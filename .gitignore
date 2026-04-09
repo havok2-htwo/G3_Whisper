@@ -1,0 +1,42 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# Environment / Secrets
+.env
+.env.*
+
+# Frontend build & deps
+frontend/node_modules/
+frontend/dist/
+frontend/*.tsbuildinfo
+
+# Models (large binary files)
+models/
+
+# Logs & runtime data
+logs/
+
+# Test audio files (large binaries)
+testaudio/
+
+# Old / deprecated code
+marked_for_delete/
+
+# Load test reports
+*.json
+!package.json
+!package-lock.json
+!tsconfig*.json
+!vite.config.d.ts
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+.DS_Store
