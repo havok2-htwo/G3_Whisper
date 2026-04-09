@@ -1,5 +1,7 @@
 # G3_WHISPER
 
+**Repository:** [https://github.com/havok2-htwo/G3_Whisper](https://github.com/havok2-htwo/G3_Whisper)
+
 ## Zweck
 
 `G3_WHISPER` ist ein lokaler Transkriptions-Server auf Basis von FastAPI + React/Vite.
@@ -395,6 +397,16 @@ Der Admin-Benchmark akzeptiert ebenfalls Audio oder Video und nutzt denselben Au
 - Wenn auf Windows kein `cl.exe` verfuegbar ist, laeuft Cohere weiter ohne den optionalen internen Compile-Pfad.
 - `__pycache__` kann lokal erneut auftauchen. Das ist normal und kein Quellcode.
 - [genesis_whisper_server_diarization_engine.py](x:/dev/G3_WHISPER/genesis_whisper_server_diarization_engine.py) liegt im Repo, ist aber aktuell nicht Teil des aktiven Hauptpfads.
+
+## Git & KI-Agenten: Code sichern (Push)
+
+Dieses Repository ist an GitHub angebunden. Da KI-Assistenten oft im Hintergrund laufen, haben sie in der Regel keine Moeglichkeit, auf interaktive Login-Fenster des *Windows Git Credential Managers* zu reagieren. Die Authentifizierung wuerde haengen bleiben.
+Wenn ein KI-Agent Code verwalten und pushen soll, gilt deshalb folgender Workflow:
+
+1. KI-Agent checkt den Status und haelt die `.gitignore` sauber.
+2. KI-Agent committet die lokalen Aenderungen via `git add -A` und `git commit -m "..."`.
+3. Der KI-Agent weist den Benutzer anschliessend an, in seinem **eigenen sichtbaren Terminal** manuell den Befehl `git push` (bzw. `git push -u origin main`) auszufuehren.
+4. Der Benutzer fuehrt den Push aus und loggt sich - falls von Git erfragt - im aufploppenden UI-Fenster ein.
 
 ## Arbeitsregeln fuer kuenftige Aenderungen
 
