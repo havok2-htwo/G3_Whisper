@@ -173,6 +173,7 @@ if defined GENESIS_STARTUP_ADMIN_KEY (
 
 echo Nutze lokale venv unter "%CD%\venv" ...
 echo Starte den GENESIS Whisper Server...
+title G3 WHISPER Server
 call "%VENV_PYTHON%" -m backend.genesis_whisper_server
 
 echo.
