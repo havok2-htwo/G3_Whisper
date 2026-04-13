@@ -13,13 +13,13 @@ from .genesis_whisper_server_globals import (
 
 
 DEFAULT_SETTINGS: Dict[str, Any] = {
-    "local_model": "openai/whisper-base",
+    "local_model": "openai/whisper-large-v3-turbo",
     "local_gpu_device": "auto",
-    "local_model_cache_path": "",
+    "local_model_cache_path": ".\\models",
     "transcription_language": "auto",
-    "batch_wait_time_ms": 250,
-    "batch_max_segments": 8,
-    "batch_max_audio_seconds": 120.0,
+    "batch_wait_time_ms": 500,
+    "batch_max_segments": 32,
+    "batch_max_audio_seconds": 300.0,
 }
 
 
