@@ -8,6 +8,15 @@ import soundfile as sf
 from fastapi import HTTPException
 
 
+def _normalize_audio_data(audio_data: np.ndarray) -> np.ndarray:
+    if audio_data.size == 0:
+        return audio_data
+    max_val = float(np.max(np.abs(audio_data)))
+    if max_val > 0.0:
+        return audio_data / max_val
+    return audio_data
+
+
 def _decode_audio_with_ffmpeg(audio_bytes: bytes, filename: str) -> np.ndarray:
     ffmpeg_path = shutil.which("ffmpeg")
     if not ffmpeg_path:
@@ -48,7 +57,7 @@ def _decode_audio_with_ffmpeg(audio_bytes: bytes, filename: str) -> np.ndarray:
     audio_data = np.frombuffer(process.stdout, dtype=np.int16).astype(np.float32) / 32768.0
     if audio_data.size == 0:
         raise HTTPException(status_code=400, detail=f"ffmpeg lieferte keine Audiodaten fuer '{filename}'.")
-    return audio_data
+    return _normalize_audio_data(audio_data)
 
 
 def load_audio_bytes(audio_bytes: bytes, filename: str, target_sample_rate: int = 16000) -> np.ndarray:
@@ -76,7 +85,9 @@ def load_audio_bytes(audio_bytes: bytes, filename: str, target_sample_rate: int 
 
     if audio_data.ndim > 1:
         audio_data = np.mean(audio_data, axis=1)
-    return np.asarray(audio_data, dtype=np.float32)
+    
+    audio_data = np.asarray(audio_data, dtype=np.float32)
+    return _normalize_audio_data(audio_data)
 
 
 def get_audio_duration_seconds(audio_data: Optional[np.ndarray], sample_rate: int = 16000) -> float:

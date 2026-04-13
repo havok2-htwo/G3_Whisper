@@ -11,12 +11,12 @@ def build_pbkdf2_hash(password: str, iterations: int = 390000) -> str:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Erzeugt einen PBKDF2-Hash fuer GENESIS_ADMIN_PASSWORD_HASH.")
-    parser.add_argument("--password", help="Passwort im Klartext. Wenn leer, wird interaktiv gefragt.")
+    parser = argparse.ArgumentParser(description="Legacy helper: erzeugt einen generischen PBKDF2-SHA256-Hash.")
+    parser.add_argument("--password", help="Klartextwert. Wenn leer, wird interaktiv gefragt.")
     parser.add_argument("--iterations", type=int, default=390000)
     args = parser.parse_args()
 
-    password = args.password or getpass.getpass("Admin-Passwort: ")
+    password = args.password or getpass.getpass("Wert zum Hashen: ")
     print(build_pbkdf2_hash(password, args.iterations))
 
 

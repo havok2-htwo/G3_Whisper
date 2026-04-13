@@ -10,8 +10,8 @@ from typing import Any, Dict, List
 import torch
 
 # --- Pfade und Konstanten ---
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-LOGS_DIR = os.path.join(SCRIPT_DIR, "logs")
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+LOGS_DIR = os.path.join(PROJECT_ROOT, "logs")
 SETTINGS_FILE = os.path.join(LOGS_DIR, "genesis_whisper_settings.json")
 LOG_FILE = os.path.join(LOGS_DIR, "transcription_log.jsonl")
 HISTORY_MAX_LEN = 100

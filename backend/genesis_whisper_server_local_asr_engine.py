@@ -16,7 +16,7 @@ try:
 except ImportError:
     DYNAMO_AVAILABLE = False
 
-from genesis_whisper_server_globals import (
+from .genesis_whisper_server_globals import (
     get_effective_transcription_language,
     get_local_model_backend,
     local_model_components,

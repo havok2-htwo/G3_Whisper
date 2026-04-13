@@ -3,7 +3,7 @@ import os
 import sys
 from typing import Any, Dict, Optional
 
-from genesis_whisper_server_globals import (
+from .genesis_whisper_server_globals import (
     LOCAL_ASR_MODEL_MAP,
     LOG_FILE,
     LOGS_DIR,

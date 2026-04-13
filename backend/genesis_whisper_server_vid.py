@@ -13,8 +13,8 @@ from dotenv import load_dotenv
 from typing import Dict, Any
 
 # Lade globale, Thread-sichere Variablen
-from genesis_whisper_server_chunking import extract_speech_audio
-from genesis_whisper_server_globals import model_load_lock as vid_model_lock
+from .genesis_whisper_server_chunking import extract_speech_audio
+from .genesis_whisper_server_globals import model_load_lock as vid_model_lock
 
 # Globale, Thread-sichere Komponente für das VID-Modell
 vid_model_components: Dict[str, Any] = {"model": None, "inference": None}

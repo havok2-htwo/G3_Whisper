@@ -13,8 +13,8 @@ from typing import Dict, Any, Optional
 from collections import defaultdict
 
 # Lade globale, Thread-sichere Variablen
-from genesis_whisper_server_globals import model_load_lock as diarization_model_lock
-from genesis_whisper_server_globals import current_task_status, task_status_lock
+from .genesis_whisper_server_globals import model_load_lock as diarization_model_lock
+from .genesis_whisper_server_globals import current_task_status, task_status_lock
 from pyannote.audio.pipelines.utils.hook import ProgressHook
 
 # Globale, Thread-sichere Komponente für das Diarisierungs-Modell

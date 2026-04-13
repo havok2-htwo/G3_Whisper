@@ -47,11 +47,21 @@ def split_audio_for_whisper(
         return []
 
     audio = np.asarray(audio_data_np, dtype=np.float32).flatten()
-    segments = _detect_speech_segments(audio, sample_rate, padding_ms=padding_ms)
-    if not segments:
-        return []
-
     max_chunk_samples = max(int(max_chunk_seconds * sample_rate), sample_rate)
+
+    # Short audio (≤ one Whisper window): skip VAD entirely to avoid
+    # cutting speech at edges where TTS fades in/out quietly.
+    if len(audio) <= max_chunk_samples:
+        return [audio.copy()]
+
+    # Longer audio: use VAD to find speech regions, then chunk each one.
+    segments = _detect_speech_segments(audio, sample_rate, padding_ms=padding_ms)
+
+    # If VAD finds nothing at all, treat the whole file as one speech region
+    # This guarantees we NEVER silently drop audio segments. Whisper will figure it out.
+    if not segments:
+        segments = [(0, len(audio))]
+
     overlap_samples = max(0, int(overlap_ms * sample_rate / 1000))
     chunks: List[np.ndarray] = []
 
@@ -78,13 +88,14 @@ def combine_transcription_chunks(text_chunks: Sequence[str]) -> str:
 
 
 def _detect_speech_segments(audio: np.ndarray, sample_rate: int, padding_ms: int) -> List[Tuple[int, int]]:
-    segments = _detect_segments_with_webrtcvad(audio, sample_rate, padding_ms)
-    if not segments:
-        segments = _detect_segments_with_energy(audio, sample_rate, padding_ms)
-    return _merge_segments(segments, merge_gap_samples=int(0.25 * sample_rate))
+    # WebRTC VAD completely disabled as it fails on telephone/filtered voice.
+    # We strictly rely on the energy (volume) based detection.
+    segments = _detect_segments_with_energy(audio, sample_rate, padding_ms)
+    # Only split segments if the silence between them is at least 300ms (0.3 seconds)
+    return _merge_segments(segments, merge_gap_samples=int(0.30 * sample_rate))
 
 
-def _detect_segments_with_webrtcvad(audio: np.ndarray, sample_rate: int, padding_ms: int) -> List[Tuple[int, int]]:
+def _detect_segments_with_webrtcvad(audio: np.ndarray, sample_rate: int, padding_ms: int, vad_aggressiveness: int = 0) -> List[Tuple[int, int]]:
     try:
         import webrtcvad
     except Exception:
@@ -95,7 +106,8 @@ def _detect_segments_with_webrtcvad(audio: np.ndarray, sample_rate: int, padding
     if len(audio) < frame_samples:
         return []
 
-    vad = webrtcvad.Vad(2)
+    # vad_aggressiveness: 0 (least aggressive / most sensitive) to 3 (most aggressive)
+    vad = webrtcvad.Vad(vad_aggressiveness)
     pcm16 = np.clip(audio, -1.0, 1.0)
     pcm16 = (pcm16 * 32767.0).astype(np.int16)
 
@@ -137,18 +149,26 @@ def _detect_segments_with_energy(audio: np.ndarray, sample_rate: int, padding_ms
     frame_ms = 30
     frame_samples = int(sample_rate * frame_ms / 1000)
     if len(audio) < frame_samples:
-        if float(np.max(np.abs(audio))) < 0.01:
+        if float(np.max(np.abs(audio))) < 0.0001:
             return []
         return [(0, len(audio))]
 
     frame_starts = list(range(0, len(audio) - frame_samples + 1, frame_samples))
     energies = np.array([float(np.sqrt(np.mean(np.square(audio[start:start + frame_samples])))) for start in frame_starts], dtype=np.float32)
 
-    if len(energies) == 0 or float(np.max(energies)) < 0.008:
+    if len(energies) == 0 or float(np.max(energies)) < 0.0001:
         return []
 
-    energy_floor = float(np.percentile(energies, 35))
-    threshold = max(0.008, energy_floor * 1.8, float(np.max(energies)) * 0.12)
+    p05_noise_floor = float(np.percentile(energies, 5))
+    p95_speech_peak = float(np.percentile(energies, 95))
+
+    # The threshold is dynamically calculated based on the audio's own volume distribution.
+    # We take the background noise (p05) and add 5% of the dynamic range up to the peak (p95).
+    # This means anything that is 5% "louder" than the pure background noise counts as speech.
+    dynamic_threshold = p05_noise_floor + (p95_speech_peak - p05_noise_floor) * 0.05
+    
+    # We ensure a hard minimum to avoid false positives on totally silent files.
+    threshold = max(0.0001, dynamic_threshold)
     voiced_flags = energies >= threshold
     min_run_frames = max(1, int(150 / frame_ms))
 

@@ -1,38 +1,35 @@
-# Architektur-Blueprint: FastAPI Backend mit React/Vite Frontend und Custom Auth
+# Architektur-Blueprint: FastAPI Backend mit React/Vite Frontend und Admin-Key Auth
 
-Diese Dokumentation beschreibt, wie das "Drumrum" (Server, Frontend, Auth, Umgebungs-Variablen) im aktuellen `G3_WHISPER` Projekt gelöst wurde. Sie dient als **Anleitung für deinen KI-Agenten**, um eine identische Architektur für einen neuen **vLLM**-Server aufzubauen.
+Diese Dokumentation beschreibt, wie das "Drumrum" (Server, Frontend, Auth, Umgebungs-Variablen) aktuell im `G3_WHISPER` Projekt gelöst ist. Sie dient als **Anleitung für deinen KI-Agenten**, um eine identische Architektur für einen neuen **vLLM**-Server aufzubauen.
 
 ---
 
 ## 1. Environment & Secrets (`.env`)
 
 Die Konfiguration der Zugangsdaten und Tokens erfolgt über eine `.env` Datei im Root-Verzeichnis.
-Für ein neues vLLM Projekt sollten die Schlüsseln konzeptionell übernommen werden (z.B. mit angepasstem Prefix):
+Für ein neues vLLM Projekt sollten die Schlüssel konzeptionell übernommen werden (z.B. mit angepasstem Prefix):
 
 ```env
 HUGGINGFACE_TOKEN=hf_...
-GENESIS_ADMIN_USERNAME=admin
-GENESIS_ADMIN_PASSWORD_HASH=pbkdf2_sha256$...
-GENESIS_SESSION_SECRET=CustomSecretKeyForHMAC
+GENESIS_ADMIN_KEY=genesis_admin_xxx
+GENESIS_STARTUP_ADMIN_KEY=genesis_startup_admin_xxx
+GENESIS_STARTUP_ADMIN_KEY_TTL_SECONDS=300
 ```
 
 Das Backend lädt diese Werte via `python-dotenv` (falls installiert) oder liest sie direkt über `os.getenv()`.
 
 ---
 
-## 2. Authentifizierung (Custom Token & Cookie)
+## 2. Authentifizierung (Admin Key per Header)
 
-Wir haben eine gewichtsgünstige, **eigene "JWT"-artige Implementierung** gebastelt, anstatt gigantische Auth-Frameworks einzubinden. Diese Architektur ist robust und portabel (findest du im Repository in der Datei `genesis_whisper_server_auth.py`).
+Wir nutzen eine gewichtsgünstige, eigene Admin-Key-Lösung anstatt eines großen Auth-Frameworks. Diese Architektur ist robust und portabel (findest du im Repository in der Datei `genesis_whisper_server_auth.py`).
 
 ### Funktionsweise:
-1. **Passwörter:** Hashes werden im Format `pbkdf2_sha256$iterations$salt$hash` hinterlegt und mit `hashlib.pbkdf2_hmac` abgeglichen.
-2. **Session-Token-Erstellung:** Wenn der Admin-Login erfolgreich ist (`/api/admin/login`), wird ein Token generiert:
-   - Es wird ein Payload geschnürt (z.B. `{"sub": username, "exp": timestamp}`).
-   - Das Payload wird base64-encodiert.
-   - Es wird eine **HMAC-SHA256 Signatur** generiert (mit dem `GENESIS_SESSION_SECRET` als Schlüssel).
-   - Token-Format: `base64_payload.signature`
-3. **Cookie-Speicherung:** Das Token wird **als HTTP-Only Cookie** über `response.set_cookie(...)` gesetzt, damit es vor dem Zugriff durch JavaScript (XSS-Schutz) sicher ist.
-4. **Schutz der Routen:** Für geschützte API-Routen wird die FastAPI Dependency `Depends(require_admin)` verwendet. Diese prüft bei jedem Request das Vorhandensein des Cookies und validiert die HMAC-Signatur.
+1. **Persistenter Admin Key:** Der Hauptschlüssel wird gehasht in `logs/genesis_whisper_secrets.json` gespeichert.
+2. **Startup Recovery Key:** Beim Startskript wird zusätzlich ein temporärer Admin Key generiert und kurz im Terminal angezeigt.
+3. **Header-Auth:** Geschützte Routen erwarten `X-Admin-Key`.
+4. **Rotation:** `POST /api/admin/keys` ersetzt den persistenten Admin Key und gibt den neuen Klartext genau einmal zurück.
+5. **Schutz der Routen:** Für geschützte API-Routen wird die FastAPI Dependency `Depends(require_admin)` verwendet. Diese prüft bei jedem Request den Header gegen den persistenten oder temporären Startup-Key.
 
 ---
 

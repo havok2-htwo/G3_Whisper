@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import asyncio
 import time
 import uuid
@@ -5,18 +7,16 @@ from statistics import mean
 from typing import Any, Dict, List
 
 import torch
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, Response, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from pydantic import BaseModel
 
-from genesis_whisper_server_audio import get_audio_duration_seconds, load_audio_bytes
-from genesis_whisper_server_auth import (
-    authenticate_admin_credentials,
-    clear_admin_session,
+from .genesis_whisper_server_audio import get_audio_duration_seconds, load_audio_bytes
+from .genesis_whisper_server_auth import (
+    get_admin_key_store,
     require_admin,
-    set_admin_session,
 )
-from genesis_whisper_server_chunking import combine_transcription_chunks, split_audio_for_whisper
-from genesis_whisper_server_globals import (
+from .genesis_whisper_server_chunking import combine_transcription_chunks, split_audio_for_whisper
+from .genesis_whisper_server_globals import (
     AVAILABLE_DEVICES,
     DEVICE_MAP_UI_TO_INTERNAL,
     current_settings,
@@ -29,13 +29,8 @@ from genesis_whisper_server_globals import (
     transcription_history,
     uses_cohere_backend,
 )
-from genesis_whisper_server_local_asr_engine import get_last_local_asr_load_error, load_local_asr_model
-from genesis_whisper_server_storage import normalize_settings, save_settings
-
-
-class AdminLoginPayload(BaseModel):
-    username: str
-    password: str
+from .genesis_whisper_server_local_asr_engine import get_last_local_asr_load_error, load_local_asr_model
+from .genesis_whisper_server_storage import normalize_settings, save_settings
 
 
 class AdminSettingsPayload(BaseModel):
@@ -222,32 +217,19 @@ async def _run_admin_benchmark(request: Request, audio_data, repeat_count: int) 
 
 
 def create_admin_api(app: FastAPI) -> FastAPI:
-    @app.post("/api/admin/login")
-    async def admin_login(payload: AdminLoginPayload, response: Response):
-        if not authenticate_admin_credentials(payload.username.strip(), payload.password):
-            from genesis_whisper_server_auth import admin_is_configured
+    @app.get("/api/admin/keys")
+    async def admin_get_keys(_: dict[str, str] = Depends(require_admin)):
+        return get_admin_key_store().list_keys()
 
-            if not admin_is_configured():
-                response.status_code = 503
-                return {"ok": False, "detail": "Admin-Login ist nicht konfiguriert."}
-            response.status_code = 401
-            return {"ok": False, "detail": "Ungueltiger Benutzername oder Passwort."}
-
-        username = payload.username.strip()
-        set_admin_session(response, username)
-        return {"ok": True, "username": username}
-
-    @app.post("/api/admin/logout")
-    async def admin_logout(response: Response, _: str = Depends(require_admin)):
-        clear_admin_session(response)
-        return {"ok": True}
-
-    @app.get("/api/admin/session")
-    async def admin_session(username: str = Depends(require_admin)):
-        return {"authenticated": True, "username": username}
+    @app.post("/api/admin/keys")
+    async def admin_rotate_key(_: dict[str, str] = Depends(require_admin)):
+        return {
+            "key": get_admin_key_store().rotate_admin_key(),
+            "keys": get_admin_key_store().list_keys(),
+        }
 
     @app.get("/api/admin/settings")
-    async def admin_get_settings(_: str = Depends(require_admin)):
+    async def admin_get_settings(_: dict[str, str] = Depends(require_admin)):
         model_identifier = local_model_components.get("model_identifier")
         return {
             "settings": _serialize_settings(),
@@ -256,7 +238,7 @@ def create_admin_api(app: FastAPI) -> FastAPI:
         }
 
     @app.put("/api/admin/settings")
-    async def admin_update_settings(payload: AdminSettingsPayload, _: str = Depends(require_admin)):
+    async def admin_update_settings(payload: AdminSettingsPayload, _: dict[str, str] = Depends(require_admin)):
         payload_data = payload.model_dump() if hasattr(payload, "model_dump") else payload.dict()
         normalized = normalize_settings(payload_data)
         with settings_lock:
@@ -283,7 +265,7 @@ def create_admin_api(app: FastAPI) -> FastAPI:
         }
 
     @app.get("/api/admin/stats")
-    async def admin_stats(_: str = Depends(require_admin)):
+    async def admin_stats(_: dict[str, str] = Depends(require_admin)):
         with history_lock:
             history_items = list(transcription_history)
 
@@ -302,7 +284,7 @@ def create_admin_api(app: FastAPI) -> FastAPI:
         }
 
     @app.get("/api/admin/queue")
-    async def admin_queue(request: Request, _: str = Depends(require_admin)):
+    async def admin_queue(request: Request, _: dict[str, str] = Depends(require_admin)):
         batch_manager = request.app.state.whisper_batch_manager
         return batch_manager.snapshot()
 
@@ -311,7 +293,7 @@ def create_admin_api(app: FastAPI) -> FastAPI:
         request: Request,
         file: UploadFile = File(..., description="Audio- oder Video-Datei fuer den Benchmark."),
         repeat_count: int = Form(1),
-        _: str = Depends(require_admin),
+        _: dict[str, str] = Depends(require_admin),
     ):
         if repeat_count < 1 or repeat_count > 64:
             raise HTTPException(status_code=400, detail="Wiederholungen muessen zwischen 1 und 64 liegen.")

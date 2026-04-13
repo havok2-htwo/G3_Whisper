@@ -11,7 +11,7 @@ from typing import Any, Callable, Deque, Dict, List, Optional
 
 import numpy as np
 
-from genesis_whisper_server_globals import batch_history, batch_runtime_state, batch_state_lock, current_settings, settings_lock
+from .genesis_whisper_server_globals import batch_history, batch_runtime_state, batch_state_lock, current_settings, settings_lock
 
 
 @dataclass

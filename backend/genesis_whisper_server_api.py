@@ -8,9 +8,9 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 
-from genesis_whisper_server_audio import load_audio_bytes
-from genesis_whisper_server_chunking import combine_transcription_chunks, split_audio_for_whisper
-from genesis_whisper_server_globals import (
+from .genesis_whisper_server_audio import load_audio_bytes
+from .genesis_whisper_server_chunking import combine_transcription_chunks, split_audio_for_whisper
+from .genesis_whisper_server_globals import (
     current_settings,
     get_effective_transcription_language,
     history_lock,
@@ -18,14 +18,14 @@ from genesis_whisper_server_globals import (
     transcription_history,
     uses_cohere_backend,
 )
-from genesis_whisper_server_local_asr_engine import (
+from .genesis_whisper_server_local_asr_engine import (
     get_last_local_asr_load_error,
     load_local_asr_model,
     transcribe_local_asr,
     transcribe_local_asr_batch,
 )
-from genesis_whisper_server_storage import log_transcription
-from genesis_whisper_server_vid import generate_voice_vector
+from .genesis_whisper_server_storage import log_transcription
+from .genesis_whisper_server_vid import generate_voice_vector
 
 
 def _normalize_engine(engine: str) -> str:
@@ -213,5 +213,55 @@ def create_api(app: FastAPI) -> FastAPI:
             return
 
         return response_data
+
+    @app.get("/v1/models")
+    async def list_models_openai():
+        with settings_lock:
+            local_model = current_settings.get("local_model", "whisper-1")
+        return {
+            "object": "list",
+            "data": [
+                {
+                    "id": local_model,
+                    "object": "model",
+                    "created": int(time.time()),
+                    "owned_by": "genesis"
+                },
+                {
+                    "id": "whisper-1",
+                    "object": "model",
+                    "created": int(time.time()),
+                    "owned_by": "genesis"
+                }
+            ]
+        }
+
+    @app.post("/v1/audio/transcriptions")
+    async def transcribe_openai_endpoint(
+        request: Request,
+        file: UploadFile = File(...),
+        model: str = Form("whisper-1"),
+        language: Optional[str] = Form(None),
+        prompt: Optional[str] = Form(None),
+        response_format: Optional[str] = Form("json"),
+        temperature: Optional[float] = Form(0.0),
+    ):
+        # We call the existing endpoint logic to avoid duplication
+        response = await transcribe_endpoint(request, file=file, engine="local", voice_ident=False)
+        transcription_text = response.get("transcription", "")
+        
+        if response_format == "text":
+            from fastapi.responses import PlainTextResponse
+            return PlainTextResponse(transcription_text)
+        elif response_format == "verbose_json":
+            return {
+                "task": "transcribe",
+                "language": current_settings.get("transcription_language", "auto"),
+                "duration": response.get("transcription_duration_ms", 0) / 1000.0,
+                "text": transcription_text,
+                "segments": []
+            }
+            
+        return {"text": transcription_text}
 
     return app
