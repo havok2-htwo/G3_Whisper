@@ -81,6 +81,12 @@ button:disabled {
   border: 1px solid rgba(255, 255, 255, 0.12);
 }
 
+.danger-button {
+  color: #fff0f1;
+  border-color: rgba(255, 141, 148, 0.24);
+  background: rgba(255, 141, 148, 0.12);
+}
+
 #root {
   min-height: 100vh;
 }
@@ -202,6 +208,12 @@ button:disabled {
   display: flex;
   flex-direction: column;
   gap: 14px;
+}
+
+.button-row {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
 }
 
 .whisper-dashboard-metrics {
@@ -675,6 +687,60 @@ tbody tr:nth-child(even) {
   background: rgba(255, 255, 255, 0.025);
 }
 
+.table-actions {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.model-actions-cell {
+  width: 1%;
+  min-width: 220px;
+  white-space: nowrap;
+}
+
+.model-status-cell {
+  min-width: 180px;
+}
+
+.model-status-cell strong {
+  display: block;
+  color: #fff7e9;
+}
+
+.model-status-error {
+  display: block;
+  margin-top: 0.4rem;
+  color: var(--danger);
+  font-size: 0.84rem;
+  line-height: 1.45;
+  white-space: normal;
+}
+
+.model-id {
+  margin-top: 0.45rem;
+}
+
+.model-path-card {
+  margin-bottom: 16px;
+  padding: 16px;
+  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.model-path-card strong {
+  display: block;
+  margin-top: 0.45rem;
+  color: #fff7e9;
+  overflow-wrap: anywhere;
+}
+
+.model-path-cell {
+  min-width: 320px;
+  overflow-wrap: anywhere;
+}
+
 .transcript-cell {
   min-width: 360px;
   white-space: normal;
@@ -729,12 +795,15 @@ tbody tr:nth-child(even) {
   }
 
   .hero-actions,
-  .form-actions {
+  .form-actions,
+  .button-row,
+  .table-actions {
     width: 100%;
   }
 
   button,
-  .secondary-button {
+  .secondary-button,
+  .ghost-button {
     width: 100%;
     justify-content: center;
   }

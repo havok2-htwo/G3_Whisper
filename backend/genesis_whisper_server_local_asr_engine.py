@@ -21,6 +21,7 @@ from .genesis_whisper_server_globals import (
     get_local_model_backend,
     local_model_components,
     model_load_lock,
+    resolve_local_model_cache_path,
     uses_cohere_backend,
 )
 
@@ -227,13 +228,14 @@ def load_local_asr_model(model_id: str, device_selection: str, cache_path: str) 
         try:
             use_gpu, target_device, torch_dtype, attn_implementation = _prepare_model_loading_options(device_selection)
             attn_implementation = _resolve_backend_attention_implementation(model_id, attn_implementation)
+            resolved_cache_path = resolve_local_model_cache_path(cache_path)
 
-            if cache_path:
-                os.makedirs(cache_path, exist_ok=True)
-            pretrained_source, pretrained_args = _resolve_local_pretrained_source(model_id, cache_path)
+            if resolved_cache_path:
+                os.makedirs(resolved_cache_path, exist_ok=True)
+            pretrained_source, pretrained_args = _resolve_local_pretrained_source(model_id, resolved_cache_path)
 
             if uses_cohere_backend(model_id):
-                dynamic_modules_cache = _configure_hf_dynamic_module_cache(cache_path)
+                dynamic_modules_cache = _configure_hf_dynamic_module_cache(resolved_cache_path)
                 if dynamic_modules_cache:
                     print(f"[INFO] Cohere Dynamic-Module-Cache: '{dynamic_modules_cache}'", file=sys.stderr)
                 processor = AutoProcessor.from_pretrained(pretrained_source, trust_remote_code=True, **pretrained_args)

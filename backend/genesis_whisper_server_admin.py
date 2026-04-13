@@ -30,6 +30,11 @@ from .genesis_whisper_server_globals import (
     uses_cohere_backend,
 )
 from .genesis_whisper_server_local_asr_engine import get_last_local_asr_load_error, load_local_asr_model
+from .genesis_whisper_server_model_manager import (
+    delete_model_cache,
+    list_model_statuses,
+    queue_model_download,
+)
 from .genesis_whisper_server_storage import normalize_settings, save_settings
 
 
@@ -41,6 +46,11 @@ class AdminSettingsPayload(BaseModel):
     batch_wait_time_ms: int
     batch_max_segments: int
     batch_max_audio_seconds: float
+
+
+class AdminModelActionPayload(BaseModel):
+    model_id: str
+    storage_path: str | None = None
 
 
 def _serialize_settings() -> Dict[str, Any]:
@@ -68,8 +78,14 @@ def _get_local_processing_key() -> tuple[str, str, str, str]:
         model_id = current_settings["local_model"]
         device = current_settings["local_gpu_device"]
         cache_path = current_settings["local_model_cache_path"]
-        language = current_settings.get("transcription_language", "auto")
+    language = current_settings.get("transcription_language", "auto")
     return model_id, device, cache_path, language
+
+
+def _effective_model_storage_path(storage_path: str | None = None) -> str:
+    if storage_path is not None:
+        return str(storage_path)
+    return str(_serialize_settings().get("local_model_cache_path", ""))
 
 
 def _get_loaded_model_cuda_index() -> int | None:
@@ -231,9 +247,11 @@ def create_admin_api(app: FastAPI) -> FastAPI:
     @app.get("/api/admin/settings")
     async def admin_get_settings(_: dict[str, str] = Depends(require_admin)):
         model_identifier = local_model_components.get("model_identifier")
+        settings_snapshot = _serialize_settings()
         return {
-            "settings": _serialize_settings(),
+            "settings": settings_snapshot,
             "options": _settings_options(),
+            "models": list_model_statuses(settings_snapshot.get("local_model_cache_path", "")),
             "loaded_model_identifier": list(model_identifier) if model_identifier else None,
         }
 
@@ -262,6 +280,33 @@ def create_admin_api(app: FastAPI) -> FastAPI:
             "model_reloaded": model_settings_changed,
             "model_loaded": model_loaded,
             "options": _settings_options(),
+            "models": list_model_statuses(saved_settings.get("local_model_cache_path", "")),
+        }
+
+    @app.get("/api/admin/models")
+    async def admin_get_models(storage_path: str | None = None, _: dict[str, str] = Depends(require_admin)):
+        return {"models": list_model_statuses(_effective_model_storage_path(storage_path))}
+
+    @app.post("/api/admin/models/download")
+    async def admin_download_model(payload: AdminModelActionPayload, _: dict[str, str] = Depends(require_admin)):
+        try:
+            job = queue_model_download(payload.model_id, _effective_model_storage_path(payload.storage_path))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {
+            "job": job,
+            "models": list_model_statuses(_effective_model_storage_path(payload.storage_path)),
+        }
+
+    @app.post("/api/admin/models/delete")
+    async def admin_delete_model(payload: AdminModelActionPayload, _: dict[str, str] = Depends(require_admin)):
+        try:
+            result = delete_model_cache(payload.model_id, _effective_model_storage_path(payload.storage_path))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {
+            **result,
+            "models": list_model_statuses(_effective_model_storage_path(payload.storage_path)),
         }
 
     @app.get("/api/admin/stats")

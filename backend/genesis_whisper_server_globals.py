@@ -5,6 +5,7 @@
 import os
 import threading
 from collections import deque
+from pathlib import Path
 from typing import Any, Dict, List
 
 import torch
@@ -18,41 +19,48 @@ HISTORY_MAX_LEN = 100
 BATCH_HISTORY_MAX_LEN = 50
 COHERE_FALLBACK_LANGUAGE = "de"
 
-LOCAL_ASR_MODEL_SPECS: Dict[str, Dict[str, str]] = {
+LOCAL_ASR_MODEL_SPECS: Dict[str, Dict[str, Any]] = {
     "Cohere Transcribe 03/2026": {
         "value": "CohereLabs/cohere-transcribe-03-2026",
         "backend": "cohere_transcribe",
         "default_language": COHERE_FALLBACK_LANGUAGE,
+        "approx_size_gb": None,
     },
     "Whisper Large v3 Turbo": {
         "value": "openai/whisper-large-v3-turbo",
         "backend": "whisper",
         "default_language": "auto",
+        "approx_size_gb": 1.6,
     },
     "Whisper Large v3": {
         "value": "openai/whisper-large-v3",
         "backend": "whisper",
         "default_language": "auto",
+        "approx_size_gb": 3.1,
     },
     "Whisper Medium": {
         "value": "openai/whisper-medium",
         "backend": "whisper",
         "default_language": "auto",
+        "approx_size_gb": 1.5,
     },
     "Whisper Small": {
         "value": "openai/whisper-small",
         "backend": "whisper",
         "default_language": "auto",
+        "approx_size_gb": 0.5,
     },
     "Whisper Base": {
         "value": "openai/whisper-base",
         "backend": "whisper",
         "default_language": "auto",
+        "approx_size_gb": 0.15,
     },
     "Whisper Tiny": {
         "value": "openai/whisper-tiny",
         "backend": "whisper",
         "default_language": "auto",
+        "approx_size_gb": 0.1,
     },
 }
 LOCAL_ASR_MODEL_MAP: Dict[str, str] = {
@@ -105,6 +113,16 @@ def get_effective_transcription_language(model_id: str, configured_language: str
     if normalized_language:
         return normalized_language
     return get_local_model_spec(model_id).get("default_language", "auto")
+
+
+def resolve_local_model_cache_path(cache_path: str) -> str:
+    normalized = str(cache_path or "").strip()
+    if not normalized:
+        return ""
+    path = Path(normalized).expanduser()
+    if not path.is_absolute():
+        path = Path(PROJECT_ROOT) / path
+    return str(path.resolve(strict=False))
 
 
 # --- GPU-Geraeteerkennung ---

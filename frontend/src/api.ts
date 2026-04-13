@@ -20,6 +20,20 @@ export type AdminSettings = {
   batch_max_audio_seconds: number;
 };
 
+export type ManagedModel = {
+  id: string;
+  label: string;
+  backend: string;
+  status: string;
+  local_path: string | null;
+  cache_path: string | null;
+  storage_root: string;
+  approx_size_gb: number | null;
+  size_on_disk_gb: number | null;
+  error: string | null;
+  updated_at: string | null;
+};
+
 export type SettingsResponse = {
   settings: AdminSettings;
   options: {
@@ -27,6 +41,7 @@ export type SettingsResponse = {
     devices: AdminOption[];
     languages: AdminOption[];
   };
+  models: ManagedModel[];
   loaded_model_identifier: string[] | null;
 };
 
@@ -144,6 +159,41 @@ export async function saveSettings(adminKey: string, settings: AdminSettings) {
       method: "PUT",
       adminKey,
       body: JSON.stringify(settings),
+    },
+  );
+}
+
+export async function getModels(adminKey: string, storagePath?: string) {
+  const query = storagePath !== undefined
+    ? `?storage_path=${encodeURIComponent(storagePath)}`
+    : "";
+  return requestJson<{ models: ManagedModel[] }>(`/api/admin/models${query}`, {
+    method: "GET",
+    adminKey,
+  });
+}
+
+export async function downloadModel(adminKey: string, modelId: string, storagePath: string) {
+  return requestJson<{ job: Record<string, unknown>; models: ManagedModel[] }>("/api/admin/models/download", {
+    method: "POST",
+    adminKey,
+    body: JSON.stringify({
+      model_id: modelId,
+      storage_path: storagePath,
+    }),
+  });
+}
+
+export async function deleteModel(adminKey: string, modelId: string, storagePath: string) {
+  return requestJson<{ ok: boolean; removed: boolean; removed_path: string | null; storage_root: string; models: ManagedModel[] }>(
+    "/api/admin/models/delete",
+    {
+      method: "POST",
+      adminKey,
+      body: JSON.stringify({
+        model_id: modelId,
+        storage_path: storagePath,
+      }),
     },
   );
 }

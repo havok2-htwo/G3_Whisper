@@ -5,10 +5,14 @@ import {
   AdminOption,
   AdminSettings,
   BenchmarkResponse,
+  ManagedModel,
   QueueResponse,
   SettingsResponse,
   StatsResponse,
+  deleteModel,
+  downloadModel,
   getKeys,
+  getModels,
   getQueue,
   getSettings,
   getStats,
@@ -54,6 +58,7 @@ const NUMBER_LOCALE = "de-DE";
 const DASHBOARD_POLL_SECONDS = 5;
 const DASHBOARD_HISTORY_POINTS = 72;
 const DASHBOARD_HISTORY_SECONDS = DASHBOARD_POLL_SECONDS * DASHBOARD_HISTORY_POINTS;
+const MODEL_STATUS_POLL_MS = 2000;
 
 const emptySettings: AdminSettings = {
   local_model: "",
@@ -134,6 +139,36 @@ function formatDateTime(value?: string | null) {
     minute: "2-digit",
     second: "2-digit",
   }).format(new Date(value));
+}
+
+function formatModelSize(model: ManagedModel) {
+  if (model.size_on_disk_gb !== null && model.size_on_disk_gb !== undefined) {
+    return `${formatFixed(model.size_on_disk_gb, model.size_on_disk_gb >= 10 ? 1 : 2)} GB`;
+  }
+  if (model.approx_size_gb !== null && model.approx_size_gb !== undefined) {
+    return `~${formatFixed(model.approx_size_gb, model.approx_size_gb >= 10 ? 1 : 2)} GB`;
+  }
+  return "n/a";
+}
+
+function formatModelStatus(status: string) {
+  if (status === "ready") {
+    return "Ready";
+  }
+  if (status === "downloading") {
+    return "Downloading";
+  }
+  if (status === "partial") {
+    return "Partial";
+  }
+  if (status === "error") {
+    return "Error";
+  }
+  return "Missing";
+}
+
+function resolveModelPath(model: ManagedModel) {
+  return model.local_path || model.cache_path || model.storage_root;
 }
 
 function describeBenchmarkWorkflow(workflow: BenchmarkWorkflow) {
@@ -341,6 +376,7 @@ export default function App() {
     devices: [],
     languages: [],
   });
+  const [managedModels, setManagedModels] = useState<ManagedModel[]>([]);
   const [loadedModelIdentifier, setLoadedModelIdentifier] = useState<string[] | null>(null);
   const [stats, setStats] = useState<StatsResponse | null>(null);
   const [queue, setQueue] = useState<QueueResponse | null>(null);
@@ -352,6 +388,9 @@ export default function App() {
   const [benchmarkBusy, setBenchmarkBusy] = useState(false);
   const [benchmarkMessage, setBenchmarkMessage] = useState("");
   const [benchmarkResult, setBenchmarkResult] = useState<BenchmarkResponse | null>(null);
+  const [modelActionId, setModelActionId] = useState<string | null>(null);
+  const [modelActionKind, setModelActionKind] = useState<"refresh" | "download" | "delete" | null>(null);
+  const hasDownloadingModels = managedModels.some((model) => model.status === "downloading");
 
   function persistAdminKey(value: string) {
     writeStoredAdminKey(value);
@@ -370,11 +409,14 @@ export default function App() {
       setQueue(null);
       setDashboardHistory([]);
       setSettingsForm(emptySettings);
+      setManagedModels([]);
       setLoadedModelIdentifier(null);
       setSettingsOptions({ models: [], devices: [], languages: [] });
       setSaveMessage("");
       setBenchmarkMessage("");
       setBenchmarkResult(null);
+      setModelActionId(null);
+      setModelActionKind(null);
       setActionMessage(nextMessage);
       setGlobalError(nextMessage);
       setAuthError("");
@@ -419,6 +461,7 @@ export default function App() {
   function applySettings(payload: SettingsResponse) {
     setSettingsForm(payload.settings);
     setSettingsOptions(payload.options);
+    setManagedModels(payload.models ?? []);
     setLoadedModelIdentifier(payload.loaded_model_identifier);
   }
 
@@ -587,6 +630,119 @@ export default function App() {
       setSaveBusy(false);
     }
   }
+
+  async function refreshManagedModels(options?: { silent?: boolean; storagePath?: string }) {
+    if (!adminKey) {
+      return;
+    }
+
+    const silent = options?.silent ?? false;
+    const storagePath = options?.storagePath ?? managedModels[0]?.storage_root ?? settingsForm.local_model_cache_path;
+
+    try {
+      const response = await getModels(adminKey, storagePath);
+      startTransition(() => {
+        setManagedModels(response.models ?? []);
+        if (!silent) {
+          setActionMessage("Model cache refreshed for the selected path.");
+        }
+      });
+    } catch (error) {
+      if (error instanceof Error && error.message === "unauthorized") {
+        handleUnauthorized();
+        return;
+      }
+      if (!silent) {
+        setGlobalError(error instanceof Error ? error.message : "Model cache refresh failed.");
+      }
+    }
+  }
+
+  async function handleRefreshModels() {
+    setModelActionId("__refresh__");
+    setModelActionKind("refresh");
+    setActionMessage("");
+    setGlobalError("");
+
+    try {
+      await refreshManagedModels({ storagePath: settingsForm.local_model_cache_path });
+    } finally {
+      setModelActionId(null);
+      setModelActionKind(null);
+    }
+  }
+
+  async function handleDownloadModel(model: ManagedModel) {
+    if (!adminKey) {
+      return;
+    }
+
+    setModelActionId(model.id);
+    setModelActionKind("download");
+    setActionMessage("");
+    setGlobalError("");
+
+    try {
+      const response = await downloadModel(adminKey, model.id, settingsForm.local_model_cache_path);
+      startTransition(() => {
+        setManagedModels(response.models ?? []);
+        setActionMessage(`Download queued for ${model.label}.`);
+      });
+    } catch (error) {
+      if (error instanceof Error && error.message === "unauthorized") {
+        handleUnauthorized();
+        return;
+      }
+      setGlobalError(error instanceof Error ? error.message : "Model download failed.");
+    } finally {
+      setModelActionId(null);
+      setModelActionKind(null);
+    }
+  }
+
+  async function handleDeleteModel(model: ManagedModel) {
+    if (!adminKey) {
+      return;
+    }
+
+    setModelActionId(model.id);
+    setModelActionKind("delete");
+    setActionMessage("");
+    setGlobalError("");
+
+    try {
+      const response = await deleteModel(adminKey, model.id, settingsForm.local_model_cache_path);
+      startTransition(() => {
+        setManagedModels(response.models ?? []);
+        setActionMessage(
+          response.removed
+            ? `Cached files removed for ${model.label}.`
+            : `No cached files found for ${model.label} in the selected path.`,
+        );
+      });
+    } catch (error) {
+      if (error instanceof Error && error.message === "unauthorized") {
+        handleUnauthorized();
+        return;
+      }
+      setGlobalError(error instanceof Error ? error.message : "Model deletion failed.");
+    } finally {
+      setModelActionId(null);
+      setModelActionKind(null);
+    }
+  }
+
+  useEffect(() => {
+    if (!adminKey || !hasDownloadingModels) {
+      return;
+    }
+
+    const intervalId = window.setInterval(() => {
+      void refreshManagedModels({ silent: true });
+    }, MODEL_STATUS_POLL_MS);
+
+    return () => window.clearInterval(intervalId);
+  }, [adminKey, hasDownloadingModels, managedModels, settingsForm.local_model_cache_path]);
 
   async function handleRunBenchmark(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -1158,6 +1314,102 @@ export default function App() {
           </div>
         </section>
       </div>
+
+      <section className="panel">
+        <div className="section-heading">
+          <div>
+            <span className="eyebrow">Models</span>
+            <h2>Cache Manager</h2>
+            <p className="section-copy">
+              Download or remove the supported ASR models directly in the cache path currently typed in the
+              settings form. Downloaded sizes reflect local cache usage; other values are rough estimates.
+            </p>
+          </div>
+          <div className="button-row">
+            <button
+              type="button"
+              className="secondary-button"
+              onClick={() => void handleRefreshModels()}
+              disabled={modelActionId === "__refresh__"}
+            >
+              {modelActionId === "__refresh__" && modelActionKind === "refresh" ? "Refreshing..." : "Refresh Models"}
+            </button>
+          </div>
+        </div>
+
+        <div className="model-path-card">
+          <span>Selected Cache Path</span>
+          <strong className="mono">{settingsForm.local_model_cache_path || "Default Hugging Face cache"}</strong>
+        </div>
+
+        <div className="table-wrap">
+          <table className="model-table">
+            <thead>
+              <tr>
+                <th>Model</th>
+                <th>Backend</th>
+                <th>Size</th>
+                <th>Status</th>
+                <th>Path</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {managedModels.length === 0 && (
+                <tr>
+                  <td colSpan={6}>No supported model entries are available.</td>
+                </tr>
+              )}
+              {managedModels.map((model) => {
+                const rowBusy = modelActionId === model.id;
+                const isDownloading = model.status === "downloading";
+                const canDelete = Boolean(model.cache_path);
+                return (
+                  <tr key={model.id}>
+                    <td>
+                      <strong>{model.label}</strong>
+                      <div className="muted mono model-id">{model.id}</div>
+                    </td>
+                    <td>{model.backend === "cohere_transcribe" ? "Cohere" : "Whisper"}</td>
+                    <td>{formatModelSize(model)}</td>
+                    <td className="model-status-cell">
+                      <strong>{formatModelStatus(model.status)}</strong>
+                      {model.error && <span className="model-status-error">{model.error}</span>}
+                    </td>
+                    <td className="mono model-path-cell">{resolveModelPath(model)}</td>
+                    <td className="model-actions-cell">
+                      <div className="table-actions">
+                        <button
+                          type="button"
+                          className="secondary-button"
+                          onClick={() => void handleDownloadModel(model)}
+                          disabled={isDownloading || rowBusy}
+                        >
+                          {isDownloading
+                            ? "Downloading..."
+                            : rowBusy && modelActionKind === "download"
+                              ? "Starting..."
+                              : model.status === "ready"
+                                ? "Download Again"
+                                : "Download"}
+                        </button>
+                        <button
+                          type="button"
+                          className="ghost-button danger-button"
+                          onClick={() => void handleDeleteModel(model)}
+                          disabled={!canDelete || isDownloading || rowBusy}
+                        >
+                          {rowBusy && modelActionKind === "delete" ? "Deleting..." : "Delete"}
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      </section>
 
       <section className="panel">
         <div className="section-heading">
