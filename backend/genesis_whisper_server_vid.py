@@ -22,6 +22,17 @@ vid_model_components: Dict[str, Any] = {"model": None, "inference": None}
 VID_MODEL_ID = "pyannote/embedding"
 HUGGING_FACE_TOKEN = None
 
+
+def _resolve_huggingface_token() -> str | None:
+    with settings_lock:
+        settings_token = str(current_settings.get("huggingface_token", "")).strip()
+    if settings_token:
+        return settings_token
+
+    load_dotenv()
+    env_token = str(os.getenv("HUGGINGFACE_TOKEN") or os.getenv("HF_TOKEN") or "").strip()
+    return env_token or None
+
 def load_vid_model() -> bool:
     """
     Lädt das pyannote.audio Embedding-Modell, falls es noch nicht geladen ist.
@@ -37,20 +48,13 @@ def load_vid_model() -> bool:
 
         print("[INFO-VID] Lade Stimmerkennungs-Modell (pyannote/embedding)...", file=sys.stderr)
 
-        # Token aus Settings oder .env laden
-        if HUGGING_FACE_TOKEN is None:
-            with settings_lock:
-                settings_token = current_settings.get("huggingface_token", "").strip()
-            
-            if settings_token:
-                HUGGING_FACE_TOKEN = settings_token
-                print("[INFO-VID] Hugging Face Token aus den Systemeinstellungen geladen.", file=sys.stderr)
-            else:
-                load_dotenv()
-                HUGGING_FACE_TOKEN = os.getenv('HUGGINGFACE_TOKEN', '')
-                if not HUGGING_FACE_TOKEN:
-                    print("[WARNUNG-VID] Hugging Face Token weder in Settings noch in .env gefunden. Versuche das Cache-Modell zu laden...", file=sys.stderr)
-                    HUGGING_FACE_TOKEN = None
+        # Token fuer jeden Ladeversuch frisch aus Settings/.env lesen,
+        # damit Korrekturen im UI ohne Server-Neustart greifen.
+        HUGGING_FACE_TOKEN = _resolve_huggingface_token()
+        if HUGGING_FACE_TOKEN:
+            print("[INFO-VID] Hugging Face Token aus Settings/.env geladen.", file=sys.stderr)
+        else:
+            print("[WARNUNG-VID] Hugging Face Token weder in Settings noch in .env gefunden. Versuche das Cache-Modell zu laden...", file=sys.stderr)
 
         try:
             from pyannote.audio import Model, Inference

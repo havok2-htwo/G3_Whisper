@@ -9,7 +9,12 @@ from typing import Any
 
 from huggingface_hub import snapshot_download
 
-from .genesis_whisper_server_globals import LOCAL_ASR_MODEL_SPECS, resolve_local_model_cache_path
+from .genesis_whisper_server_globals import (
+    LOCAL_ASR_MODEL_SPECS,
+    current_settings,
+    resolve_local_model_cache_path,
+    settings_lock,
+)
 
 BYTES_PER_GB = 1024 ** 3
 _model_jobs_lock = threading.Lock()
@@ -34,6 +39,44 @@ def _resolve_storage_root(storage_path: str) -> Path:
         return Path(env_cache).expanduser().resolve(strict=False)
 
     return (Path.home() / ".cache" / "huggingface" / "hub").resolve(strict=False)
+
+
+def _resolve_huggingface_token(explicit_token: str | None = None) -> str | None:
+    candidate = str(explicit_token or "").strip()
+    if candidate:
+        return candidate
+
+    with settings_lock:
+        settings_token = str(current_settings.get("huggingface_token", "")).strip()
+    if settings_token:
+        return settings_token
+
+    env_token = str(os.getenv("HUGGINGFACE_TOKEN") or os.getenv("HF_TOKEN") or "").strip()
+    return env_token or None
+
+
+def _format_download_error(model_id: str, exc: Exception, token_present: bool) -> str:
+    message = str(exc).strip() or exc.__class__.__name__
+    normalized_message = message.lower()
+    is_auth_error = (
+        "cannot access gated repo" in normalized_message
+        or "gated repo" in normalized_message
+        or "401 client error" in normalized_message
+        or "401 unauthorized" in normalized_message
+        or "please log in" in normalized_message
+    )
+    if not is_auth_error:
+        return message
+
+    if token_present:
+        return (
+            f"{message} The configured Hugging Face token may not have access to '{model_id}'. "
+            f"Make sure the same account accepted the model license on Hugging Face, then retry."
+        )
+
+    return (
+        f"{message} Enter a Hugging Face token with access to '{model_id}' in the admin settings and retry."
+    )
 
 
 def _job_key(model_id: str, storage_root: Path) -> tuple[str, str]:
@@ -152,7 +195,7 @@ def list_model_statuses(storage_path: str) -> list[dict[str, Any]]:
     return statuses
 
 
-def queue_model_download(model_id: str, storage_path: str) -> dict[str, Any]:
+def queue_model_download(model_id: str, storage_path: str, huggingface_token: str | None = None) -> dict[str, Any]:
     model_specs = _supported_model_specs()
     if model_id not in model_specs:
         raise ValueError(f"Unsupported model id '{model_id}'.")
@@ -160,6 +203,7 @@ def queue_model_download(model_id: str, storage_path: str) -> dict[str, Any]:
     storage_root = _resolve_storage_root(storage_path)
     storage_root.mkdir(parents=True, exist_ok=True)
     current_job_key = _job_key(model_id, storage_root)
+    download_token = _resolve_huggingface_token(huggingface_token)
 
     with _model_jobs_lock:
         existing_job = _model_jobs.get(current_job_key)
@@ -175,14 +219,19 @@ def queue_model_download(model_id: str, storage_path: str) -> dict[str, Any]:
 
     def worker() -> None:
         try:
-            snapshot_download(model_id, cache_dir=str(storage_root), resume_download=True)
+            snapshot_download(
+                model_id,
+                cache_dir=str(storage_root),
+                resume_download=True,
+                token=download_token,
+            )
         except Exception as exc:
             with _model_jobs_lock:
                 _model_jobs[current_job_key] = {
                     "model_id": model_id,
                     "storage_root": str(storage_root),
                     "status": "error",
-                    "error": str(exc),
+                    "error": _format_download_error(model_id, exc, token_present=bool(download_token)),
                     "updated_at": _now_iso(),
                 }
             return

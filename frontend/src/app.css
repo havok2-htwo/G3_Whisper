@@ -284,6 +284,12 @@ button:disabled {
   max-width: 820px;
 }
 
+.field-note {
+  margin-top: -6px;
+  font-size: 0.92rem;
+  color: var(--text-dim);
+}
+
 .benchmark-form {
   display: grid;
   gap: 16px;

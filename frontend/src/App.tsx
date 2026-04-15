@@ -684,7 +684,12 @@ export default function App() {
     setGlobalError("");
 
     try {
-      const response = await downloadModel(adminKey, model.id, settingsForm.local_model_cache_path);
+      const response = await downloadModel(
+        adminKey,
+        model.id,
+        settingsForm.local_model_cache_path,
+        settingsForm.huggingface_token,
+      );
       startTransition(() => {
         setManagedModels(response.models ?? []);
         setActionMessage(`Download queued for ${model.label}.`);
@@ -1216,6 +1221,11 @@ export default function App() {
                 onChange={(event) => updateSetting("huggingface_token", event.target.value)}
               />
             </label>
+            <p className="field-note full-width">
+              Needed for gated Hugging Face models like <code>pyannote/embedding</code>. Save the settings to persist
+              it for runtime use; the current typed value is also sent with manual model downloads from the Cache
+              Manager.
+            </p>
 
             <label>
               <span>Wait Time (ms)</span>

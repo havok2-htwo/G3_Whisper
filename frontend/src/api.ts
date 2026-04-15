@@ -174,13 +174,14 @@ export async function getModels(adminKey: string, storagePath?: string) {
   });
 }
 
-export async function downloadModel(adminKey: string, modelId: string, storagePath: string) {
+export async function downloadModel(adminKey: string, modelId: string, storagePath: string, huggingfaceToken?: string) {
   return requestJson<{ job: Record<string, unknown>; models: ManagedModel[] }>("/api/admin/models/download", {
     method: "POST",
     adminKey,
     body: JSON.stringify({
       model_id: modelId,
       storage_path: storagePath,
+      huggingface_token: huggingfaceToken,
     }),
   });
 }

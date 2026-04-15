@@ -52,6 +52,7 @@ class AdminSettingsPayload(BaseModel):
 class AdminModelActionPayload(BaseModel):
     model_id: str
     storage_path: str | None = None
+    huggingface_token: str | None = None
 
 
 def _serialize_settings() -> Dict[str, Any]:
@@ -291,7 +292,11 @@ def create_admin_api(app: FastAPI) -> FastAPI:
     @app.post("/api/admin/models/download")
     async def admin_download_model(payload: AdminModelActionPayload, _: dict[str, str] = Depends(require_admin)):
         try:
-            job = queue_model_download(payload.model_id, _effective_model_storage_path(payload.storage_path))
+            job = queue_model_download(
+                payload.model_id,
+                _effective_model_storage_path(payload.storage_path),
+                payload.huggingface_token,
+            )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return {
