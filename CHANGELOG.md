@@ -4,6 +4,10 @@ Dieses Dokument wird bewusst knapp gehalten und bei kuenftigen Arbeiten fortgesc
 
 ## Unreleased
 
+- **Fix:** Gated Hugging Face token from Admin Settings or `HUGGINGFACE_TOKEN` / `HF_TOKEN` is now reused during direct local ASR model loading, not only during explicit cache downloads.
+- **Fix:** Der Cohere-Ladepfad erkennt unvollstaendige lokale Snapshots jetzt korrekt als `partial`, fuehrt bei Bedarf einen vollstaendigen `snapshot_download(...)` aus und laedt erst danach aus dem fertigen lokalen Snapshot.
+- **Fix:** Der Cache Manager markiert `CohereLabs/cohere-transcribe-03-2026` nicht mehr vorschnell als `ready`; fuer `ready` muessen jetzt Remote-Code-Dateien, `tokenizer.model` und Modellgewichte vollstaendig lokal vorliegen.
+- **Doku:** `README.md`, `API_DOCUMENTATION.md` und `VENV_SETUP.md` an aktuelle Defaults, Admin-Model-Endpoints und den gated-Cohere-Workflow angepasst.
 - **Fix:** `pyannote/embedding` wird im Cache Manager nicht mehr faelschlich als unvollstaendig erkannt; als vollstaendiger Snapshot gelten jetzt `config.yaml` plus `pytorch_model.bin`.
 - **Fix:** Der Voice-Vector-Loader nutzt fuer `pyannote/embedding` jetzt den korrekten pyannote-Parameter `token=` und bevorzugt einen vollstaendigen lokalen Snapshot aus `local_model_cache_path`.
 - **Fix:** `omegaconf` wurde als explizite Python-Abhaengigkeit aufgenommen, weil der Runtime-Load von `pyannote/embedding` sonst trotz installiertem `pyannote.audio` mit `voice_vector=null` scheitern kann.

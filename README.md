@@ -11,6 +11,7 @@ It provides a simple upload API for audio and video files, features a protected 
 - `CohereLabs/cohere-transcribe-03-2026`
 
 Optionally, a voice vector can also be generated based on `pyannote/embedding`.
+For gated Hugging Face models, the runtime loader can use the saved admin-setting token or `HUGGINGFACE_TOKEN` / `HF_TOKEN`.
 
 This file acts as the central functional and technical reference for this repository. If the code and the README diverge, the following rule applies: The README must be updated in the same work step until it accurately reflects the current state again.
 
@@ -47,6 +48,7 @@ Old Gradio, OpenAI, Voxtral, and side-server paths are no longer active. Such le
 - admin dashboard protected by `X-Admin-Key`
 - persistent hashed admin key plus temporary startup admin key on launch
 - Model switching, Hugging Face Token input, and runtime settings in the admin panel
+- Cache Manager with `missing`, `partial`, `downloading`, `ready`, and `error` states
 - Batch queue for Whisper
 - Benchmark in the admin panel including:
   - Runtime
@@ -127,6 +129,7 @@ Behavior:
 - If `voice_ident=true`, the request is intentionally processed serially under a GPU lock.
 - If the active model is a Whisper model, audio is split into speech segments prior to batch inference.
 - If the active model is Cohere, the local ASR path currently processes the audio as a single item.
+- For gated Cohere loads, the runtime path now completes an incomplete Hugging Face snapshot first and only then loads the model from the finished local snapshot.
 - Only the native `POST /transcribe/` route can return a `voice_vector`.
 
 ### OpenAI-Compatible Routes
@@ -206,6 +209,7 @@ Currently available:
 - `openai/whisper-large-v3`
 - `openai/whisper-medium`
 - `openai/whisper-small`
+- `openai/whisper-base`
 - `openai/whisper-tiny`
 
 The Cache Manager in the UI also additionally supports downloading and deleting the `pyannote/embedding` model for Voice Vectors.
@@ -231,6 +235,7 @@ Backend-specific exception:
 
 - The Cohere ASR model is currently intentionally loaded with `attn_implementation="eager"` because the current Transformers integration for this model does not properly support `sdpa` or `flash_attention_2` yet.
 - On Windows, the internal Cohere `transcribe()` compile path is disabled if no `cl.exe` is found.
+- For gated Cohere models, the runtime loader now reuses the configured Hugging Face token for both direct `from_pretrained(...)` calls and a full fallback `snapshot_download(...)` when the local cache is incomplete.
 
 Currently not included as a fixed integrated standard:
 
@@ -262,9 +267,10 @@ The most important environment variables:
 
 - `HUGGINGFACE_TOKEN`
   - required for `pyannote/embedding`
-  - may also be relevant for gated Hugging Face models
+  - required for gated Hugging Face models such as `CohereLabs/cohere-transcribe-03-2026` unless the token is saved in the admin UI
   - **Note:** Can now optionally be configured directly via the Admin Settings UI, which takes precedence over `.env`.
   - **Important:** A token entered only during a manual cache download is not sufficient for later runtime loading. The token must be persisted in Admin Settings or `.env`.
+  - **Important:** The same saved token is now also used by the runtime loader itself when Cohere needs to complete missing snapshot files such as `tokenizer.model`.
 - `GENESIS_ADMIN_KEY`
   - optional bootstrap value for the persistent admin key on first run
 - `GENESIS_STARTUP_ADMIN_KEY`
@@ -289,15 +295,16 @@ Important files:
 
 ## Default Settings
 
-The active default values come from [genesis_whisper_server_storage.py](x:/dev/G3_WHISPER/genesis_whisper_server_storage.py):
+The active default values come from [backend/genesis_whisper_server_storage.py](x:/dev/G3_WHISPER/backend/genesis_whisper_server_storage.py):
 
-- `local_model`: `openai/whisper-base`
+- `local_model`: `openai/whisper-large-v3-turbo`
 - `local_gpu_device`: `auto`
-- `local_model_cache_path`: empty
+- `local_model_cache_path`: `.\models`
 - `transcription_language`: `auto`
-- `batch_wait_time_ms`: `250`
-- `batch_max_segments`: `8`
-- `batch_max_audio_seconds`: `120.0`
+- `batch_wait_time_ms`: `500`
+- `batch_max_segments`: `32`
+- `batch_max_audio_seconds`: `300.0`
+- `huggingface_token`: empty string
 
 ## Admin Endpoints
 
@@ -308,6 +315,9 @@ Active admin routes:
 - `POST /api/admin/keys`
 - `GET /api/admin/settings`
 - `PUT /api/admin/settings`
+- `GET /api/admin/models`
+- `POST /api/admin/models/download`
+- `POST /api/admin/models/delete`
 - `GET /api/admin/stats`
 - `GET /api/admin/queue`
 - `POST /api/admin/benchmark`
@@ -472,7 +482,10 @@ The admin benchmark also accepts audio or video and uses the same audio loading 
 - The active speech detection path is energy-based. The `webrtcvad` helper implementation is currently not used in the main runtime flow.
 - The OpenAI-compatible `POST /v1/audio/transcriptions` route currently uses the active saved server model/settings and mainly varies the response shape for client compatibility.
 - The Cohere model relies on `trust_remote_code`; the dynamic modules required for this are cached locally within the project under [`models/hf_modules`](x:/dev/G3_WHISPER/models/hf_modules) instead of in the global user cache.
+- Cohere is only treated as cache-ready when its local snapshot contains the expected remote-code files, tokenizer assets including `tokenizer.model`, and model weights. Incomplete snapshots are intentionally surfaced as `partial`.
+- If a gated Cohere snapshot is incomplete but a valid Hugging Face token is configured, the runtime loader now performs a full `snapshot_download(...)` before loading the local snapshot.
 - On Windows, if no `cl.exe` is available, Cohere continues to run without the optional internal compile path.
+- On Windows, Hugging Face may warn about degraded cache behavior without symlink support. Developer Mode or elevated execution improves this, but the cache still works without it.
 - `pyannote/embedding` is treated as cache-ready when its snapshot contains `config.yaml` and `pytorch_model.bin`; unlike Whisper models it does not rely on `preprocessor_config.json`.
 - The voice-vector loader prefers a complete local snapshot under the configured `local_model_cache_path` before falling back to the Hugging Face Hub cache.
 - `__pycache__` might reappear locally. This is normal and not source code.

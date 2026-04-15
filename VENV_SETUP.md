@@ -18,6 +18,8 @@ Dieses Projekt nutzt jetzt einen lokalen Python-Ordner `venv` direkt im Repo und
 - Das Frontend wird weiterhin separat ueber `frontend\package.json` verwaltet
 - Wenn `requirements.txt` geaendert wurde, installiert `start.bat` die Python-Abhaengigkeiten beim naechsten Start erneut
 - Fuer Voice Vectors via `pyannote/embedding` muss die lokale `venv` vollstaendig sein; insbesondere `omegaconf` muss installiert sein und ist deshalb explizit Teil von `requirements.txt`
+- Fuer gated Hugging Face Modelle wie `CohereLabs/cohere-transcribe-03-2026` muss ein gueltiger Token entweder in den Admin Settings gespeichert oder als `HUGGINGFACE_TOKEN` / `HF_TOKEN` gesetzt sein
+- Beim ersten Cohere-Ladevorgang kann der Server fehlende Snapshot-Dateien wie `tokenizer.model` automatisch nachladen; auf Windows kann dabei eine Hugging-Face-Warnung zu fehlender Symlink-Unterstuetzung erscheinen, was nur die Cache-Effizienz betrifft
 
 ## Wichtige Dateien
 
