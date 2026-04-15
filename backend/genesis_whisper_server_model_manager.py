@@ -88,7 +88,11 @@ def _repo_root_for_model(model_id: str, storage_root: Path) -> Path:
     return storage_root / _repo_dir_name(model_id)
 
 
-def _resolve_snapshot_path(repo_root: Path) -> Path | None:
+def _snapshot_matches_required_files(snapshot_path: Path, required_files: tuple[str, ...]) -> bool:
+    return all((snapshot_path / required_file).is_file() for required_file in required_files)
+
+
+def _resolve_snapshot_path(repo_root: Path, required_files: tuple[str, ...]) -> Path | None:
     refs_main_path = repo_root / "refs" / "main"
     snapshots_dir = repo_root / "snapshots"
     snapshot_candidates: list[Path] = []
@@ -108,7 +112,7 @@ def _resolve_snapshot_path(repo_root: Path) -> Path | None:
             pass
 
     for snapshot_path in snapshot_candidates:
-        if (snapshot_path / "preprocessor_config.json").is_file():
+        if _snapshot_matches_required_files(snapshot_path, required_files):
             return snapshot_path
 
     return None
@@ -136,6 +140,7 @@ def _supported_model_specs() -> dict[str, dict[str, Any]]:
             "label": label,
             "backend": spec.get("backend", "whisper"),
             "approx_size_gb": spec.get("approx_size_gb"),
+            "required_files": ("preprocessor_config.json",),
         }
         for label, spec in LOCAL_ASR_MODEL_SPECS.items()
     }
@@ -145,7 +150,8 @@ def _supported_model_specs() -> dict[str, dict[str, Any]]:
     specs["pyannote/embedding"] = {
         "label": "Pyannote Speaker Diarization",
         "backend": "pyannote",
-        "approx_size_gb": 0.05
+        "approx_size_gb": 0.05,
+        "required_files": ("config.yaml", "pytorch_model.bin"),
     }
     
     return specs
@@ -161,7 +167,7 @@ def list_model_statuses(storage_path: str) -> list[dict[str, Any]]:
     for model_id, metadata in model_specs.items():
         repo_root = _repo_root_for_model(model_id, storage_root)
         repo_exists = repo_root.exists()
-        snapshot_path = _resolve_snapshot_path(repo_root) if repo_exists else None
+        snapshot_path = _resolve_snapshot_path(repo_root, tuple(metadata.get("required_files", ()))) if repo_exists else None
         job = jobs.get(_job_key(model_id, storage_root))
 
         if job and job.get("status") == "downloading":

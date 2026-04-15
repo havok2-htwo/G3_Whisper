@@ -7,6 +7,7 @@
 
 import os
 import sys
+from pathlib import Path
 import torch
 import numpy as np
 from dotenv import load_dotenv
@@ -14,7 +15,12 @@ from typing import Dict, Any
 
 # Lade globale, Thread-sichere Variablen
 from .genesis_whisper_server_chunking import extract_speech_audio
-from .genesis_whisper_server_globals import model_load_lock as vid_model_lock, current_settings, settings_lock
+from .genesis_whisper_server_globals import (
+    current_settings,
+    model_load_lock as vid_model_lock,
+    resolve_local_model_cache_path,
+    settings_lock,
+)
 
 # Globale, Thread-sichere Komponente für das VID-Modell
 vid_model_components: Dict[str, Any] = {"model": None, "inference": None}
@@ -32,6 +38,39 @@ def _resolve_huggingface_token() -> str | None:
     load_dotenv()
     env_token = str(os.getenv("HUGGINGFACE_TOKEN") or os.getenv("HF_TOKEN") or "").strip()
     return env_token or None
+
+
+def _resolve_vid_pretrained_source() -> tuple[str, str | None]:
+    with settings_lock:
+        cache_path = resolve_local_model_cache_path(str(current_settings.get("local_model_cache_path", "")).strip())
+
+    if not cache_path:
+        return VID_MODEL_ID, None
+
+    repo_cache_dir = Path(cache_path) / f"models--{VID_MODEL_ID.replace('/', '--')}"
+    refs_main_path = repo_cache_dir / "refs" / "main"
+    snapshots_dir = repo_cache_dir / "snapshots"
+    snapshot_candidates: list[Path] = []
+
+    if refs_main_path.is_file():
+        try:
+            revision = refs_main_path.read_text(encoding="utf-8").strip()
+        except OSError:
+            revision = ""
+        if revision:
+            snapshot_candidates.append(snapshots_dir / revision)
+
+    if snapshots_dir.is_dir():
+        try:
+            snapshot_candidates.extend(path for path in snapshots_dir.iterdir() if path.is_dir())
+        except OSError:
+            pass
+
+    for snapshot_path in snapshot_candidates:
+        if (snapshot_path / "config.yaml").is_file() and (snapshot_path / "pytorch_model.bin").is_file():
+            return str(snapshot_path), cache_path
+
+    return VID_MODEL_ID, cache_path
 
 def load_vid_model() -> bool:
     """
@@ -60,8 +99,18 @@ def load_vid_model() -> bool:
             from pyannote.audio import Model, Inference
             
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            
-            model = Model.from_pretrained(VID_MODEL_ID, use_auth_token=HUGGING_FACE_TOKEN)
+
+            pretrained_source, cache_dir = _resolve_vid_pretrained_source()
+            if pretrained_source != VID_MODEL_ID:
+                print(f"[INFO-VID] Verwende lokales Cache-Modell fuer Stimmerkennung: {pretrained_source}", file=sys.stderr)
+            elif cache_dir:
+                print(f"[INFO-VID] Verwende Hugging-Face-Cache fuer Stimmerkennung: {cache_dir}", file=sys.stderr)
+
+            model = Model.from_pretrained(
+                pretrained_source,
+                token=HUGGING_FACE_TOKEN,
+                cache_dir=cache_dir,
+            )
             model.to(device)
             inference = Inference(model, window="whole")
 
