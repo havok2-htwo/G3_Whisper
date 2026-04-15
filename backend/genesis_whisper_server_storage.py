@@ -20,6 +20,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "batch_wait_time_ms": 500,
     "batch_max_segments": 32,
     "batch_max_audio_seconds": 300.0,
+    "huggingface_token": "",
 }
 
 
@@ -36,6 +37,7 @@ def normalize_settings(settings: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     normalized["transcription_language"] = (
         configured_language if configured_language in SUPPORTED_LANGUAGE_VALUES else DEFAULT_SETTINGS["transcription_language"]
     )
+    normalized["huggingface_token"] = str(source.get("huggingface_token", "")).strip()
 
     try:
         normalized["batch_wait_time_ms"] = max(0, int(source.get("batch_wait_time_ms", DEFAULT_SETTINGS["batch_wait_time_ms"])))

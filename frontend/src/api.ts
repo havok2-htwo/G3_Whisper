@@ -18,6 +18,7 @@ export type AdminSettings = {
   batch_wait_time_ms: number;
   batch_max_segments: number;
   batch_max_audio_seconds: number;
+  huggingface_token: string;
 };
 
 export type ManagedModel = {

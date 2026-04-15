@@ -46,7 +46,7 @@ Old Gradio, OpenAI, Voxtral, and side-server paths are no longer active. Such le
 - OpenAPI docs on `GET /docs` and schema export on `GET /openapi.json`
 - admin dashboard protected by `X-Admin-Key`
 - persistent hashed admin key plus temporary startup admin key on launch
-- Model switching and runtime settings in the admin panel
+- Model switching, Hugging Face Token input, and runtime settings in the admin panel
 - Batch queue for Whisper
 - Benchmark in the admin panel including:
   - Runtime
@@ -206,8 +206,9 @@ Currently available:
 - `openai/whisper-large-v3`
 - `openai/whisper-medium`
 - `openai/whisper-small`
-- `openai/whisper-base`
 - `openai/whisper-tiny`
+
+The Cache Manager in the UI also additionally supports downloading and deleting the `pyannote/embedding` model for Voice Vectors.
 
 Note:
 
@@ -262,6 +263,7 @@ The most important environment variables:
 - `HUGGINGFACE_TOKEN`
   - required for `pyannote/embedding`
   - may also be relevant for gated Hugging Face models
+  - **Note:** Can now optionally be configured directly via the Admin Settings UI, which takes precedence over `.env`.
 - `GENESIS_ADMIN_KEY`
   - optional bootstrap value for the persistent admin key on first run
 - `GENESIS_STARTUP_ADMIN_KEY`

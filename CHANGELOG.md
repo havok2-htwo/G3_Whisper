@@ -4,6 +4,8 @@ Dieses Dokument wird bewusst knapp gehalten und bei kuenftigen Arbeiten fortgesc
 
 ## Unreleased
 
+- **Neu:** Hugging Face Token kann nun optional direkt in der Server-UI (Settings) konfiguriert werden, was ein manuelles Pflegen der `.env`-Datei nicht mehr zwingend erfordert.
+- **Neu:** Das `pyannote/embedding` Modell fuer die Stimmerkennung ist nun explizit im Cache Manager sichtbar und kann dort ueber die UI heruntergeladen, aktualisiert oder gelöscht werden.
 - Root-Python-Dateien in das neue Paket `backend/` verschoben und die Startpfade auf `python -m backend.genesis_whisper_server` umgestellt.
 - Startskripte auf `start.bat` und `start.sh` als neue Standard-Einstiegspunkte umgestellt.
 - Linux-Pfad mit separatem `install.sh` fuer Setup/Build und angepasstem `start.sh` fuer den Serverstart ergänzt.

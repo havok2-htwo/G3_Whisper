@@ -46,6 +46,7 @@ class AdminSettingsPayload(BaseModel):
     batch_wait_time_ms: int
     batch_max_segments: int
     batch_max_audio_seconds: float
+    huggingface_token: str
 
 
 class AdminModelActionPayload(BaseModel):

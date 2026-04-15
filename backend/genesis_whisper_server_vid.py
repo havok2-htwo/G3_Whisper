@@ -14,7 +14,7 @@ from typing import Dict, Any
 
 # Lade globale, Thread-sichere Variablen
 from .genesis_whisper_server_chunking import extract_speech_audio
-from .genesis_whisper_server_globals import model_load_lock as vid_model_lock
+from .genesis_whisper_server_globals import model_load_lock as vid_model_lock, current_settings, settings_lock
 
 # Globale, Thread-sichere Komponente für das VID-Modell
 vid_model_components: Dict[str, Any] = {"model": None, "inference": None}
@@ -37,13 +37,20 @@ def load_vid_model() -> bool:
 
         print("[INFO-VID] Lade Stimmerkennungs-Modell (pyannote/embedding)...", file=sys.stderr)
 
-        # Token aus .env laden
+        # Token aus Settings oder .env laden
         if HUGGING_FACE_TOKEN is None:
-            load_dotenv()
-            HUGGING_FACE_TOKEN = os.getenv('HUGGINGFACE_TOKEN')
-            if not HUGGING_FACE_TOKEN:
-                print("[FEHLER-VID] Hugging Face Token nicht in .env gefunden. Stimmerkennung ist nicht möglich.", file=sys.stderr)
-                return False
+            with settings_lock:
+                settings_token = current_settings.get("huggingface_token", "").strip()
+            
+            if settings_token:
+                HUGGING_FACE_TOKEN = settings_token
+                print("[INFO-VID] Hugging Face Token aus den Systemeinstellungen geladen.", file=sys.stderr)
+            else:
+                load_dotenv()
+                HUGGING_FACE_TOKEN = os.getenv('HUGGINGFACE_TOKEN', '')
+                if not HUGGING_FACE_TOKEN:
+                    print("[WARNUNG-VID] Hugging Face Token weder in Settings noch in .env gefunden. Versuche das Cache-Modell zu laden...", file=sys.stderr)
+                    HUGGING_FACE_TOKEN = None
 
         try:
             from pyannote.audio import Model, Inference

@@ -65,9 +65,10 @@ const emptySettings: AdminSettings = {
   local_gpu_device: "",
   local_model_cache_path: "",
   transcription_language: "auto",
-  batch_wait_time_ms: 250,
-  batch_max_segments: 8,
-  batch_max_audio_seconds: 120,
+  batch_wait_time_ms: 1000,
+  batch_max_segments: 16,
+  batch_max_audio_seconds: 60.0,
+  huggingface_token: "",
 };
 
 function readStoredAdminKey() {
@@ -1206,6 +1207,16 @@ export default function App() {
               />
             </label>
 
+            <label className="full-width">
+              <span>Hugging Face Token</span>
+              <input
+                type="password"
+                placeholder="hf_... (optional)"
+                value={settingsForm.huggingface_token}
+                onChange={(event) => updateSetting("huggingface_token", event.target.value)}
+              />
+            </label>
+
             <label>
               <span>Wait Time (ms)</span>
               <input
@@ -1370,7 +1381,7 @@ export default function App() {
                       <strong>{model.label}</strong>
                       <div className="muted mono model-id">{model.id}</div>
                     </td>
-                    <td>{model.backend === "cohere_transcribe" ? "Cohere" : "Whisper"}</td>
+                    <td>{model.backend === "cohere_transcribe" ? "Cohere" : model.backend === "pyannote" ? "Pyannote" : "Whisper"}</td>
                     <td>{formatModelSize(model)}</td>
                     <td className="model-status-cell">
                       <strong>{formatModelStatus(model.status)}</strong>

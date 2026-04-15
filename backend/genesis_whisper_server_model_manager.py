@@ -88,7 +88,7 @@ def _directory_size_gb(path: Path | None) -> float | None:
 
 
 def _supported_model_specs() -> dict[str, dict[str, Any]]:
-    return {
+    specs = {
         str(spec["value"]): {
             "label": label,
             "backend": spec.get("backend", "whisper"),
@@ -96,6 +96,16 @@ def _supported_model_specs() -> dict[str, dict[str, Any]]:
         }
         for label, spec in LOCAL_ASR_MODEL_SPECS.items()
     }
+    
+    # Add pyannote model explicitly here so it shows up in Cache Manager 
+    # but not in the ASR Model dropdown list
+    specs["pyannote/embedding"] = {
+        "label": "Pyannote Speaker Diarization",
+        "backend": "pyannote",
+        "approx_size_gb": 0.05
+    }
+    
+    return specs
 
 
 def list_model_statuses(storage_path: str) -> list[dict[str, Any]]:
