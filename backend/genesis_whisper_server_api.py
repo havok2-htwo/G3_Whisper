@@ -160,7 +160,15 @@ def create_api(app: FastAPI) -> FastAPI:
                         voice_vector_duration_ms = round((time.monotonic() - v_start) * 1000)
                         print(f"[API-INFO] Stimm-Vektor erfolgreich generiert in {voice_vector_duration_ms}ms.", file=sys.stderr)
                     except Exception as exc:
-                        print(f"[API-FEHLER] Stimm-Vektor-Generierung fehlgeschlagen: {exc}", file=sys.stderr)
+                        error_detail = str(exc)
+                        if "omegaconf" in error_detail.lower():
+                            error_detail = (
+                                "Stimm-Vektor-Generierung fehlgeschlagen: Fehlende Python-Abhaengigkeit "
+                                "'omegaconf' auf dem Server. Bitte venv/requirements aktualisieren."
+                            )
+                        else:
+                            error_detail = f"Stimm-Vektor-Generierung fehlgeschlagen: {exc}"
+                        print(f"[API-FEHLER] {error_detail}", file=sys.stderr)
                         voice_vector = None
                         voice_vector_duration_ms = round((time.monotonic() - v_start) * 1000)
 

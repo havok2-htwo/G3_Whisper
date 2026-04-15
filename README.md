@@ -264,6 +264,7 @@ The most important environment variables:
   - required for `pyannote/embedding`
   - may also be relevant for gated Hugging Face models
   - **Note:** Can now optionally be configured directly via the Admin Settings UI, which takes precedence over `.env`.
+  - **Important:** A token entered only during a manual cache download is not sufficient for later runtime loading. The token must be persisted in Admin Settings or `.env`.
 - `GENESIS_ADMIN_KEY`
   - optional bootstrap value for the persistent admin key on first run
 - `GENESIS_STARTUP_ADMIN_KEY`
@@ -463,6 +464,7 @@ The admin benchmark also accepts audio or video and uses the same audio loading 
 
 - `python-multipart` is required for FastAPI form uploads and is part of [requirements.txt](x:/dev/G3_WHISPER/requirements.txt).
 - `librosa` is required by parts of the local ASR stack and is therefore explicitly part of [requirements.txt](x:/dev/G3_WHISPER/requirements.txt).
+- `omegaconf` is explicitly part of [requirements.txt](x:/dev/G3_WHISPER/requirements.txt) because `pyannote/embedding` can otherwise fail at runtime even when `pyannote.audio` is already installed.
 - The server has been migrated to FastAPI Lifespan. Old event handler calls should not be reintroduced.
 - If a model cannot be loaded, the API and benchmark will bubble up the specific loader error instead of just a generic message.
 - For models wrapped with `torch.compile(...)`, do not use truthiness checks like `if not model`. Always explicitly check `is None` instead.
@@ -471,6 +473,8 @@ The admin benchmark also accepts audio or video and uses the same audio loading 
 - The OpenAI-compatible `POST /v1/audio/transcriptions` route currently uses the active saved server model/settings and mainly varies the response shape for client compatibility.
 - The Cohere model relies on `trust_remote_code`; the dynamic modules required for this are cached locally within the project under [`models/hf_modules`](x:/dev/G3_WHISPER/models/hf_modules) instead of in the global user cache.
 - On Windows, if no `cl.exe` is available, Cohere continues to run without the optional internal compile path.
+- `pyannote/embedding` is treated as cache-ready when its snapshot contains `config.yaml` and `pytorch_model.bin`; unlike Whisper models it does not rely on `preprocessor_config.json`.
+- The voice-vector loader prefers a complete local snapshot under the configured `local_model_cache_path` before falling back to the Hugging Face Hub cache.
 - `__pycache__` might reappear locally. This is normal and not source code.
 - [backend/genesis_whisper_server_diarization_engine.py](x:/dev/G3_WHISPER/backend/genesis_whisper_server_diarization_engine.py) is in the repo but is not currently part of the active main path.
 
