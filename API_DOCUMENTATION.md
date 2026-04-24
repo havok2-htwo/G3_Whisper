@@ -93,7 +93,7 @@ Success response with voice embedding:
 Typical errors:
 
 - `400`: upload could not be decoded or validated
-- `500`: model load or runtime error
+- `500`: model load or runtime error; the server currently propagates the concrete loader message
 
 ### `GET /v1/models`
 
@@ -113,7 +113,7 @@ Example response:
   "object": "list",
   "data": [
     {
-      "id": "openai/whisper-base",
+      "id": "openai/whisper-large-v3-turbo",
       "object": "model",
       "created": 1760000000,
       "owned_by": "genesis"
@@ -246,17 +246,18 @@ Response shape:
 ```json
 {
   "settings": {
-    "local_model": "openai/whisper-base",
+    "local_model": "openai/whisper-large-v3-turbo",
     "local_gpu_device": "auto",
-    "local_model_cache_path": "",
+    "local_model_cache_path": ".\\models",
     "transcription_language": "auto",
-    "batch_wait_time_ms": 250,
-    "batch_max_segments": 8,
-    "batch_max_audio_seconds": 120.0
+    "batch_wait_time_ms": 500,
+    "batch_max_segments": 32,
+    "batch_max_audio_seconds": 300.0,
+    "huggingface_token": "hf_xxx"
   },
   "options": {
     "models": [
-      { "label": "Whisper Base", "value": "openai/whisper-base" }
+      { "label": "Whisper Large v3 Turbo", "value": "openai/whisper-large-v3-turbo" }
     ],
     "devices": [
       { "label": "Auto (Empfohlen)", "value": "auto" }
@@ -265,10 +266,25 @@ Response shape:
       { "label": "German (de)", "value": "de" }
     ]
   },
+  "models": [
+    {
+      "id": "CohereLabs/cohere-transcribe-03-2026",
+      "label": "Cohere Transcribe 03/2026",
+      "backend": "cohere_transcribe",
+      "status": "partial",
+      "local_path": null,
+      "cache_path": "X:\\dev\\G3_WHISPER\\models\\models--CohereLabs--cohere-transcribe-03-2026",
+      "storage_root": "X:\\dev\\G3_WHISPER\\models",
+      "approx_size_gb": null,
+      "size_on_disk_gb": 0.0,
+      "error": null,
+      "updated_at": null
+    }
+  ],
   "loaded_model_identifier": [
-    "openai/whisper-base",
+    "openai/whisper-large-v3-turbo",
     "auto",
-    ""
+    ".\\models"
   ]
 }
 ```
@@ -284,13 +300,14 @@ Request body:
 
 ```json
 {
-  "local_model": "openai/whisper-base",
+  "local_model": "openai/whisper-large-v3-turbo",
   "local_gpu_device": "auto",
-  "local_model_cache_path": "",
+  "local_model_cache_path": ".\\models",
   "transcription_language": "auto",
-  "batch_wait_time_ms": 250,
-  "batch_max_segments": 8,
-  "batch_max_audio_seconds": 120.0
+  "batch_wait_time_ms": 500,
+  "batch_max_segments": 32,
+  "batch_max_audio_seconds": 300.0,
+  "huggingface_token": "hf_xxx"
 }
 ```
 
@@ -301,6 +318,103 @@ Response fields:
 - `model_reloaded`
 - `model_loaded`
 - `options`
+- `models`
+
+Notes:
+
+- `huggingface_token` can be stored via this route and is then reused by later manual cache downloads and runtime model loads.
+
+### `GET /api/admin/models`
+
+Purpose:
+
+- returns the cache-manager status list for the selected storage path
+
+Query params:
+
+- `storage_path` (optional): overrides the configured model storage root for the status query
+
+Response shape:
+
+```json
+{
+  "models": [
+    {
+      "id": "CohereLabs/cohere-transcribe-03-2026",
+      "label": "Cohere Transcribe 03/2026",
+      "backend": "cohere_transcribe",
+      "status": "partial",
+      "local_path": null,
+      "cache_path": "X:\\dev\\G3_WHISPER\\models\\models--CohereLabs--cohere-transcribe-03-2026",
+      "storage_root": "X:\\dev\\G3_WHISPER\\models",
+      "approx_size_gb": null,
+      "size_on_disk_gb": 0.0,
+      "error": null,
+      "updated_at": null
+    }
+  ]
+}
+```
+
+Status values currently used:
+
+- `missing`
+- `partial`
+- `downloading`
+- `ready`
+- `error`
+
+Notes:
+
+- A gated Cohere snapshot is only considered `ready` if the required remote-code files, tokenizer assets including `tokenizer.model`, and model weights are all present locally.
+
+### `POST /api/admin/models/download`
+
+Purpose:
+
+- starts or resumes a background model download for the selected cache path
+
+Request body:
+
+```json
+{
+  "model_id": "CohereLabs/cohere-transcribe-03-2026",
+  "storage_path": ".\\models",
+  "huggingface_token": "hf_xxx"
+}
+```
+
+Response fields:
+
+- `job`
+- `models`
+
+Notes:
+
+- If `huggingface_token` is omitted, the server falls back to the saved admin settings token and then to `HUGGINGFACE_TOKEN` / `HF_TOKEN`.
+
+### `POST /api/admin/models/delete`
+
+Purpose:
+
+- removes the cached repository directory for a managed model from the selected storage path
+
+Request body:
+
+```json
+{
+  "model_id": "CohereLabs/cohere-transcribe-03-2026",
+  "storage_path": ".\\models"
+}
+```
+
+Response fields:
+
+- `ok`
+- `removed`
+- `removed_path`
+- `storage_root`
+- `models`
 
 ### `GET /api/admin/stats`
 
@@ -426,4 +540,5 @@ Special case:
 - direct `soundfile` decode is preferred; `ffmpeg` is the fallback for unsupported formats
 - Whisper chunking currently uses the energy-based speech detector
 - Cohere uses the active saved language, and when the server setting is `auto`, it falls back to `de`
+- For gated Cohere models, the runtime loader reuses the saved Hugging Face token and completes incomplete local snapshots before loading from the finished local snapshot.
 - admin benchmark and public transcription log into [`logs`](x:/dev/G3_WHISPER/logs)

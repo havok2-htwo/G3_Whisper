@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
+from huggingface_hub import snapshot_download
 from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, WhisperForConditionalGeneration, WhisperProcessor
 
 try:
@@ -17,11 +18,13 @@ except ImportError:
     DYNAMO_AVAILABLE = False
 
 from .genesis_whisper_server_globals import (
+    current_settings,
     get_effective_transcription_language,
     get_local_model_backend,
     local_model_components,
     model_load_lock,
     resolve_local_model_cache_path,
+    settings_lock,
     uses_cohere_backend,
 )
 
@@ -67,6 +70,154 @@ def _resolve_local_pretrained_source(model_id: str, cache_path: str):
             return snapshot_path, {"local_files_only": True}
 
     return model_id, {"cache_dir": cache_path}
+
+
+def _resolve_snapshot_candidates(model_id: str, cache_path: str) -> List[str]:
+    if not cache_path:
+        return []
+
+    repo_cache_dir = os.path.join(cache_path, f"models--{model_id.replace('/', '--')}")
+    snapshots_dir = os.path.join(repo_cache_dir, "snapshots")
+    refs_main_path = os.path.join(repo_cache_dir, "refs", "main")
+    snapshot_candidates: List[str] = []
+
+    if os.path.isfile(refs_main_path):
+        try:
+            with open(refs_main_path, "r", encoding="utf-8") as refs_file:
+                snapshot_name = refs_file.read().strip()
+            if snapshot_name:
+                snapshot_candidates.append(os.path.join(snapshots_dir, snapshot_name))
+        except OSError:
+            pass
+
+    if os.path.isdir(snapshots_dir):
+        try:
+            snapshot_candidates.extend(
+                os.path.join(snapshots_dir, entry.name)
+                for entry in os.scandir(snapshots_dir)
+                if entry.is_dir()
+            )
+        except OSError:
+            pass
+
+    return snapshot_candidates
+
+
+def _snapshot_contains_any(snapshot_path: str, filenames: List[str]) -> bool:
+    return any(os.path.isfile(os.path.join(snapshot_path, filename)) for filename in filenames)
+
+
+def _is_snapshot_ready_for_model(model_id: str, snapshot_path: str) -> bool:
+    if not snapshot_path or not os.path.isdir(snapshot_path):
+        return False
+
+    required_files = ["config.json", "preprocessor_config.json"]
+    if uses_cohere_backend(model_id):
+        required_files.extend(
+            [
+                "configuration_cohere_asr.py",
+                "modeling_cohere_asr.py",
+                "processing_cohere_asr.py",
+                "tokenization_cohere_asr.py",
+                "processor_config.json",
+                "tokenizer_config.json",
+                "tokenizer.model",
+            ]
+        )
+        tokenizer_files = ["tokenizer.model"]
+    else:
+        required_files.append("tokenizer_config.json")
+        tokenizer_files = ["tokenizer.json", "vocab.json"]
+
+    if not all(os.path.isfile(os.path.join(snapshot_path, filename)) for filename in required_files):
+        return False
+
+    if not _snapshot_contains_any(snapshot_path, tokenizer_files):
+        return False
+
+    return _snapshot_contains_any(
+        snapshot_path,
+        ["model.safetensors", "model.safetensors.index.json", "pytorch_model.bin", "pytorch_model.bin.index.json"],
+    )
+
+
+def _resolve_cached_snapshot_path(model_id: str, cache_path: str) -> Optional[str]:
+    for snapshot_path in _resolve_snapshot_candidates(model_id, cache_path):
+        if _is_snapshot_ready_for_model(model_id, snapshot_path):
+            return snapshot_path
+    return None
+
+
+def _resolve_huggingface_token() -> Optional[str]:
+    with settings_lock:
+        settings_token = str(current_settings.get("huggingface_token", "")).strip()
+    if settings_token:
+        return settings_token
+
+    env_token = str(os.getenv("HUGGINGFACE_TOKEN") or os.getenv("HF_TOKEN") or "").strip()
+    return env_token or None
+
+
+def _with_huggingface_token(pretrained_args: Dict[str, Any], huggingface_token: Optional[str]) -> Dict[str, Any]:
+    if not huggingface_token:
+        return dict(pretrained_args)
+
+    args_with_token = dict(pretrained_args)
+    args_with_token.setdefault("token", huggingface_token)
+    return args_with_token
+
+
+def _format_model_load_error(model_id: str, exc: Exception, token_present: bool) -> str:
+    message = str(exc).strip() or exc.__class__.__name__
+    normalized_message = message.lower()
+    is_auth_error = (
+        "cannot access gated repo" in normalized_message
+        or "gated repo" in normalized_message
+        or "401 client error" in normalized_message
+        or "401 unauthorized" in normalized_message
+        or "please log in" in normalized_message
+    )
+    if not is_auth_error:
+        return message
+
+    if token_present:
+        return (
+            f"{message} The configured Hugging Face token may not have access to '{model_id}'. "
+            f"Make sure the same Hugging Face account accepted the model license, then retry."
+        )
+
+    return (
+        f"{message} No Hugging Face token with access to '{model_id}' is currently configured. "
+        f"Save one in the admin settings or set HUGGINGFACE_TOKEN/HF_TOKEN, then retry."
+    )
+
+
+def _resolve_cohere_pretrained_source(
+    model_id: str,
+    cache_path: str,
+    huggingface_token: Optional[str],
+) -> Tuple[str, Dict[str, Any]]:
+    cached_snapshot_path = _resolve_cached_snapshot_path(model_id, cache_path)
+    if cached_snapshot_path:
+        return cached_snapshot_path, {"local_files_only": True}
+
+    if not huggingface_token:
+        if cache_path:
+            return model_id, {"cache_dir": cache_path}
+        return model_id, {}
+
+    print(
+        f"[INFO] Cohere-Snapshot fuer '{model_id}' ist lokal unvollstaendig. Starte vollstaendigen Hugging-Face-Download...",
+        file=sys.stderr,
+    )
+    snapshot_path = snapshot_download(
+        model_id,
+        cache_dir=cache_path or None,
+        resume_download=True,
+        token=huggingface_token,
+    )
+    print(f"[INFO] Cohere-Snapshot bereit: '{snapshot_path}'", file=sys.stderr)
+    return snapshot_path, {"local_files_only": True}
 
 
 def _prepare_model_loading_options(device_selection: str) -> Tuple[bool, Optional[str], torch.dtype, str]:
@@ -225,14 +376,24 @@ def load_local_asr_model(model_id: str, device_selection: str, cache_path: str) 
             f"[INFO] Lade lokales ASR-Modell: '{model_id}' (Backend: {model_backend}) auf Geraet '{device_selection}' mit Cache-Pfad: '{cache_path or 'Standard'}'...",
             file=sys.stderr,
         )
+        huggingface_token: Optional[str] = None
         try:
             use_gpu, target_device, torch_dtype, attn_implementation = _prepare_model_loading_options(device_selection)
             attn_implementation = _resolve_backend_attention_implementation(model_id, attn_implementation)
             resolved_cache_path = resolve_local_model_cache_path(cache_path)
+            huggingface_token = _resolve_huggingface_token()
 
             if resolved_cache_path:
                 os.makedirs(resolved_cache_path, exist_ok=True)
-            pretrained_source, pretrained_args = _resolve_local_pretrained_source(model_id, resolved_cache_path)
+            if uses_cohere_backend(model_id):
+                pretrained_source, pretrained_args = _resolve_cohere_pretrained_source(
+                    model_id,
+                    resolved_cache_path,
+                    huggingface_token,
+                )
+            else:
+                pretrained_source, pretrained_args = _resolve_local_pretrained_source(model_id, resolved_cache_path)
+            pretrained_args = _with_huggingface_token(pretrained_args, huggingface_token)
 
             if uses_cohere_backend(model_id):
                 dynamic_modules_cache = _configure_hf_dynamic_module_cache(resolved_cache_path)
@@ -272,8 +433,9 @@ def load_local_asr_model(model_id: str, device_selection: str, cache_path: str) 
             print(f"[INFO] Modell '{model_id}' erfolgreich auf '{str(model_device)}' geladen.", file=sys.stderr)
             return True
         except Exception as exc:
-            LAST_LOCAL_ASR_LOAD_ERROR = f"{type(exc).__name__}: {exc}"
-            print(f"[FEHLER] Kritisches Problem beim Laden des Modells '{model_id}': {exc}", file=sys.stderr)
+            formatted_error = _format_model_load_error(model_id, exc, token_present=bool(huggingface_token))
+            LAST_LOCAL_ASR_LOAD_ERROR = f"{type(exc).__name__}: {formatted_error}"
+            print(f"[FEHLER] Kritisches Problem beim Laden des Modells '{model_id}': {formatted_error}", file=sys.stderr)
             traceback.print_exc()
             _store_local_model_components(None, None, None, None)
             return False

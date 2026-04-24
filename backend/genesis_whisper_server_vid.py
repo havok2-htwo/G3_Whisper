@@ -121,7 +121,13 @@ def load_vid_model() -> bool:
             return True
 
         except Exception as e:
-            print(f"[FEHLER-VID] Kritisches Problem beim Laden des Stimmerkennungs-Modells: {e}", file=sys.stderr)
+            error_message = str(e)
+            if "No module named 'omegaconf'" in error_message:
+                error_message = (
+                    "Fehlende Python-Abhaengigkeit 'omegaconf'. "
+                    "Bitte die Server-venv mit requirements.txt aktualisieren."
+                )
+            print(f"[FEHLER-VID] Kritisches Problem beim Laden des Stimmerkennungs-Modells: {error_message}", file=sys.stderr)
             # Zurücksetzen, um einen erneuten Ladeversuch zu ermöglichen
             vid_model_components = {"model": None, "inference": None}
             return False

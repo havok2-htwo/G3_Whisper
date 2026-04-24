@@ -88,11 +88,22 @@ def _repo_root_for_model(model_id: str, storage_root: Path) -> Path:
     return storage_root / _repo_dir_name(model_id)
 
 
-def _snapshot_matches_required_files(snapshot_path: Path, required_files: tuple[str, ...]) -> bool:
-    return all((snapshot_path / required_file).is_file() for required_file in required_files)
+def _snapshot_matches_required_files(
+    snapshot_path: Path,
+    required_files: tuple[str, ...],
+    required_any_groups: tuple[tuple[str, ...], ...] = (),
+) -> bool:
+    if not all((snapshot_path / required_file).is_file() for required_file in required_files):
+        return False
+
+    return all(any((snapshot_path / candidate).is_file() for candidate in group) for group in required_any_groups)
 
 
-def _resolve_snapshot_path(repo_root: Path, required_files: tuple[str, ...]) -> Path | None:
+def _resolve_snapshot_path(
+    repo_root: Path,
+    required_files: tuple[str, ...],
+    required_any_groups: tuple[tuple[str, ...], ...] = (),
+) -> Path | None:
     refs_main_path = repo_root / "refs" / "main"
     snapshots_dir = repo_root / "snapshots"
     snapshot_candidates: list[Path] = []
@@ -112,7 +123,7 @@ def _resolve_snapshot_path(repo_root: Path, required_files: tuple[str, ...]) -> 
             pass
 
     for snapshot_path in snapshot_candidates:
-        if _snapshot_matches_required_files(snapshot_path, required_files):
+        if _snapshot_matches_required_files(snapshot_path, required_files, required_any_groups):
             return snapshot_path
 
     return None
@@ -140,10 +151,28 @@ def _supported_model_specs() -> dict[str, dict[str, Any]]:
             "label": label,
             "backend": spec.get("backend", "whisper"),
             "approx_size_gb": spec.get("approx_size_gb"),
-            "required_files": ("preprocessor_config.json",),
+            "required_files": ("config.json", "preprocessor_config.json", "tokenizer_config.json"),
+            "required_any_groups": (
+                ("tokenizer.json", "vocab.json"),
+                ("model.safetensors", "model.safetensors.index.json", "pytorch_model.bin", "pytorch_model.bin.index.json"),
+            ),
         }
         for label, spec in LOCAL_ASR_MODEL_SPECS.items()
     }
+    specs["CohereLabs/cohere-transcribe-03-2026"]["required_files"] = (
+        "config.json",
+        "preprocessor_config.json",
+        "processor_config.json",
+        "configuration_cohere_asr.py",
+        "modeling_cohere_asr.py",
+        "processing_cohere_asr.py",
+        "tokenization_cohere_asr.py",
+        "tokenizer_config.json",
+        "tokenizer.model",
+    )
+    specs["CohereLabs/cohere-transcribe-03-2026"]["required_any_groups"] = (
+        ("model.safetensors", "model.safetensors.index.json", "pytorch_model.bin", "pytorch_model.bin.index.json"),
+    )
     
     # Add pyannote model explicitly here so it shows up in Cache Manager 
     # but not in the ASR Model dropdown list
@@ -152,6 +181,7 @@ def _supported_model_specs() -> dict[str, dict[str, Any]]:
         "backend": "pyannote",
         "approx_size_gb": 0.05,
         "required_files": ("config.yaml", "pytorch_model.bin"),
+        "required_any_groups": (),
     }
     
     return specs
@@ -167,7 +197,15 @@ def list_model_statuses(storage_path: str) -> list[dict[str, Any]]:
     for model_id, metadata in model_specs.items():
         repo_root = _repo_root_for_model(model_id, storage_root)
         repo_exists = repo_root.exists()
-        snapshot_path = _resolve_snapshot_path(repo_root, tuple(metadata.get("required_files", ()))) if repo_exists else None
+        snapshot_path = (
+            _resolve_snapshot_path(
+                repo_root,
+                tuple(metadata.get("required_files", ())),
+                tuple(metadata.get("required_any_groups", ())),
+            )
+            if repo_exists
+            else None
+        )
         job = jobs.get(_job_key(model_id, storage_root))
 
         if job and job.get("status") == "downloading":
