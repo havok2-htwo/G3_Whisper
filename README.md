@@ -224,7 +224,8 @@ Note:
 
 The local ASR path already utilizes several optimizations:
 
-- GPU dtype optimization, preferring `bfloat16`, else `float16`
+- configurable GPU model precision via admin settings: `bf16`, `fp16`, `int8_bnb`, or `fp32`
+- optional 8-bit Transformers loading through `bitsandbytes` for lower model VRAM usage
 - `torch.compile(...)`, if available and sensible
 - `sdpa` as the attention standard
 - `flash_attention_2` only if `flash_attn` is installed
@@ -299,6 +300,7 @@ The active default values come from [backend/genesis_whisper_server_storage.py](
 
 - `local_model`: `openai/whisper-large-v3-turbo`
 - `local_gpu_device`: `auto`
+- `local_model_precision`: `fp16`
 - `local_model_cache_path`: `.\models`
 - `transcription_language`: `auto`
 - `batch_wait_time_ms`: `500`

@@ -41,3 +41,6 @@ marked_for_delete/
 # OS
 Thumbs.db
 .DS_Store
+
+# Huggingface Cache
+admin/

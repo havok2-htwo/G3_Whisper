@@ -86,6 +86,14 @@ SUPPORTED_LANGUAGE_OPTIONS: Dict[str, str] = {
 }
 SUPPORTED_LANGUAGE_VALUES = set(SUPPORTED_LANGUAGE_OPTIONS.values())
 
+SUPPORTED_MODEL_PRECISION_OPTIONS: Dict[str, str] = {
+    "BF16": "bf16",
+    "FP16": "fp16",
+    "INT8 (bitsandbytes)": "int8_bnb",
+    "FP32": "fp32",
+}
+SUPPORTED_MODEL_PRECISION_VALUES = set(SUPPORTED_MODEL_PRECISION_OPTIONS.values())
+
 
 def get_local_model_spec(model_id: str) -> Dict[str, str]:
     for spec in LOCAL_ASR_MODEL_SPECS.values():

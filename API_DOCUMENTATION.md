@@ -238,7 +238,7 @@ Response:
 Purpose:
 
 - returns current saved settings
-- returns UI options for models, devices, and languages
+- returns UI options for models, devices, precisions, and languages
 - returns the currently loaded model identifier if a model is already in memory
 
 Response shape:
@@ -248,6 +248,7 @@ Response shape:
   "settings": {
     "local_model": "openai/whisper-large-v3-turbo",
     "local_gpu_device": "auto",
+    "local_model_precision": "fp16",
     "local_model_cache_path": ".\\models",
     "transcription_language": "auto",
     "batch_wait_time_ms": 500,
@@ -261,6 +262,10 @@ Response shape:
     ],
     "devices": [
       { "label": "Auto (Empfohlen)", "value": "auto" }
+    ],
+    "precisions": [
+      { "label": "INT8 (bitsandbytes)", "value": "int8_bnb" },
+      { "label": "FP16", "value": "fp16" }
     ],
     "languages": [
       { "label": "German (de)", "value": "de" }
@@ -284,7 +289,8 @@ Response shape:
   "loaded_model_identifier": [
     "openai/whisper-large-v3-turbo",
     "auto",
-    ".\\models"
+    ".\\models",
+    "fp16"
   ]
 }
 ```
@@ -294,7 +300,7 @@ Response shape:
 Purpose:
 
 - validates and persists admin settings
-- reloads the model if model-related settings changed
+- reloads the model if model-related settings changed, including precision
 
 Request body:
 
@@ -302,6 +308,7 @@ Request body:
 {
   "local_model": "openai/whisper-large-v3-turbo",
   "local_gpu_device": "auto",
+  "local_model_precision": "fp16",
   "local_model_cache_path": ".\\models",
   "transcription_language": "auto",
   "batch_wait_time_ms": 500,

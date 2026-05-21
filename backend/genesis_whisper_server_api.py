@@ -35,18 +35,19 @@ def _normalize_engine(engine: str) -> str:
     raise HTTPException(status_code=400, detail="Es wird nur noch die lokale ASR-Engine unterstuetzt.")
 
 
-def _get_local_processing_key() -> Tuple[str, str, str, str]:
+def _get_local_processing_key() -> Tuple[str, str, str, str, str]:
     with settings_lock:
         model_id = current_settings["local_model"]
         device = current_settings["local_gpu_device"]
         cache_path = current_settings["local_model_cache_path"]
         language = current_settings.get("transcription_language", "auto")
-    return model_id, device, cache_path, language
+        precision = current_settings.get("local_model_precision", "fp16")
+    return model_id, device, cache_path, language, precision
 
 
-def process_local_asr_batch(audio_batch: List[np.ndarray], processing_key: Tuple[str, str, str, str]) -> List[str]:
-    model_id, device, cache_path, language = processing_key
-    if not load_local_asr_model(model_id, device, cache_path):
+def process_local_asr_batch(audio_batch: List[np.ndarray], processing_key: Tuple[str, str, str, str, str]) -> List[str]:
+    model_id, device, cache_path, language, precision = processing_key
+    if not load_local_asr_model(model_id, device, cache_path, precision):
         load_error = get_last_local_asr_load_error()
         detail = "Lokales ASR-Modell konnte nicht geladen werden."
         if load_error:
@@ -141,8 +142,8 @@ def create_api(app: FastAPI) -> FastAPI:
                 nonlocal transcription_text, voice_vector, transcription_duration_ms, voice_vector_duration_ms
 
                 t_start = time.monotonic()
-                local_model_id, device, cache, language = local_processing_key
-                if not load_local_asr_model(local_model_id, device, cache):
+                local_model_id, device, cache, language, precision = local_processing_key
+                if not load_local_asr_model(local_model_id, device, cache, precision):
                     load_error = get_last_local_asr_load_error()
                     detail = "Lokales ASR-Modell konnte nicht geladen werden."
                     if load_error:

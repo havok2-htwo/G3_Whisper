@@ -63,6 +63,7 @@ const MODEL_STATUS_POLL_MS = 2000;
 const emptySettings: AdminSettings = {
   local_model: "",
   local_gpu_device: "",
+  local_model_precision: "fp16",
   local_model_cache_path: "",
   transcription_language: "auto",
   batch_wait_time_ms: 1000,
@@ -372,9 +373,10 @@ export default function App() {
   const [actionMessage, setActionMessage] = useState("");
   const [globalError, setGlobalError] = useState("");
   const [settingsForm, setSettingsForm] = useState<AdminSettings>(emptySettings);
-  const [settingsOptions, setSettingsOptions] = useState<{ models: AdminOption[]; devices: AdminOption[]; languages: AdminOption[] }>({
+  const [settingsOptions, setSettingsOptions] = useState<{ models: AdminOption[]; devices: AdminOption[]; precisions: AdminOption[]; languages: AdminOption[] }>({
     models: [],
     devices: [],
+    precisions: [],
     languages: [],
   });
   const [managedModels, setManagedModels] = useState<ManagedModel[]>([]);
@@ -412,7 +414,7 @@ export default function App() {
       setSettingsForm(emptySettings);
       setManagedModels([]);
       setLoadedModelIdentifier(null);
-      setSettingsOptions({ models: [], devices: [], languages: [] });
+      setSettingsOptions({ models: [], devices: [], precisions: [], languages: [] });
       setSaveMessage("");
       setBenchmarkMessage("");
       setBenchmarkResult(null);
@@ -835,6 +837,7 @@ export default function App() {
   const configuredModelLabel = resolveOptionLabel(settingsOptions.models, settingsForm.local_model, "No model configured");
   const configuredDeviceLabel = resolveOptionLabel(settingsOptions.devices, settingsForm.local_gpu_device, "Auto");
   const configuredLanguageLabel = resolveOptionLabel(settingsOptions.languages, settingsForm.transcription_language, "Auto");
+  const configuredPrecisionLabel = resolveOptionLabel(settingsOptions.precisions, settingsForm.local_model_precision, "FP16");
   const loadedModelLabel = loadedModelIdentifier ? loadedModelIdentifier.join(" | ") : "No model loaded";
 
   return (
@@ -876,6 +879,10 @@ export default function App() {
           <div className="status-pill">
             <span>Language</span>
             <strong>{configuredLanguageLabel}</strong>
+          </div>
+          <div className="status-pill">
+            <span>Precision</span>
+            <strong>{configuredPrecisionLabel}</strong>
           </div>
         </div>
       </section>
@@ -1197,6 +1204,20 @@ export default function App() {
                 onChange={(event) => updateSetting("transcription_language", event.target.value)}
               >
                 {settingsOptions.languages.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+
+            <label>
+              <span>Precision</span>
+              <select
+                value={settingsForm.local_model_precision}
+                onChange={(event) => updateSetting("local_model_precision", event.target.value)}
+              >
+                {settingsOptions.precisions.map((option) => (
                   <option key={option.value} value={option.value}>
                     {option.label}
                   </option>
