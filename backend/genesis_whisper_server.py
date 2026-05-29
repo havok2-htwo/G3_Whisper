@@ -30,6 +30,7 @@ async def startup_server(app: FastAPI):
         f"Geladene Start-Konfiguration: "
         f"Lokales ASR-Modell='{current_settings['local_model']}', "
         f"Geraet='{current_settings['local_gpu_device']}', "
+        f"Precision='{current_settings['local_model_precision']}', "
         f"Sprache='{current_settings['transcription_language']}', "
         f"Cache-Pfad='{current_settings['local_model_cache_path'] or 'Standard'}'",
         file=sys.stderr,

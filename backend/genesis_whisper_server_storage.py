@@ -9,12 +9,14 @@ from .genesis_whisper_server_globals import (
     LOGS_DIR,
     SETTINGS_FILE,
     SUPPORTED_LANGUAGE_VALUES,
+    SUPPORTED_MODEL_PRECISION_VALUES,
 )
 
 
 DEFAULT_SETTINGS: Dict[str, Any] = {
     "local_model": "openai/whisper-large-v3-turbo",
     "local_gpu_device": "auto",
+    "local_model_precision": "fp16",
     "local_model_cache_path": ".\\models",
     "transcription_language": "auto",
     "batch_wait_time_ms": 500,
@@ -32,6 +34,10 @@ def normalize_settings(settings: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     local_model = str(source.get("local_model", DEFAULT_SETTINGS["local_model"])).strip() or DEFAULT_SETTINGS["local_model"]
     normalized["local_model"] = local_model if local_model in valid_models else DEFAULT_SETTINGS["local_model"]
     normalized["local_gpu_device"] = str(source.get("local_gpu_device", DEFAULT_SETTINGS["local_gpu_device"])).strip() or DEFAULT_SETTINGS["local_gpu_device"]
+    configured_precision = str(source.get("local_model_precision", DEFAULT_SETTINGS["local_model_precision"])).strip().lower()
+    normalized["local_model_precision"] = (
+        configured_precision if configured_precision in SUPPORTED_MODEL_PRECISION_VALUES else DEFAULT_SETTINGS["local_model_precision"]
+    )
     normalized["local_model_cache_path"] = str(source.get("local_model_cache_path", "")).strip()
     configured_language = str(source.get("transcription_language", DEFAULT_SETTINGS["transcription_language"])).strip().lower()
     normalized["transcription_language"] = (

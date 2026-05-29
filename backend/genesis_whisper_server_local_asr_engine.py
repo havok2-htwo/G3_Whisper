@@ -1,4 +1,5 @@
 import gc
+import importlib.util
 import os
 import shutil
 import sys
@@ -32,9 +33,46 @@ COHERE_MAX_INFERENCE_BATCH_SIZE = 16
 LAST_LOCAL_ASR_LOAD_ERROR: Optional[str] = None
 
 
+def _normalize_model_precision(model_precision: str) -> str:
+    normalized_precision = (model_precision or "fp16").strip().lower()
+    if normalized_precision in {"bf16", "fp16", "int8_bnb", "fp32"}:
+        return normalized_precision
+    return "fp16"
+
+
 def _get_model_device_and_dtype(model):
     parameter = next(model.parameters())
+    if not parameter.is_floating_point():
+        fallback_dtype = torch.float16 if parameter.device.type == "cuda" else torch.float32
+        return parameter.device, fallback_dtype
     return parameter.device, parameter.dtype
+
+
+def _uses_bitsandbytes_quantization(model_precision: str) -> bool:
+    return _normalize_model_precision(model_precision) == "int8_bnb"
+
+
+def _require_bitsandbytes_quantization(use_gpu: bool):
+    if not use_gpu:
+        raise RuntimeError("INT8 bitsandbytes Quantization benoetigt ein CUDA-GPU-Geraet.")
+
+    missing_packages = [
+        package_name
+        for package_name in ("bitsandbytes", "accelerate")
+        if importlib.util.find_spec(package_name) is None
+    ]
+    if missing_packages:
+        raise RuntimeError(
+            "INT8 bitsandbytes Quantization benoetigt zusaetzliche Pakete: "
+            f"{', '.join(missing_packages)}. Bitte requirements installieren und erneut versuchen."
+        )
+
+    try:
+        from transformers import BitsAndBytesConfig
+    except Exception as exc:
+        raise RuntimeError(f"BitsAndBytesConfig konnte nicht aus transformers geladen werden: {exc}") from exc
+
+    return BitsAndBytesConfig
 
 
 def _resolve_local_pretrained_source(model_id: str, cache_path: str):
@@ -220,9 +258,38 @@ def _resolve_cohere_pretrained_source(
     return snapshot_path, {"local_files_only": True}
 
 
-def _prepare_model_loading_options(device_selection: str) -> Tuple[bool, Optional[str], torch.dtype, str]:
+def _resolve_requested_torch_dtype(model_precision: str, use_gpu: bool) -> torch.dtype:
+    normalized_precision = _normalize_model_precision(model_precision)
+
+    if normalized_precision == "fp32":
+        print("[INFO] Precision: float32 wird fuer das lokale ASR-Modell verwendet.", file=sys.stderr)
+        return torch.float32
+
+    if normalized_precision == "int8_bnb":
+        if not use_gpu:
+            raise RuntimeError("INT8 bitsandbytes Quantization benoetigt ein CUDA-GPU-Geraet.")
+        print("[INFO] Precision: INT8 bitsandbytes Quantization wird fuer GPU verwendet.", file=sys.stderr)
+        return torch.float16
+
+    if not use_gpu:
+        print(
+            f"[INFO] Precision '{normalized_precision}' ist nur fuer GPU-Ladevorgaenge aktiv. CPU verwendet float32.",
+            file=sys.stderr,
+        )
+        return torch.float32
+
+    if normalized_precision == "bf16":
+        if not torch.cuda.is_bf16_supported():
+            raise RuntimeError("bf16 wurde angefordert, wird von der aktuellen CUDA-GPU aber nicht unterstuetzt.")
+        print("[INFO] Precision: bfloat16 wird fuer GPU verwendet.", file=sys.stderr)
+        return torch.bfloat16
+
+    print("[INFO] Precision: float16 wird fuer GPU verwendet.", file=sys.stderr)
+    return torch.float16
+
+
+def _prepare_model_loading_options(device_selection: str, model_precision: str) -> Tuple[bool, Optional[str], torch.dtype, str]:
     target_device = "cpu"
-    torch_dtype = torch.float32
     attn_implementation = "sdpa"
 
     use_gpu = False
@@ -233,14 +300,9 @@ def _prepare_model_loading_options(device_selection: str) -> Tuple[bool, Optiona
         use_gpu = True
         target_device = device_selection
 
-    if use_gpu:
-        if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
-            torch_dtype = torch.bfloat16
-            print("[INFO] Optimierung: bfloat16 wird fuer GPU verwendet.", file=sys.stderr)
-        else:
-            torch_dtype = torch.float16
-            print("[INFO] Optimierung: float16 wird fuer GPU verwendet.", file=sys.stderr)
+    torch_dtype = _resolve_requested_torch_dtype(model_precision, use_gpu)
 
+    if use_gpu:
         try:
             import flash_attn  # noqa: F401
 
@@ -337,6 +399,36 @@ def _load_auto_speech_model(pretrained_source: str, pretrained_args: Dict[str, A
         return AutoModelForSpeechSeq2Seq.from_pretrained(pretrained_source, **reduced_model_kwargs, **pretrained_args)
 
 
+def _build_model_kwargs(
+    normalized_precision: str,
+    use_gpu: bool,
+    target_device: str,
+    torch_dtype: torch.dtype,
+    attn_implementation: str,
+    trust_remote_code: bool = False,
+) -> Dict[str, Any]:
+    model_kwargs: Dict[str, Any] = {
+        "dtype": torch_dtype,
+        "low_cpu_mem_usage": True,
+        "attn_implementation": attn_implementation,
+    }
+    if trust_remote_code:
+        model_kwargs["trust_remote_code"] = True
+
+    if not _uses_bitsandbytes_quantization(normalized_precision):
+        return model_kwargs
+
+    BitsAndBytesConfig = _require_bitsandbytes_quantization(use_gpu)
+    model_kwargs["quantization_config"] = BitsAndBytesConfig(
+        load_in_8bit=True,
+        # Whisper large-v3-turbo produced early EOS with every encoder layer quantized.
+        llm_int8_skip_modules=["model.encoder.layers.0", "proj_out"],
+    )
+    model_kwargs["device_map"] = {"": target_device}
+    print("[INFO] bitsandbytes: load_in_8bit=True mit Transformers device_map aktiviert.", file=sys.stderr)
+    return model_kwargs
+
+
 def _maybe_compile_whisper_model(model, use_gpu: bool):
     if not use_gpu:
         return model
@@ -353,18 +445,19 @@ def _maybe_compile_whisper_model(model, use_gpu: bool):
     return model
 
 
-def load_local_asr_model(model_id: str, device_selection: str, cache_path: str) -> bool:
+def load_local_asr_model(model_id: str, device_selection: str, cache_path: str, model_precision: str = "fp16") -> bool:
     global local_model_components
     global LAST_LOCAL_ASR_LOAD_ERROR
 
     with model_load_lock:
-        target_identifier = (model_id, device_selection, cache_path)
+        normalized_precision = _normalize_model_precision(model_precision)
+        target_identifier = (model_id, device_selection, cache_path, normalized_precision)
         model_backend = get_local_model_backend(model_id)
         current_identifier = local_model_components.get("model_identifier")
 
         if current_identifier == target_identifier and local_model_components.get("model") is not None:
             print(
-                f"[INFO] Lokales ASR-Modell '{model_id}' auf Geraet '{device_selection}' (Cache: '{cache_path or 'Standard'}') ist bereits geladen.",
+                f"[INFO] Lokales ASR-Modell '{model_id}' auf Geraet '{device_selection}' mit Precision '{normalized_precision}' (Cache: '{cache_path or 'Standard'}') ist bereits geladen.",
                 file=sys.stderr,
             )
             LAST_LOCAL_ASR_LOAD_ERROR = None
@@ -373,15 +466,16 @@ def load_local_asr_model(model_id: str, device_selection: str, cache_path: str) 
         _cleanup_previous_model()
 
         print(
-            f"[INFO] Lade lokales ASR-Modell: '{model_id}' (Backend: {model_backend}) auf Geraet '{device_selection}' mit Cache-Pfad: '{cache_path or 'Standard'}'...",
+            f"[INFO] Lade lokales ASR-Modell: '{model_id}' (Backend: {model_backend}) auf Geraet '{device_selection}' mit Precision '{normalized_precision}' und Cache-Pfad: '{cache_path or 'Standard'}'...",
             file=sys.stderr,
         )
         huggingface_token: Optional[str] = None
         try:
-            use_gpu, target_device, torch_dtype, attn_implementation = _prepare_model_loading_options(device_selection)
+            use_gpu, target_device, torch_dtype, attn_implementation = _prepare_model_loading_options(device_selection, normalized_precision)
             attn_implementation = _resolve_backend_attention_implementation(model_id, attn_implementation)
             resolved_cache_path = resolve_local_model_cache_path(cache_path)
             huggingface_token = _resolve_huggingface_token()
+            uses_bnb_quantization = _uses_bitsandbytes_quantization(normalized_precision)
 
             if resolved_cache_path:
                 os.makedirs(resolved_cache_path, exist_ok=True)
@@ -400,28 +494,36 @@ def load_local_asr_model(model_id: str, device_selection: str, cache_path: str) 
                 if dynamic_modules_cache:
                     print(f"[INFO] Cohere Dynamic-Module-Cache: '{dynamic_modules_cache}'", file=sys.stderr)
                 processor = AutoProcessor.from_pretrained(pretrained_source, trust_remote_code=True, **pretrained_args)
-                model_kwargs = {
-                    "trust_remote_code": True,
-                    "torch_dtype": torch_dtype,
-                    "low_cpu_mem_usage": True,
-                    "attn_implementation": attn_implementation,
-                }
+                model_kwargs = _build_model_kwargs(
+                    normalized_precision,
+                    use_gpu,
+                    target_device,
+                    torch_dtype,
+                    attn_implementation,
+                    trust_remote_code=True,
+                )
                 model = _load_auto_speech_model(pretrained_source, pretrained_args, model_kwargs)
             else:
                 processor = WhisperProcessor.from_pretrained(pretrained_source, **pretrained_args)
+                model_kwargs = _build_model_kwargs(
+                    normalized_precision,
+                    use_gpu,
+                    target_device,
+                    torch_dtype,
+                    attn_implementation,
+                )
                 model = WhisperForConditionalGeneration.from_pretrained(
                     pretrained_source,
-                    torch_dtype=torch_dtype,
-                    low_cpu_mem_usage=True,
-                    attn_implementation=attn_implementation,
+                    **model_kwargs,
                     **pretrained_args,
                 )
-                if target_device != "cpu":
+                if target_device != "cpu" and not uses_bnb_quantization:
                     model.to(target_device)
-                model = _maybe_compile_whisper_model(model, use_gpu)
+                if not uses_bnb_quantization:
+                    model = _maybe_compile_whisper_model(model, use_gpu)
 
             model.eval()
-            if uses_cohere_backend(model_id) and target_device != "cpu":
+            if uses_cohere_backend(model_id) and target_device != "cpu" and not uses_bnb_quantization:
                 model.to(target_device)
             model_device, _ = _get_model_device_and_dtype(model)
             if not use_gpu and model_device.type != "cpu":

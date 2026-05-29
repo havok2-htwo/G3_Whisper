@@ -25,6 +25,7 @@ from .genesis_whisper_server_globals import (
     local_model_components,
     LOCAL_ASR_MODEL_MAP,
     SUPPORTED_LANGUAGE_OPTIONS,
+    SUPPORTED_MODEL_PRECISION_OPTIONS,
     settings_lock,
     transcription_history,
     uses_cohere_backend,
@@ -41,6 +42,7 @@ from .genesis_whisper_server_storage import normalize_settings, save_settings
 class AdminSettingsPayload(BaseModel):
     local_model: str
     local_gpu_device: str
+    local_model_precision: str = "fp16"
     local_model_cache_path: str
     transcription_language: str
     batch_wait_time_ms: int
@@ -65,23 +67,26 @@ def _settings_options() -> Dict[str, List[Dict[str, str]]]:
     models = [{"label": label, "value": model_id} for label, model_id in LOCAL_ASR_MODEL_MAP.items()]
     devices = [{"label": label, "value": DEVICE_MAP_UI_TO_INTERNAL[label]} for label in AVAILABLE_DEVICES]
     languages = [{"label": label, "value": value} for label, value in SUPPORTED_LANGUAGE_OPTIONS.items()]
-    return {"models": models, "devices": devices, "languages": languages}
+    precisions = [{"label": label, "value": value} for label, value in SUPPORTED_MODEL_PRECISION_OPTIONS.items()]
+    return {"models": models, "devices": devices, "languages": languages, "precisions": precisions}
 
 
 def _load_model_for_settings(settings_snapshot: Dict[str, Any]) -> bool:
     model_id = settings_snapshot["local_model"]
     device = settings_snapshot["local_gpu_device"]
+    precision = settings_snapshot["local_model_precision"]
     cache_path = settings_snapshot["local_model_cache_path"]
-    return load_local_asr_model(model_id, device, cache_path)
+    return load_local_asr_model(model_id, device, cache_path, precision)
 
 
-def _get_local_processing_key() -> tuple[str, str, str, str]:
+def _get_local_processing_key() -> tuple[str, str, str, str, str]:
     with settings_lock:
         model_id = current_settings["local_model"]
         device = current_settings["local_gpu_device"]
         cache_path = current_settings["local_model_cache_path"]
-    language = current_settings.get("transcription_language", "auto")
-    return model_id, device, cache_path, language
+        language = current_settings.get("transcription_language", "auto")
+        precision = current_settings.get("local_model_precision", "fp16")
+    return model_id, device, cache_path, language, precision
 
 
 def _effective_model_storage_path(storage_path: str | None = None) -> str:
@@ -130,7 +135,7 @@ def _read_peak_vram_metrics(cuda_index: int | None) -> Dict[str, float | None]:
 
 async def _run_admin_benchmark(request: Request, audio_data, repeat_count: int) -> Dict[str, Any]:
     processing_key = _get_local_processing_key()
-    model_id, _, _, configured_language = processing_key
+    model_id, _, _, configured_language, _ = processing_key
     effective_language = get_effective_transcription_language(model_id, configured_language)
 
     if not await asyncio.to_thread(_load_model_for_settings, _serialize_settings()):
@@ -270,7 +275,7 @@ def create_admin_api(app: FastAPI) -> FastAPI:
 
         model_settings_changed = any(
             previous_settings.get(key) != saved_settings.get(key)
-            for key in ("local_model", "local_gpu_device", "local_model_cache_path")
+            for key in ("local_model", "local_gpu_device", "local_model_precision", "local_model_cache_path")
         )
         model_loaded = None
         if model_settings_changed:

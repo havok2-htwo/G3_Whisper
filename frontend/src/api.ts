@@ -13,6 +13,7 @@ export type AdminKeyMetadata = {
 export type AdminSettings = {
   local_model: string;
   local_gpu_device: string;
+  local_model_precision: string;
   local_model_cache_path: string;
   transcription_language: string;
   batch_wait_time_ms: number;
@@ -40,6 +41,7 @@ export type SettingsResponse = {
   options: {
     models: AdminOption[];
     devices: AdminOption[];
+    precisions: AdminOption[];
     languages: AdminOption[];
   };
   models: ManagedModel[];
