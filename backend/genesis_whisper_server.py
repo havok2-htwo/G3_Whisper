@@ -19,6 +19,54 @@ from .genesis_whisper_server_storage import load_settings
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 FRONTEND_DIST_DIR = PROJECT_ROOT / "frontend" / "dist"
+WARMUP_SAMPLE = PROJECT_ROOT / "testaudio" / "Testaudio_02.wav"
+
+
+def _warmup_local_asr() -> None:
+    """Eager-load the configured ASR model and run one transcription on a sample clip so
+    the first real request is already warm (model + cuDNN/compile kernels primed), then
+    release the reserved CUDA cache pool so idle VRAM stays low. Best-effort: a warmup
+    failure (e.g. an unsupported precision) must never block server startup."""
+    import gc
+
+    try:
+        from .genesis_whisper_server_audio import load_audio_bytes
+        from .genesis_whisper_server_local_asr_engine import load_local_asr_model, transcribe_local_asr
+
+        model_id = current_settings.get("local_model")
+        if not model_id:
+            print("[WARMUP] kein lokales ASR-Modell konfiguriert -> uebersprungen.", file=sys.stderr)
+            return
+        if not WARMUP_SAMPLE.is_file():
+            print(f"[WARMUP] Testaudio nicht gefunden: {WARMUP_SAMPLE} -> uebersprungen.", file=sys.stderr)
+            return
+
+        device = current_settings.get("local_gpu_device")
+        cache = current_settings.get("local_model_cache_path")
+        precision = current_settings.get("local_model_precision", "fp16")
+        language = current_settings.get("transcription_language") or "auto"
+
+        print(f"[WARMUP] Lade Modell '{model_id}' (precision={precision}) und waerme mit {WARMUP_SAMPLE.name} ...", file=sys.stderr)
+        if not load_local_asr_model(model_id, device, cache, precision):
+            print("[WARMUP] Modell-Load fehlgeschlagen -> Warmup uebersprungen.", file=sys.stderr)
+            return
+
+        audio = load_audio_bytes(WARMUP_SAMPLE.read_bytes(), WARMUP_SAMPLE.name)
+        text = transcribe_local_asr(audio, language=language)
+        print(f"[WARMUP] fertig. Beispiel-Transkript: {str(text)[:80]!r}", file=sys.stderr)
+    except Exception as exc:
+        print(f"[WARMUP] nicht-kritischer Warmup-Fehler ({type(exc).__name__}: {exc}).", file=sys.stderr)
+    finally:
+        # Release the reserved CUDA pool the warmup just sized (keeps idle VRAM low).
+        try:
+            import torch
+
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
 
 
 async def startup_server(app: FastAPI):
@@ -41,6 +89,10 @@ async def startup_server(app: FastAPI):
     app.state.local_gpu_lock = local_gpu_lock
     app.state.whisper_batch_manager = whisper_batch_manager
     await whisper_batch_manager.start()
+
+    # Eager-load + warm the ASR model on a sample clip so the first real request is fast,
+    # then trim the CUDA cache. Best-effort: a warmup failure must not block startup.
+    await asyncio.to_thread(_warmup_local_asr)
 
 
 async def shutdown_server(app: FastAPI):

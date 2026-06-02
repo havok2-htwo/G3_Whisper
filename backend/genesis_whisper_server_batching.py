@@ -113,15 +113,38 @@ class WhisperBatchManager:
                 "max_audio_seconds": float(current_settings.get("batch_max_audio_seconds", 120.0)),
             }
 
+    @staticmethod
+    def _trim_cuda_cache() -> None:
+        """Release the reserved CUDA cache pool back to the driver so idle VRAM drops to
+        the model floor (leaves room for the other GPU tenants). Best-effort."""
+        try:
+            import gc
+
+            import torch
+
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+
     async def _worker_loop(self):
+        dirty = False
         try:
             while not self._stop_event.is_set():
                 first_item = await self._get_next_item()
                 if first_item is None:
+                    # Queue drained: trim once after a burst so the inference reserved-pool
+                    # spike is returned to the driver instead of staying pinned while idle.
+                    if dirty:
+                        self._trim_cuda_cache()
+                        dirty = False
                     continue
                 batch_items = await self._collect_batch(first_item)
                 if batch_items:
                     await self._process_batch(batch_items)
+                    dirty = True
         except asyncio.CancelledError:
             raise
         except Exception as exc:

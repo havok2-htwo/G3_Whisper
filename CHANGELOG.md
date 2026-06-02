@@ -2,6 +2,14 @@
 
 Dieses Dokument wird bewusst knapp gehalten und bei kuenftigen Arbeiten fortgeschrieben.
 
+## 2026-06-02
+
+- **Neu:** Startup-Warmup: Das konfigurierte ASR-Modell wird beim Start eager geladen und mit `testaudio/Testaudio_02.wav` aufgewaermt (statt lazy beim ersten Request); danach wird der CUDA-Cache getrimmt, sodass die erste echte Anfrage warm ist. Best-effort: Ein Warmup-Fehler blockiert den Start nie.
+- **Neu:** Idle-VRAM-Trim: Der Batch-Worker gibt den reservierten CUDA-Pool jetzt frei, sobald die Queue nach einem Burst leerlaeuft (nicht pro Batch -> kein Churn unter Last), sodass das Leerlauf-VRAM auf den Modell-Floor faellt und Platz fuer andere GPU-Tenants bleibt.
+- **Neu:** `start.bat` setzt vor dem Start `PYTORCH_CUDA_ALLOC_CONF=garbage_collection_threshold:0.8,max_split_size_mb:256` (weniger Fragmentierung des reservierten Pools; `expandable_segments` wird auf Windows ignoriert).
+- **Neu:** Experimentelle Precision-Option `fp8` -> `FineGrainedFP8Config` mit bf16-Compute, gated auf das importierbare HF-Paket `kernels` (sonst Fallback auf bf16, geloggt). Das `kernels`-Paket wird bewusst nicht automatisch installiert.
+- **Fix:** fp16-`masked_fill`-Guard: Skalar-Maskenwerte, die fp16 uebersteigen (z.B. das hartcodierte `-1e9` im Cohere-ASR-Modell), werden auf die `finfo`-Grenze der Tensor-dtype geklemmt. Damit laeuft `int8_bnb` (fp16-Compute) ohne den `c10::Half`-Overflow-Crash; in-range-Werte sowie fp32/bf16 bleiben unveraendert. `bf16` bleibt am robustesten, `int8_bnb` spart am meisten Gewichts-VRAM.
+
 ## Unreleased
 
 - **Fix:** Gated Hugging Face token from Admin Settings or `HUGGINGFACE_TOKEN` / `HF_TOKEN` is now reused during direct local ASR model loading, not only during explicit cache downloads.

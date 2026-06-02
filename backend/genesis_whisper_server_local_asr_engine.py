@@ -33,11 +33,65 @@ COHERE_MAX_INFERENCE_BATCH_SIZE = 16
 LAST_LOCAL_ASR_LOAD_ERROR: Optional[str] = None
 
 
+def _install_fp16_masked_fill_guard() -> None:
+    """Make int8_bnb / fp16 inference robust against attention-mask overflow.
+
+    Some remote models (e.g. CohereLabs/cohere-transcribe) fill the attention scores with a
+    hardcoded ``-1e9`` (``scores.masked_fill(mask, -1e9)``). With fp16 compute (which
+    int8_bnb forces) converting ``-1e9`` to Half overflows and raises
+    ``RuntimeError: value cannot be converted to type c10::Half without overflow``.
+
+    This installs a thin guard on ``torch.Tensor.masked_fill`` that clamps a scalar fill
+    value to the tensor dtype's finfo bounds. It is a no-op for in-range values (so fp32/bf16
+    and normal masks are unaffected) and only rewrites the overflowing fp16 case to the
+    dtype's most-negative value -- exactly the intended "very negative" mask. Eager-only;
+    torch.compile lowers masked_fill to its aten op directly, so compiled paths are untouched."""
+    if getattr(torch.Tensor.masked_fill, "_g3_fp16_guard", False):
+        return
+    _orig_masked_fill = torch.Tensor.masked_fill
+
+    def _guarded_masked_fill(self, mask, value):
+        if isinstance(value, (int, float)) and self.is_floating_point():
+            info = torch.finfo(self.dtype)
+            if value < info.min:
+                value = info.min
+            elif value > info.max:
+                value = info.max
+        return _orig_masked_fill(self, mask, value)
+
+    _guarded_masked_fill._g3_fp16_guard = True
+    torch.Tensor.masked_fill = _guarded_masked_fill
+
+
+_install_fp16_masked_fill_guard()
+
+
 def _normalize_model_precision(model_precision: str) -> str:
     normalized_precision = (model_precision or "fp16").strip().lower()
-    if normalized_precision in {"bf16", "fp16", "int8_bnb", "fp32"}:
+    if normalized_precision in {"bf16", "fp16", "int8_bnb", "fp32", "fp8"}:
         return normalized_precision
     return "fp16"
+
+
+def _maybe_fp8_quantization_config():
+    """Experimental fp8 (FineGrainedFP8Config) for maximum VRAM save. Inference needs the
+    HF `kernels` package; without it the model would load but every generate() raises, so
+    return None (caller falls back to the bf16 compute dtype) unless kernels is importable.
+    fp8 uses bf16 compute, which also avoids the fp16 attention-mask overflow some models hit."""
+    if importlib.util.find_spec("kernels") is None:
+        print(
+            "[INFO] fp8 angefordert, aber das Paket `kernels` fehlt -> Fallback auf bf16. "
+            "Fuer echtes fp8: `pip install -U kernels` (vorher pruefen, dass das Modell-Laden nicht bricht).",
+            file=sys.stderr,
+        )
+        return None
+    try:
+        from transformers import FineGrainedFP8Config
+
+        return FineGrainedFP8Config()
+    except Exception as exc:
+        print(f"[WARNUNG] fp8 angefordert, aber FineGrainedFP8Config nicht verfuegbar: {exc} -> bf16.", file=sys.stderr)
+        return None
 
 
 def _get_model_device_and_dtype(model):
@@ -265,6 +319,14 @@ def _resolve_requested_torch_dtype(model_precision: str, use_gpu: bool) -> torch
         print("[INFO] Precision: float32 wird fuer das lokale ASR-Modell verwendet.", file=sys.stderr)
         return torch.float32
 
+    if normalized_precision == "fp8":
+        if not use_gpu:
+            raise RuntimeError("fp8 benoetigt ein CUDA-GPU-Geraet.")
+        if not torch.cuda.is_bf16_supported():
+            raise RuntimeError("fp8 nutzt bf16-Compute, das diese GPU nicht unterstuetzt.")
+        print("[INFO] Precision: fp8 (experimentell, Compute bf16) angefordert.", file=sys.stderr)
+        return torch.bfloat16
+
     if normalized_precision == "int8_bnb":
         if not use_gpu:
             raise RuntimeError("INT8 bitsandbytes Quantization benoetigt ein CUDA-GPU-Geraet.")
@@ -414,6 +476,15 @@ def _build_model_kwargs(
     }
     if trust_remote_code:
         model_kwargs["trust_remote_code"] = True
+
+    if normalized_precision == "fp8":
+        fp8_config = _maybe_fp8_quantization_config()
+        if fp8_config is not None:
+            model_kwargs["quantization_config"] = fp8_config
+            model_kwargs["device_map"] = {"": target_device}
+            print("[INFO] fp8: FineGrainedFP8Config aktiviert (Compute bf16).", file=sys.stderr)
+        # else: kernels missing -> fall through with the bf16 compute dtype already set.
+        return model_kwargs
 
     if not _uses_bitsandbytes_quantization(normalized_precision):
         return model_kwargs

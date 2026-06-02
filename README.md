@@ -224,13 +224,55 @@ Note:
 
 The local ASR path already utilizes several optimizations:
 
-- configurable GPU model precision via admin settings: `bf16`, `fp16`, `int8_bnb`, or `fp32`
+- configurable GPU model precision via admin settings: `bf16`, `fp16`, `int8_bnb`, `fp8`, or `fp32`
+  - `bf16` is the recommended precision.
+  - `fp8` is experimental (see "Experimental fp8 Precision" below).
 - optional 8-bit Transformers loading through `bitsandbytes` for lower model VRAM usage
 - `torch.compile(...)`, if available and sensible
 - `sdpa` as the attention standard
 - `flash_attention_2` only if `flash_attn` is installed
-- Lazy loading for models
 - Batch queue for Whisper
+- startup warmup of the configured ASR model with a sample clip (see "Startup Warmup" below)
+- idle CUDA-cache trimming so idle VRAM drops back to the model floor (see "Idle VRAM Trimming" below)
+
+### Startup Warmup
+
+The configured ASR model is now eager-loaded at startup and warmed with `testaudio/Testaudio_02.wav`
+(previously the model was loaded lazily on the first request). After the warmup transcription the
+CUDA cache is trimmed, so the first real request is already warm without leaving an oversized
+reserved pool behind.
+
+The warmup is best-effort: any warmup failure (for example an unsupported precision) is logged and
+never blocks server startup.
+
+### Idle VRAM Trimming
+
+The Whisper batch worker releases the reserved CUDA cache pool once the queue drains after a burst
+of work, rather than after every batch (so there is no per-batch churn under sustained load). When
+the server is idle, VRAM therefore drops back to the model floor and leaves room for other GPU
+tenants. The `start.bat` launcher additionally sets
+`PYTORCH_CUDA_ALLOC_CONF=garbage_collection_threshold:0.8,max_split_size_mb:256` before launch to
+reduce reserved-pool fragmentation (note: `expandable_segments` is ignored on Windows).
+
+### Experimental fp8 Precision
+
+The precision setting accepts an experimental `fp8` value that loads the model with
+`FineGrainedFP8Config` while keeping `bf16` compute.
+
+- `fp8` is gated on the Hugging Face `kernels` package being importable. If `kernels` is not
+  installed, the path falls back to `bf16` (logged), because without `kernels` the model would
+  load but inference would fail.
+- The `kernels` package is intentionally not installed automatically (it can break model loading);
+  install it manually with `pip install -U kernels` if you want real fp8.
+- Because `fp8` uses `bf16` compute, it also avoids the fp16 attention-mask overflow that
+  `int8_bnb` would otherwise hit on the Cohere ASR model.
+
+The Cohere ASR model hardcodes a `-1e9` attention-mask fill value, which overflows fp16 (the
+compute dtype `int8_bnb` forces) and used to raise `RuntimeError: value cannot be converted to
+type c10::Half without overflow`. A guard on `torch.Tensor.masked_fill` now clamps such scalar
+fill values to the tensor dtype's `finfo` bounds, so **`int8_bnb` works** (and saves the most
+weight VRAM). In-range values and `fp32`/`bf16` are unaffected. `bf16` remains the most robust
+choice for maximum compatibility.
 
 Backend-specific exception:
 
@@ -242,7 +284,7 @@ Currently not included as a fixed integrated standard:
 
 - explicit Triton-for-Windows setup
 - mandatory Flash Attention setup
-- explicit GPU warmup immediately after model loading
+- the optional Hugging Face `kernels` package required for real `fp8` (intentionally not auto-installed)
 
 Important runtime decision:
 
@@ -487,6 +529,7 @@ The admin benchmark also accepts audio or video and uses the same audio loading 
 - Cohere is only treated as cache-ready when its local snapshot contains the expected remote-code files, tokenizer assets including `tokenizer.model`, and model weights. Incomplete snapshots are intentionally surfaced as `partial`.
 - If a gated Cohere snapshot is incomplete but a valid Hugging Face token is configured, the runtime loader now performs a full `snapshot_download(...)` before loading the local snapshot.
 - On Windows, if no `cl.exe` is available, Cohere continues to run without the optional internal compile path.
+- The Cohere ASR model hardcodes a `-1e9` attention-mask value that overflows fp16; a `masked_fill` fp16 guard now clamps it, so `int8_bnb` (max weight-VRAM save) works. `bf16` is still the most robust choice; experimental `fp8` needs the optional `kernels` package.
 - On Windows, Hugging Face may warn about degraded cache behavior without symlink support. Developer Mode or elevated execution improves this, but the cache still works without it.
 - `pyannote/embedding` is treated as cache-ready when its snapshot contains `config.yaml` and `pytorch_model.bin`; unlike Whisper models it does not rely on `preprocessor_config.json`.
 - The voice-vector loader prefers a complete local snapshot under the configured `local_model_cache_path` before falling back to the Hugging Face Hub cache.

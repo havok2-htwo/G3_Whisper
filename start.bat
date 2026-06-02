@@ -174,6 +174,9 @@ if defined GENESIS_STARTUP_ADMIN_KEY (
 echo Nutze lokale venv unter "%CD%\venv" ...
 echo Starte den GENESIS Whisper Server...
 title G3 WHISPER Server
+REM Shrink the CUDA caching-allocator reserved pool (less fragmentation -> lower idle VRAM,
+REM leaves room for the other GPU tenants). expandable_segments is Linux-only / ignored on Windows.
+set "PYTORCH_CUDA_ALLOC_CONF=garbage_collection_threshold:0.8,max_split_size_mb:256"
 call "%VENV_PYTHON%" -m backend.genesis_whisper_server
 
 echo.

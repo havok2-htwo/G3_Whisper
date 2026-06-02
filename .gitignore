@@ -21,8 +21,9 @@ models/
 # Logs & runtime data
 logs/
 
-# Test audio files (large binaries)
-testaudio/
+# Test audio: keep the small sample clips (the startup warmup uses Testaudio_02.wav),
+# but exclude the large LongAudio.mp4 (~14 MB binary).
+testaudio/LongAudio.mp4
 
 # Old / deprecated code
 marked_for_delete/
