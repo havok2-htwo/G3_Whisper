@@ -19,6 +19,7 @@ from .genesis_whisper_server_globals import (
     uses_cohere_backend,
 )
 from .genesis_whisper_server_local_asr_engine import (
+    _is_authentication_error,
     get_last_local_asr_load_error,
     load_local_asr_model,
     transcribe_local_asr,
@@ -182,9 +183,12 @@ def create_api(app: FastAPI) -> FastAPI:
                 raise
             except Exception as exc:
                 print(f"[API FEHLER] bei /transcribe/: {exc}", file=sys.stderr)
-                import traceback
+                if not _is_authentication_error(exc):
+                    # Auth/Gated failures already carry a concise, actionable hint;
+                    # only dump a traceback for genuinely unexpected errors.
+                    import traceback
 
-                traceback.print_exc()
+                    traceback.print_exc()
                 raise HTTPException(status_code=500, detail=str(exc)) from exc
 
         total_duration_ms = round((time.monotonic() - request_start_time) * 1000)

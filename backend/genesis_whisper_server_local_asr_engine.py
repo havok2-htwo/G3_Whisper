@@ -259,17 +259,26 @@ def _with_huggingface_token(pretrained_args: Dict[str, Any], huggingface_token: 
     return args_with_token
 
 
-def _format_model_load_error(model_id: str, exc: Exception, token_present: bool) -> str:
-    message = str(exc).strip() or exc.__class__.__name__
-    normalized_message = message.lower()
-    is_auth_error = (
+def _is_authentication_error(exc: Exception) -> bool:
+    """True for Hugging Face gated-repo / 401 auth failures.
+
+    These are expected, actionable misconfigurations (missing token / unaccepted
+    license), not crashes. Callers use this to log a concise hint instead of
+    dumping a full traceback to the console.
+    """
+    normalized_message = (str(exc).strip() or exc.__class__.__name__).lower()
+    return (
         "cannot access gated repo" in normalized_message
         or "gated repo" in normalized_message
         or "401 client error" in normalized_message
         or "401 unauthorized" in normalized_message
         or "please log in" in normalized_message
     )
-    if not is_auth_error:
+
+
+def _format_model_load_error(model_id: str, exc: Exception, token_present: bool) -> str:
+    message = str(exc).strip() or exc.__class__.__name__
+    if not _is_authentication_error(exc):
         return message
 
     if token_present:
@@ -608,8 +617,16 @@ def load_local_asr_model(model_id: str, device_selection: str, cache_path: str, 
         except Exception as exc:
             formatted_error = _format_model_load_error(model_id, exc, token_present=bool(huggingface_token))
             LAST_LOCAL_ASR_LOAD_ERROR = f"{type(exc).__name__}: {formatted_error}"
-            print(f"[FEHLER] Kritisches Problem beim Laden des Modells '{model_id}': {formatted_error}", file=sys.stderr)
-            traceback.print_exc()
+            if _is_authentication_error(exc):
+                # Expected, actionable misconfiguration: log a concise hint and
+                # skip the full traceback so it does not flood the console.
+                print(
+                    f"[FEHLER] Zugriff auf Modell '{model_id}' verweigert (Hugging Face Gated/401): {formatted_error}",
+                    file=sys.stderr,
+                )
+            else:
+                print(f"[FEHLER] Kritisches Problem beim Laden des Modells '{model_id}': {formatted_error}", file=sys.stderr)
+                traceback.print_exc()
             _store_local_model_components(None, None, None, None)
             return False
 
