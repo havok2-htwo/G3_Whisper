@@ -1,25 +1,28 @@
-# G3 Voice stack — Whisper (ASR, :7861) + OmniVoice (TTS, :8091) + DIA (diarization, :7864):
-# three GPU containers on one host.
+# G3 Voice stack — Whisper (ASR, :7861) + OmniVoice (TTS, :8091) + DIA (diarization,
+# :7864) + EMBED (text embeddings, :8777): four containers on one host. Whisper,
+# OmniVoice and DIA use the GPU; EMBED is CPU/OpenVINO only.
 #
 # This compose lives in the g3_whisper repo and builds ALL services, so it expects the
-# g3_omnivoice and g3_dia repos checked out as SIBLING directories next to this one:
+# g3_omnivoice, g3_dia and g3_embed repos checked out as SIBLING directories next to it:
 #
 #   <parent>/
 #   ├─ g3_whisper/      <- this repo; run `docker compose` from here
 #   │  └─ docker-compose.yml
 #   ├─ g3_omnivoice/    <- clone of the g3_omnivoice repo
-#   └─ g3_dia/          <- clone of the g3_dia repo
+#   ├─ g3_dia/          <- clone of the g3_dia repo
+#   └─ g3_embed/        <- clone of the g3_embed repo
 #
 #   git clone https://dev.it-breitenstein.de/ai-jointventure/g3_whisper.git
 #   git clone https://dev.it-breitenstein.de/ai-jointventure/g3_omnivoice.git
-#   git clone <g3_dia repo url> g3_dia
+#   git clone https://dev.it-breitenstein.de/ai-jointventure/g3_dia.git
+#   git clone https://dev.it-breitenstein.de/ai-jointventure/g3_embed.git
 #   cp g3_whisper/.env.example g3_whisper/.env   # set HUGGINGFACE_TOKEN
 #   cd g3_whisper && docker compose up -d --build
 #
 # Host needs: Docker Engine + Compose v2 (>= 2.24.0) and the NVIDIA Container Toolkit.
-# All services share the single GPU by design. The first start is slow — models are
-# downloaded into the named volumes on first boot. Admin UIs use username/password
-# (default admin/admin, forced change on first login).
+# The three GPU services share the single GPU by design; EMBED runs on CPU. The first
+# start is slow — models are downloaded into the named volumes on first boot. Admin UIs
+# use username/password (default admin/admin, forced change on first login).
 
 name: g3-voice
 
@@ -118,6 +121,30 @@ services:
       start_period: 1200s
       retries: 5
 
+  embed:
+    build:
+      # sibling checkout of the g3_embed repo (see header)
+      context: ../g3_embed
+      dockerfile: Dockerfile
+    image: g3-embed:latest
+    container_name: g3-embed
+    restart: unless-stopped
+    ports:
+      - "8777:8777"
+    env_file:
+      - path: .env
+        required: false
+    volumes:
+      - embed_models:/app/models
+      - embed_logs:/app/logs
+    # CPU / OpenVINO service — no GPU reservation needed.
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8777/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 300s
+      retries: 5
+
 volumes:
   whisper_models:
   whisper_logs:
@@ -125,3 +152,5 @@ volumes:
   omnivoice_data:
   dia_models:
   dia_logs:
+  embed_models:
+  embed_logs:
