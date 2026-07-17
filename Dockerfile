@@ -30,15 +30,19 @@ ENV PYTHONUNBUFFERED=1 \
     HF_HOME=/app/models/.hf
 
 # System libraries:
-#   ffmpeg        -> decode mp3/m4a/video containers SoundFile cannot read; also brings the
-#                    libav* shared libs that pyannote.audio 4.x's torchcodec dependency needs
-#   libsndfile1   -> soundfile / librosa
-#   libsamplerate0-> the `samplerate` resampler
-#   curl          -> container HEALTHCHECK
+#   ffmpeg         -> decode mp3/m4a/video containers SoundFile cannot read; also brings the
+#                     libav* shared libs that pyannote.audio 4.x's torchcodec dependency needs
+#   libsndfile1    -> soundfile / librosa
+#   libsamplerate0 -> the `samplerate` resampler
+#   build-essential-> g++/gcc toolchain torch.compile / Inductor uses to JIT-compile the CUDA
+#                     kernel wrappers on first inference (Cohere transcribe() + the optional
+#                     Whisper torch.compile). Without it Inductor raises "No working C++ compiler".
+#   curl           -> container HEALTHCHECK
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ffmpeg \
         libsndfile1 \
         libsamplerate0 \
+        build-essential \
         curl \
         ca-certificates \
     && rm -rf /var/lib/apt/lists/*

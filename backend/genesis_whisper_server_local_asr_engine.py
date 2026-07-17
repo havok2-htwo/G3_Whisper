@@ -692,12 +692,22 @@ def _cohere_transcribe_via_transcribe_api(processor, model, audio_batch: List[np
 
     model_device, _ = _get_model_device_and_dtype(model)
     enable_compile = model_device.type == "cuda"
-    if enable_compile and os.name == "nt" and shutil.which("cl") is None:
-        enable_compile = False
-        print(
-            "[INFO] Cohere transcribe()-Compile auf Windows deaktiviert, da 'cl' nicht gefunden wurde.",
-            file=sys.stderr,
-        )
+    if enable_compile:
+        # torch.compile / Inductor JIT-compiles the kernel wrappers with a host C++ compiler
+        # on the first inference. Skip compile (run eager) when none is available so a
+        # compiler-less environment degrades gracefully instead of raising
+        # "InductorError: No working C++ compiler": MSVC 'cl' on Windows, g++/clang++/c++
+        # elsewhere (the Linux container image ships build-essential, so g++ is present).
+        if os.name == "nt":
+            has_cxx = shutil.which("cl") is not None
+        else:
+            has_cxx = any(shutil.which(cxx) for cxx in ("g++", "clang++", "c++"))
+        if not has_cxx:
+            enable_compile = False
+            print(
+                "[INFO] Cohere transcribe()-Compile deaktiviert: kein C++-Compiler (cl/g++) gefunden.",
+                file=sys.stderr,
+            )
 
     transcribe_kwargs = {
         "processor": processor,
