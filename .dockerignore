@@ -35,6 +35,11 @@ start.sh
 install.sh
 venv/
 
+# --- Deployment files (not needed in the image; keep .env secrets out of the build context) ---
+docker-compose.yml
+.env
+.env.*
+
 # --- Docs / misc ---
 *.md
 !README.md

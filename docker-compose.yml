@@ -1,0 +1,91 @@
+# G3 Voice stack — Whisper (ASR) + OmniVoice (TTS): two GPU containers on one host.
+#
+# This compose lives in the g3_whisper repo and builds BOTH services, so it expects the
+# g3_omnivoice repo checked out as a SIBLING directory next to this one:
+#
+#   <parent>/
+#   ├─ g3_whisper/      <- this repo; run `docker compose` from here
+#   │  └─ docker-compose.yml
+#   └─ g3_omnivoice/    <- clone of ai-jointventure/g3_omnivoice
+#
+#   git clone https://dev.it-breitenstein.de/ai-jointventure/g3_whisper.git
+#   git clone https://dev.it-breitenstein.de/ai-jointventure/g3_omnivoice.git
+#   cp g3_whisper/.env.example g3_whisper/.env   # set HUGGINGFACE_TOKEN + admin key
+#   cd g3_whisper && docker compose up -d --build
+#
+# Host needs: Docker Engine + Compose v2 (>= 2.24.0) and the NVIDIA Container Toolkit.
+# Both services share the single GPU by design. The first start is slow — models are
+# downloaded into the named volumes on first boot.
+
+name: g3-voice
+
+services:
+  whisper:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: g3-whisper:latest
+    container_name: g3-whisper
+    restart: unless-stopped
+    ports:
+      - "7861:7861"
+    env_file:
+      - path: .env
+        required: false
+    volumes:
+      - whisper_models:/app/models
+      - whisper_logs:/app/logs
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:7861/openapi.json"]
+      interval: 30s
+      timeout: 5s
+      start_period: 1200s
+      retries: 5
+
+  omnivoice:
+    build:
+      # sibling checkout of the g3_omnivoice repo (see header)
+      context: ../g3_omnivoice
+      dockerfile: Dockerfile
+    image: g3-omnivoice:latest
+    container_name: g3-omnivoice
+    restart: unless-stopped
+    ports:
+      - "8091:8091"
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      # Reach the sibling Whisper container for WER benchmarking on the compose network.
+      OMNIVOICE_TTS_WHISPER_BASE_URL: http://whisper:7861
+    volumes:
+      - omnivoice_models:/app/models
+      - omnivoice_data:/app/data
+    depends_on:
+      - whisper
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8091/openapi.json"]
+      interval: 30s
+      timeout: 5s
+      start_period: 1800s
+      retries: 5
+
+volumes:
+  whisper_models:
+  whisper_logs:
+  omnivoice_models:
+  omnivoice_data:

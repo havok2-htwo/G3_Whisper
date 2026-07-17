@@ -8,6 +8,7 @@ __pycache__/
 # Environment / Secrets
 .env
 .env.*
+!.env.example
 
 # Frontend build & deps
 frontend/node_modules/
