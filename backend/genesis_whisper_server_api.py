@@ -8,7 +8,8 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 
-from .genesis_whisper_server_audio import load_audio_bytes
+from .genesis_whisper_server_audio import get_audio_duration_seconds, load_audio_bytes
+from .genesis_whisper_server_auth import authorize_api_key, get_auth_store
 from .genesis_whisper_server_chunking import combine_transcription_chunks, split_audio_for_whisper
 from .genesis_whisper_server_globals import (
     current_settings,
@@ -71,6 +72,7 @@ def create_api(app: FastAPI) -> FastAPI:
         engine: str = Form("local", description="Es wird nur noch die lokale ASR-Engine unterstuetzt."),
         voice_ident: bool = Form(False, description="Wenn True, wird zusaetzlich ein Stimm-Vektor (Embedding) generiert."),
     ):
+        api_key_id = authorize_api_key(request)
         request_start_time = time.monotonic()
         source_ip = request.client.host if request.client else "unknown"
         engine = _normalize_engine(engine)
@@ -211,6 +213,9 @@ def create_api(app: FastAPI) -> FastAPI:
         with history_lock:
             transcription_history.appendleft(log_entry)
         log_transcription(log_entry)
+
+        if api_key_id:
+            get_auth_store().record_api_key_usage(api_key_id, get_audio_duration_seconds(audio_data))
 
         response_data = {
             "transcription": transcription_text,

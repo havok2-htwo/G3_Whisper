@@ -1,24 +1,30 @@
 import { FormEvent, startTransition, useEffect, useState } from "react";
 
 import {
-  AdminKeyMetadata,
   AdminOption,
   AdminSettings,
+  ApiKeyInfo,
   BenchmarkResponse,
+  CreatedApiKey,
   ManagedModel,
   QueueResponse,
   SettingsResponse,
   StatsResponse,
+  changePassword,
+  createApiKey,
+  deleteApiKey,
   deleteModel,
   downloadModel,
-  getKeys,
   getModels,
   getQueue,
   getSettings,
   getStats,
-  rotateAdminKey,
+  listApiKeys,
+  login,
+  logout,
   runBenchmark,
   saveSettings,
+  whoami,
 } from "./api";
 
 type HistoryEntry = {
@@ -53,7 +59,8 @@ type DashboardHistoryPoint = {
   batchRealtime: number;
 };
 
-const ADMIN_KEY_STORAGE = "genesis_admin_key";
+type AuthState = "loading" | "login" | "change" | "ready";
+
 const NUMBER_LOCALE = "de-DE";
 const DASHBOARD_POLL_SECONDS = 5;
 const DASHBOARD_HISTORY_POINTS = 72;
@@ -71,29 +78,6 @@ const emptySettings: AdminSettings = {
   batch_max_audio_seconds: 60.0,
   huggingface_token: "",
 };
-
-function readStoredAdminKey() {
-  try {
-    return localStorage.getItem(ADMIN_KEY_STORAGE) || sessionStorage.getItem(ADMIN_KEY_STORAGE) || "";
-  } catch {
-    return "";
-  }
-}
-
-function writeStoredAdminKey(value: string) {
-  try {
-    localStorage.setItem(ADMIN_KEY_STORAGE, value);
-    sessionStorage.setItem(ADMIN_KEY_STORAGE, value);
-  } catch {}
-}
-
-function clearStoredAdminKey() {
-  try {
-    localStorage.removeItem(ADMIN_KEY_STORAGE);
-    sessionStorage.removeItem(ADMIN_KEY_STORAGE);
-  } catch {}
-}
-
 
 function formatValue(value: number | null | undefined, suffix = "") {
   if (value === null || value === undefined || Number.isNaN(value)) {
@@ -362,14 +346,26 @@ async function copyTextToClipboard(value: string) {
   document.body.removeChild(textArea);
 }
 
-
 export default function App() {
-  const [adminKey, setAdminKey] = useState(() => readStoredAdminKey());
-  const [adminKeyInput, setAdminKeyInput] = useState(() => readStoredAdminKey());
+  const [authState, setAuthState] = useState<AuthState>("loading");
+  const [currentUser, setCurrentUser] = useState("");
+  const [loginUsername, setLoginUsername] = useState("admin");
+  const [loginPassword, setLoginPassword] = useState("");
   const [authBusy, setAuthBusy] = useState(false);
   const [authError, setAuthError] = useState("");
-  const [adminMetadata, setAdminMetadata] = useState<AdminKeyMetadata | null>(null);
-  const [newlyCreatedKey, setNewlyCreatedKey] = useState<(AdminKeyMetadata & { token: string }) | null>(null);
+
+  const [pwCurrent, setPwCurrent] = useState("");
+  const [pwNew, setPwNew] = useState("");
+  const [pwConfirm, setPwConfirm] = useState("");
+  const [pwBusy, setPwBusy] = useState(false);
+  const [pwError, setPwError] = useState("");
+  const [pwMessage, setPwMessage] = useState("");
+
+  const [apiKeys, setApiKeys] = useState<ApiKeyInfo[]>([]);
+  const [newKeyAlias, setNewKeyAlias] = useState("");
+  const [createdKey, setCreatedKey] = useState<CreatedApiKey | null>(null);
+  const [apiKeyBusy, setApiKeyBusy] = useState(false);
+
   const [actionMessage, setActionMessage] = useState("");
   const [globalError, setGlobalError] = useState("");
   const [settingsForm, setSettingsForm] = useState<AdminSettings>(emptySettings);
@@ -394,20 +390,10 @@ export default function App() {
   const [modelActionId, setModelActionId] = useState<string | null>(null);
   const [modelActionKind, setModelActionKind] = useState<"refresh" | "download" | "delete" | null>(null);
   const hasDownloadingModels = managedModels.some((model) => model.status === "downloading");
+  const isReady = authState === "ready";
 
-  function persistAdminKey(value: string) {
-    writeStoredAdminKey(value);
-    setAdminKey(value);
-    setAdminKeyInput(value);
-  }
-
-  function clearPersistedAdminKey(nextMessage = "") {
-    clearStoredAdminKey();
+  function resetDashboardState() {
     startTransition(() => {
-      setAdminKey("");
-      setAdminKeyInput("");
-      setAdminMetadata(null);
-      setNewlyCreatedKey(null);
       setStats(null);
       setQueue(null);
       setDashboardHistory([]);
@@ -415,49 +401,52 @@ export default function App() {
       setManagedModels([]);
       setLoadedModelIdentifier(null);
       setSettingsOptions({ models: [], devices: [], precisions: [], languages: [] });
+      setApiKeys([]);
+      setCreatedKey(null);
       setSaveMessage("");
       setBenchmarkMessage("");
       setBenchmarkResult(null);
       setModelActionId(null);
       setModelActionKind(null);
-      setActionMessage(nextMessage);
-      setGlobalError(nextMessage);
-      setAuthError("");
+      setActionMessage("");
+      setGlobalError("");
     });
   }
 
-  function handleUnauthorized(message = "The admin key is invalid or expired.") {
-    clearPersistedAdminKey(message);
+  // Centralized reaction to auth failures raised by any admin call.
+  function handleApiError(error: unknown, fallback: string): boolean {
+    const message = error instanceof Error ? error.message : "";
+    if (message === "unauthorized") {
+      resetDashboardState();
+      setAuthState("login");
+      setAuthError("Your session has expired. Please sign in again.");
+      return true;
+    }
+    if (message === "password_change_required") {
+      setAuthState("change");
+      return true;
+    }
+    setGlobalError(error instanceof Error ? error.message : fallback);
+    return false;
   }
 
-  async function loadDashboard(currentAdminKey = adminKey) {
-    if (!currentAdminKey) {
-      return;
-    }
-
+  async function loadDashboard() {
     try {
       const [settingsResponse, statsResponse, queueResponse, keysResponse] = await Promise.all([
-        getSettings(currentAdminKey),
-        getStats(currentAdminKey),
-        getQueue(currentAdminKey),
-        getKeys(currentAdminKey),
+        getSettings(),
+        getStats(),
+        getQueue(),
+        listApiKeys(),
       ]);
       startTransition(() => {
         applySettings(settingsResponse);
         setStats(statsResponse);
         setQueue(queueResponse);
-        setAdminMetadata(keysResponse.admin_key);
+        setApiKeys(keysResponse.keys);
         setGlobalError("");
-        setAuthError("");
       });
     } catch (error) {
-      if (error instanceof Error && error.message === "unauthorized") {
-        handleUnauthorized();
-        return;
-      }
-      startTransition(() => {
-        setGlobalError(error instanceof Error ? error.message : "The dashboard could not be loaded.");
-      });
+      handleApiError(error, "The dashboard could not be loaded.");
     }
   }
 
@@ -469,55 +458,61 @@ export default function App() {
   }
 
   async function refreshOperationalData() {
-    if (!adminKey) {
+    if (!isReady) {
       return;
     }
-
     try {
-      const [statsResponse, queueResponse, keysResponse] = await Promise.all([
-        getStats(adminKey),
-        getQueue(adminKey),
-        getKeys(adminKey),
-      ]);
+      const [statsResponse, queueResponse, keysResponse] = await Promise.all([getStats(), getQueue(), listApiKeys()]);
       startTransition(() => {
         setStats(statsResponse);
         setQueue(queueResponse);
-        setAdminMetadata(keysResponse.admin_key);
+        setApiKeys(keysResponse.keys);
         setGlobalError("");
       });
     } catch (error) {
-      if (error instanceof Error && error.message === "unauthorized") {
-        handleUnauthorized();
-        return;
-      }
-      setGlobalError(error instanceof Error ? error.message : "Live polling failed.");
+      handleApiError(error, "Live polling failed.");
     }
   }
 
+  // Bootstrap: check the session on mount.
   useEffect(() => {
-    if (!adminKey) {
-      return;
-    }
-    void loadDashboard(adminKey);
-  }, [adminKey]);
+    let cancelled = false;
+    (async () => {
+      try {
+        const me = await whoami();
+        if (cancelled) return;
+        setCurrentUser(me.username);
+        setAuthState(me.must_change_password ? "change" : "ready");
+      } catch {
+        if (!cancelled) setAuthState("login");
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
-    if (!adminKey) {
+    if (!isReady) {
       return;
     }
+    void loadDashboard();
+  }, [authState]);
 
+  useEffect(() => {
+    if (!isReady) {
+      return;
+    }
     const intervalId = window.setInterval(() => {
       void refreshOperationalData();
     }, DASHBOARD_POLL_SECONDS * 1000);
-
     return () => window.clearInterval(intervalId);
-  }, [adminKey]);
+  }, [authState]);
 
   useEffect(() => {
-    if (!adminKey || !stats || !queue) {
+    if (!isReady || !stats || !queue) {
       return;
     }
-
     const nextPoint: DashboardHistoryPoint = {
       queueSize: queue.queue_size ?? 0,
       pendingBufferSize: queue.pending_buffer_size ?? 0,
@@ -526,79 +521,109 @@ export default function App() {
       meanTranscriptionDurationMs: stats.summary.avg_transcription_duration_ms ?? 0,
       batchRealtime: computeBatchRealtime((queue.recent_batches?.[0] ?? null) as BatchEntry | null),
     };
-
     setDashboardHistory((current) => [...current.slice(-(DASHBOARD_HISTORY_POINTS - 1)), nextPoint]);
-  }, [adminKey, queue, stats]);
+  }, [authState, queue, stats]);
 
-  async function handleOpenAdmin() {
-    const candidate = adminKeyInput.trim();
-    if (!candidate) {
-      return;
-    }
-
+  async function handleLogin(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
     setAuthBusy(true);
     setAuthError("");
-    setActionMessage("");
-    setGlobalError("");
-
     try {
-      await Promise.all([getSettings(candidate), getKeys(candidate)]);
-      persistAdminKey(candidate);
-      setActionMessage("Admin key accepted. Loading dashboard.");
+      const me = await login(loginUsername.trim(), loginPassword);
+      setCurrentUser(me.username);
+      setLoginPassword("");
+      setAuthState(me.must_change_password ? "change" : "ready");
     } catch (error) {
       setAuthError(
         error instanceof Error && error.message === "unauthorized"
-          ? "The entered admin key is not valid."
+          ? "Invalid username or password."
           : error instanceof Error
             ? error.message
-            : "The admin key could not be verified.",
+            : "Login failed.",
       );
     } finally {
       setAuthBusy(false);
     }
   }
 
-  async function handleRotateAdminKey() {
-    if (!adminKey) {
+  async function handleChangePassword(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setPwError("");
+    setPwMessage("");
+    if (pwNew.length < 4) {
+      setPwError("The new password must be at least 4 characters.");
       return;
     }
+    if (pwNew !== pwConfirm) {
+      setPwError("The new password and its confirmation do not match.");
+      return;
+    }
+    setPwBusy(true);
+    try {
+      await changePassword(pwCurrent, pwNew);
+      setPwCurrent("");
+      setPwNew("");
+      setPwConfirm("");
+      setPwMessage("Password updated.");
+      setAuthState("ready");
+    } catch (error) {
+      setPwError(error instanceof Error ? error.message : "Password change failed.");
+    } finally {
+      setPwBusy(false);
+    }
+  }
 
+  async function handleLogout() {
+    try {
+      await logout();
+    } catch {
+      // ignore — clear locally regardless
+    }
+    resetDashboardState();
+    setLoginPassword("");
+    setAuthState("login");
+  }
+
+  async function handleCreateApiKey(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setApiKeyBusy(true);
     setActionMessage("");
     setGlobalError("");
-
     try {
-      const response = await rotateAdminKey(adminKey);
-      persistAdminKey(response.key.token);
-      startTransition(() => {
-        setAdminMetadata(response.keys.admin_key);
-        setNewlyCreatedKey(response.key);
-        setActionMessage("Admin key rotated successfully. The new key is already stored locally.");
-      });
+      const created = await createApiKey(newKeyAlias.trim());
+      setCreatedKey(created);
+      setNewKeyAlias("");
+      setActionMessage(`API key "${created.alias}" created. Copy it now — it is shown only once.`);
+      const keysResponse = await listApiKeys();
+      setApiKeys(keysResponse.keys);
     } catch (error) {
-      if (error instanceof Error && error.message === "unauthorized") {
-        handleUnauthorized();
-        return;
-      }
-      setGlobalError(error instanceof Error ? error.message : "The admin key could not be rotated.");
+      handleApiError(error, "The API key could not be created.");
+    } finally {
+      setApiKeyBusy(false);
     }
   }
 
-  async function handleCopyAdminKey() {
+  async function handleDeleteApiKey(keyId: string, alias: string) {
+    setActionMessage("");
+    setGlobalError("");
     try {
-      await copyTextToClipboard(adminKey);
-      setActionMessage("Admin key copied to the clipboard.");
+      await deleteApiKey(keyId);
+      setCreatedKey((current) => (current?.id === keyId ? null : current));
+      setActionMessage(`API key "${alias}" deleted.`);
+      const keysResponse = await listApiKeys();
+      setApiKeys(keysResponse.keys);
     } catch (error) {
-      setGlobalError(error instanceof Error ? error.message : "Copying failed.");
+      handleApiError(error, "The API key could not be deleted.");
     }
   }
 
-  async function handleCopyNewKey() {
-    if (!newlyCreatedKey?.token) {
+  async function handleCopyCreatedKey() {
+    if (!createdKey?.token) {
       return;
     }
     try {
-      await copyTextToClipboard(newlyCreatedKey.token);
-      setActionMessage("New admin key copied to the clipboard.");
+      await copyTextToClipboard(createdKey.token);
+      setActionMessage("API key copied to the clipboard.");
     } catch (error) {
       setGlobalError(error instanceof Error ? error.message : "Copying failed.");
     }
@@ -606,14 +631,11 @@ export default function App() {
 
   async function handleSaveSettings(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!adminKey) {
-      return;
-    }
     setSaveBusy(true);
     setSaveMessage("");
 
     try {
-      const response = await saveSettings(adminKey, settingsForm);
+      const response = await saveSettings(settingsForm);
       startTransition(() => {
         applySettings(response);
         setSaveMessage(
@@ -624,8 +646,7 @@ export default function App() {
       });
       await refreshOperationalData();
     } catch (error) {
-      if (error instanceof Error && error.message === "unauthorized") {
-        handleUnauthorized();
+      if (handleApiError(error, "Saving settings failed.")) {
         return;
       }
       setSaveMessage(error instanceof Error ? error.message : "Saving settings failed.");
@@ -635,7 +656,7 @@ export default function App() {
   }
 
   async function refreshManagedModels(options?: { silent?: boolean; storagePath?: string }) {
-    if (!adminKey) {
+    if (!isReady) {
       return;
     }
 
@@ -643,7 +664,7 @@ export default function App() {
     const storagePath = options?.storagePath ?? managedModels[0]?.storage_root ?? settingsForm.local_model_cache_path;
 
     try {
-      const response = await getModels(adminKey, storagePath);
+      const response = await getModels(storagePath);
       startTransition(() => {
         setManagedModels(response.models ?? []);
         if (!silent) {
@@ -651,8 +672,7 @@ export default function App() {
         }
       });
     } catch (error) {
-      if (error instanceof Error && error.message === "unauthorized") {
-        handleUnauthorized();
+      if (handleApiError(error, "Model cache refresh failed.")) {
         return;
       }
       if (!silent) {
@@ -676,32 +696,19 @@ export default function App() {
   }
 
   async function handleDownloadModel(model: ManagedModel) {
-    if (!adminKey) {
-      return;
-    }
-
     setModelActionId(model.id);
     setModelActionKind("download");
     setActionMessage("");
     setGlobalError("");
 
     try {
-      const response = await downloadModel(
-        adminKey,
-        model.id,
-        settingsForm.local_model_cache_path,
-        settingsForm.huggingface_token,
-      );
+      const response = await downloadModel(model.id, settingsForm.local_model_cache_path, settingsForm.huggingface_token);
       startTransition(() => {
         setManagedModels(response.models ?? []);
         setActionMessage(`Download queued for ${model.label}.`);
       });
     } catch (error) {
-      if (error instanceof Error && error.message === "unauthorized") {
-        handleUnauthorized();
-        return;
-      }
-      setGlobalError(error instanceof Error ? error.message : "Model download failed.");
+      handleApiError(error, "Model download failed.");
     } finally {
       setModelActionId(null);
       setModelActionKind(null);
@@ -709,17 +716,13 @@ export default function App() {
   }
 
   async function handleDeleteModel(model: ManagedModel) {
-    if (!adminKey) {
-      return;
-    }
-
     setModelActionId(model.id);
     setModelActionKind("delete");
     setActionMessage("");
     setGlobalError("");
 
     try {
-      const response = await deleteModel(adminKey, model.id, settingsForm.local_model_cache_path);
+      const response = await deleteModel(model.id, settingsForm.local_model_cache_path);
       startTransition(() => {
         setManagedModels(response.models ?? []);
         setActionMessage(
@@ -729,11 +732,7 @@ export default function App() {
         );
       });
     } catch (error) {
-      if (error instanceof Error && error.message === "unauthorized") {
-        handleUnauthorized();
-        return;
-      }
-      setGlobalError(error instanceof Error ? error.message : "Model deletion failed.");
+      handleApiError(error, "Model deletion failed.");
     } finally {
       setModelActionId(null);
       setModelActionKind(null);
@@ -741,22 +740,17 @@ export default function App() {
   }
 
   useEffect(() => {
-    if (!adminKey || !hasDownloadingModels) {
+    if (!isReady || !hasDownloadingModels) {
       return;
     }
-
     const intervalId = window.setInterval(() => {
       void refreshManagedModels({ silent: true });
     }, MODEL_STATUS_POLL_MS);
-
     return () => window.clearInterval(intervalId);
-  }, [adminKey, hasDownloadingModels, managedModels, settingsForm.local_model_cache_path]);
+  }, [authState, hasDownloadingModels, managedModels, settingsForm.local_model_cache_path]);
 
   async function handleRunBenchmark(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!adminKey) {
-      return;
-    }
     if (!benchmarkFile) {
       setBenchmarkMessage("Please select an audio or video file first.");
       return;
@@ -767,7 +761,7 @@ export default function App() {
     setBenchmarkResult(null);
 
     try {
-      const result = await runBenchmark(adminKey, benchmarkFile, benchmarkRepeatCount);
+      const result = await runBenchmark(benchmarkFile, benchmarkRepeatCount);
       startTransition(() => {
         setBenchmarkResult(result);
         setBenchmarkMessage(
@@ -776,8 +770,7 @@ export default function App() {
       });
       await refreshOperationalData();
     } catch (error) {
-      if (error instanceof Error && error.message === "unauthorized") {
-        handleUnauthorized();
+      if (handleApiError(error, "Benchmark failed.")) {
         return;
       }
       setBenchmarkMessage(error instanceof Error ? error.message : "Benchmark failed.");
@@ -793,7 +786,17 @@ export default function App() {
     }));
   }
 
-  if (!adminKey) {
+  if (authState === "loading") {
+    return (
+      <main className="shell centered">
+        <section className="panel login-panel">
+          <p className="message">Loading...</p>
+        </section>
+      </main>
+    );
+  }
+
+  if (authState === "login") {
     return (
       <main className="shell centered">
         <section className="panel login-panel">
@@ -801,31 +804,97 @@ export default function App() {
             <span className="eyebrow">Private Access</span>
             <h1>GENESIS Whisper Admin</h1>
             <p>
-              The public transcription API stays open, while the private dashboard for queue control, benchmarks,
-              and history is protected by the admin key.
+              The public transcription API stays open until you create an API key. The private dashboard for queue
+              control, benchmarks, and history is protected by a username and password login.
             </p>
           </div>
 
-          <div className="login-form">
+          <form className="login-form" onSubmit={handleLogin}>
             <label>
-              <span>Admin Key</span>
+              <span>Username</span>
               <input
-                value={adminKeyInput}
-                onChange={(event) => setAdminKeyInput(event.target.value)}
-                placeholder="genesis_admin_..."
+                value={loginUsername}
+                autoComplete="username"
+                onChange={(event) => setLoginUsername(event.target.value)}
+                placeholder="admin"
+              />
+            </label>
+            <label>
+              <span>Password</span>
+              <input
+                type="password"
+                value={loginPassword}
+                autoComplete="current-password"
+                onChange={(event) => setLoginPassword(event.target.value)}
+                placeholder="admin"
               />
             </label>
 
-            <button type="button" onClick={() => void handleOpenAdmin()} disabled={!adminKeyInput.trim() || authBusy}>
-              {authBusy ? "Checking..." : "Open Dashboard"}
+            <button type="submit" disabled={!loginUsername.trim() || !loginPassword || authBusy}>
+              {authBusy ? "Signing in..." : "Sign In"}
             </button>
 
-            <p className="message">
-              Use the persistent admin key or the temporary startup key that is briefly shown during server launch.
-            </p>
+            <p className="message">Default credentials: admin / admin. You must change the password on first login.</p>
+            {authError && <p className="message error">{authError}</p>}
+          </form>
+        </section>
+      </main>
+    );
+  }
 
-            {(authError || globalError) && <p className="message error">{authError || globalError}</p>}
+  if (authState === "change") {
+    return (
+      <main className="shell centered">
+        <section className="panel login-panel">
+          <div className="hero-copy">
+            <span className="eyebrow">Security</span>
+            <h1>Set a New Password</h1>
+            <p>
+              You are signed in as <strong>{currentUser || "admin"}</strong>. Choose a new password before continuing
+              to the dashboard.
+            </p>
           </div>
+
+          <form className="login-form" onSubmit={handleChangePassword}>
+            <label>
+              <span>Current Password</span>
+              <input
+                type="password"
+                value={pwCurrent}
+                autoComplete="current-password"
+                onChange={(event) => setPwCurrent(event.target.value)}
+              />
+            </label>
+            <label>
+              <span>New Password</span>
+              <input
+                type="password"
+                value={pwNew}
+                autoComplete="new-password"
+                onChange={(event) => setPwNew(event.target.value)}
+              />
+            </label>
+            <label>
+              <span>Confirm New Password</span>
+              <input
+                type="password"
+                value={pwConfirm}
+                autoComplete="new-password"
+                onChange={(event) => setPwConfirm(event.target.value)}
+              />
+            </label>
+
+            <button type="submit" disabled={pwBusy || !pwCurrent || !pwNew || !pwConfirm}>
+              {pwBusy ? "Saving..." : "Save New Password"}
+            </button>
+
+            <button type="button" className="ghost-button" onClick={() => void handleLogout()}>
+              Cancel & Sign Out
+            </button>
+
+            {pwMessage && <p className="message">{pwMessage}</p>}
+            {pwError && <p className="message error">{pwError}</p>}
+          </form>
         </section>
       </main>
     );
@@ -854,16 +923,17 @@ export default function App() {
             <button type="button" className="secondary-button" onClick={() => void loadDashboard()}>
               Refresh
             </button>
-            <button type="button" className="secondary-button" onClick={() => void handleRotateAdminKey()}>
-              Rotate Admin Key
-            </button>
-            <button type="button" className="ghost-button" onClick={() => clearPersistedAdminKey()}>
+            <button type="button" className="ghost-button" onClick={() => void handleLogout()}>
               Logout
             </button>
           </div>
         </div>
 
         <div className="status-grid">
+          <div className="status-pill">
+            <span>Signed in as</span>
+            <strong>{currentUser || "admin"}</strong>
+          </div>
           <div className="status-pill">
             <span>Configured Model</span>
             <strong>{configuredModelLabel}</strong>
@@ -975,65 +1045,120 @@ export default function App() {
 
         <div className="stack side-widget-stack">
         <section className="panel stack">
-          <p className="eyebrow">Admin Key</p>
-          <h2>Dashboard Access</h2>
+          <p className="eyebrow">Account</p>
+          <h2>Admin Access</h2>
+          <div className="metric-grid compact-metrics">
+            <div className="metric-card">
+              <span>Username</span>
+              <strong>{currentUser || "admin"}</strong>
+            </div>
+            <div className="metric-card">
+              <span>Session</span>
+              <strong>Active (cookie)</strong>
+            </div>
+          </div>
 
-          {newlyCreatedKey && (
+          <form className="login-form" onSubmit={handleChangePassword}>
+            <label>
+              <span>Current Password</span>
+              <input type="password" value={pwCurrent} autoComplete="current-password" onChange={(event) => setPwCurrent(event.target.value)} />
+            </label>
+            <label>
+              <span>New Password</span>
+              <input type="password" value={pwNew} autoComplete="new-password" onChange={(event) => setPwNew(event.target.value)} />
+            </label>
+            <label>
+              <span>Confirm New Password</span>
+              <input type="password" value={pwConfirm} autoComplete="new-password" onChange={(event) => setPwConfirm(event.target.value)} />
+            </label>
+            <button type="submit" disabled={pwBusy || !pwCurrent || !pwNew || !pwConfirm}>
+              {pwBusy ? "Saving..." : "Change Password"}
+            </button>
+            {pwMessage && <p className="message">{pwMessage}</p>}
+            {pwError && <p className="message error">{pwError}</p>}
+          </form>
+        </section>
+
+        <section className="panel stack">
+          <p className="eyebrow">API Keys</p>
+          <h2>Public API Access</h2>
+          <p className="section-copy">
+            While no key exists, <code>POST /transcribe/</code> is open to everyone. As soon as one key exists, callers
+            must send a valid <code>X-API-Key</code> header. Usage (processed audio seconds) is tracked per key.
+          </p>
+
+          {createdKey && (
             <div className="key-token-card">
               <div className="key-card-head">
                 <div>
-                  <strong>{newlyCreatedKey.label}</strong>
-                  <p>The server returns the rotated key only once in plain text.</p>
+                  <strong>{createdKey.alias}</strong>
+                  <p>Copy this key now — it is shown only once.</p>
                 </div>
-                <button type="button" className="secondary-button" onClick={() => void handleCopyNewKey()}>
+                <button type="button" className="secondary-button" onClick={() => void handleCopyCreatedKey()}>
                   Copy
                 </button>
               </div>
-              <div className="key-token-value mono">{newlyCreatedKey.token}</div>
+              <div className="key-token-value mono">{createdKey.token}</div>
             </div>
           )}
 
-          <div className="metric-grid compact-metrics">
-            <div className="metric-card">
-              <span>Name</span>
-              <strong>{adminMetadata?.label || "Master Admin Key"}</strong>
-            </div>
-            <div className="metric-card">
-              <span>Created</span>
-              <strong>{formatDateTime(adminMetadata?.created_at)}</strong>
-            </div>
-            <div className="metric-card">
-              <span>Last Used</span>
-              <strong>{formatDateTime(adminMetadata?.last_used_at)}</strong>
-            </div>
-            <div className="metric-card">
-              <span>Browser Token</span>
-              <strong>{adminKey ? "Stored" : "Missing"}</strong>
-            </div>
-          </div>
-
-          <div className="key-token-card">
-            <div className="key-card-head">
-              <div>
-                <strong>Current Browser Key</strong>
-                <p>This token is sent as <code>X-Admin-Key</code> with every protected admin request.</p>
-              </div>
-              <button type="button" className="secondary-button" onClick={() => void handleCopyAdminKey()}>
-                Copy
+          <form className="benchmark-form" onSubmit={handleCreateApiKey}>
+            <label className="full-width">
+              <span>Alias</span>
+              <input
+                value={newKeyAlias}
+                onChange={(event) => setNewKeyAlias(event.target.value)}
+                placeholder="e.g. Key fuer Projekt X"
+              />
+            </label>
+            <div className="form-actions full-width">
+              <button type="submit" disabled={apiKeyBusy || !newKeyAlias.trim()}>
+                {apiKeyBusy ? "Creating..." : "Create API Key"}
               </button>
             </div>
-            <div className="key-token-value mono">{adminKey}</div>
-          </div>
+          </form>
 
-          <div className="button-row">
-            <button type="button" onClick={() => void handleRotateAdminKey()}>
-              Rotate Admin Key
-            </button>
-            <button type="button" className="secondary-button" onClick={() => void handleCopyAdminKey()}>
-              Copy Current Key
-            </button>
+          <div className="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Alias</th>
+                  <th>Created</th>
+                  <th>Audio (s)</th>
+                  <th>Requests</th>
+                  <th>Last Used</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody>
+                {apiKeys.length === 0 && (
+                  <tr>
+                    <td colSpan={6}>No API keys — the public API is currently open.</td>
+                  </tr>
+                )}
+                {apiKeys.map((key) => (
+                  <tr key={key.id}>
+                    <td>{key.alias}</td>
+                    <td>{formatDateTime(key.created_at)}</td>
+                    <td>{formatFixed(key.usage.total_seconds_processed, 1)}</td>
+                    <td>{key.usage.request_count}</td>
+                    <td>{formatDateTime(key.usage.last_used_at)}</td>
+                    <td>
+                      <button
+                        type="button"
+                        className="ghost-button danger-button"
+                        onClick={() => void handleDeleteApiKey(key.id, key.alias)}
+                      >
+                        Delete
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
           </div>
         </section>
+
         <section className="panel stack benchmark-widget">
           <p className="eyebrow">Benchmark</p>
           <h2>Run Audio Through the Active Pipeline</h2>

@@ -64,7 +64,6 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 
 # Application code + the built frontend.
 COPY backend/ ./backend/
-COPY tools/ ./tools/
 COPY testaudio/ ./testaudio/
 COPY --from=frontend /build/frontend/dist ./frontend/dist
 

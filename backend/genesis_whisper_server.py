@@ -226,12 +226,14 @@ def _landing_response() -> HTMLResponse:
                 <span class="eyebrow">GENESIS Transcription Server</span>
                 <h1>Lokale Transkription offen, Admin-Dashboard geschuetzt.</h1>
                 <p>
-                  Die oeffentliche Upload-API bleibt unter <code>POST /transcribe/</code> ohne API-Key erreichbar.
-                  Das Admin-Dashboard unter <code>/admin</code> ist nur per <code>X-Admin-Key</code> zugaenglich.
+                  Die oeffentliche Upload-API unter <code>POST /transcribe/</code> ist ohne Key erreichbar,
+                  solange keine API-Keys angelegt sind. Sobald im Admin-Dashboard mindestens ein API-Key
+                  existiert, wird ein <code>X-API-Key</code>-Header verlangt.
                 </p>
                 <p>
-                  Beim Startskript wird zusaetzlich ein temporaerer Startup-Admin-Key angezeigt, falls du lokalen
-                  Notfallzugriff brauchst.
+                  Das Admin-Dashboard unter <code>/admin</code> ist per Login (Benutzername/Passwort) geschuetzt.
+                  Standardzugang <code>admin</code> / <code>admin</code> &ndash; das Passwort muss beim ersten
+                  Login geaendert werden.
                 </p>
                 <div class="button-row">
                   <a class="primary" href="/admin">Admin-Dashboard oeffnen</a>
