@@ -1,26 +1,34 @@
 # G3 Voice — Docker deployment
 
-`docker-compose.yml` in this repo runs **both** GPU services:
+`docker-compose.yml` in this repo runs **three** GPU services:
 
 | Service     | Description                                | URL                  | Port |
 |-------------|--------------------------------------------|----------------------|------|
 | `whisper`   | GENESIS Whisper ASR + speaker diarization  | `http://<host>:7861` | 7861 |
 | `omnivoice` | G3 OmniVoice TTS + voice cloning            | `http://<host>:8091` | 8091 |
+| `dia`       | GENESIS DIA speaker diarization             | `http://<host>:7864` | 7864 |
 
-Whisper uses **CUDA 12.8** wheels, OmniVoice the pinned **CUDA 13.0** stack — each
-container is self-contained, so the differing CUDA versions do not conflict. Both share
-the single NVIDIA GPU (verified on an RTX 5090 / `sm_120`).
+Whisper + DIA use **CUDA 12.8** wheels, OmniVoice the pinned **CUDA 13.0** stack — each
+container is self-contained, so the differing CUDA versions do not conflict. All three
+share the single NVIDIA GPU (verified on an RTX 5090 / `sm_120`).
 
-## Layout — two sibling repos
+Each admin dashboard (`/admin`) is behind a **username/password login** — default
+`admin` / `admin`, with a forced password change on first login. The public processing
+APIs stay open until you create an API key in the dashboard; once a key exists callers
+must send a valid `X-API-Key` header (usage is tracked per key).
 
-This compose builds both services and expects the `g3_omnivoice` repo **next to** this one:
+## Layout — three sibling repos
+
+This compose builds all services and expects the `g3_omnivoice` and `g3_dia` repos
+**next to** this one:
 
 ```
 <parent>/
 ├─ g3_whisper/      <- this repo; run docker compose from here
 │  ├─ docker-compose.yml
 │  └─ .env
-└─ g3_omnivoice/    <- clone of ai-jointventure/g3_omnivoice
+├─ g3_omnivoice/    <- clone of the g3_omnivoice repo
+└─ g3_dia/          <- clone of the g3_dia repo
 ```
 
 ## Host prerequisites (Ubuntu)
@@ -41,7 +49,8 @@ This compose builds both services and expects the `g3_omnivoice` repo **next to*
 ```bash
 git clone https://dev.it-breitenstein.de/ai-jointventure/g3_whisper.git
 git clone https://dev.it-breitenstein.de/ai-jointventure/g3_omnivoice.git
-cp g3_whisper/.env.example g3_whisper/.env      # set HUGGINGFACE_TOKEN + admin key
+git clone <g3_dia repo url> g3_dia
+cp g3_whisper/.env.example g3_whisper/.env      # set HUGGINGFACE_TOKEN (admin login is admin/admin)
 cd g3_whisper
 docker compose up -d --build
 docker compose logs -f
