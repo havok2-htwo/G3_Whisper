@@ -13,7 +13,7 @@ from fastapi import HTTPException, Request, Response
 from .genesis_whisper_password_hash import build_pbkdf2_hash, verify_pbkdf2_hash
 
 # --- configuration ---
-SESSION_COOKIE_NAME = "g3_admin_session"
+SESSION_COOKIE_NAME = "g3_whisper_session"
 SESSION_TTL_SECONDS = 7 * 24 * 3600  # 7 days
 DEFAULT_ADMIN_USERNAME = "admin"
 DEFAULT_ADMIN_PASSWORD = "admin"
