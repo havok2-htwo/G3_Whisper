@@ -21,6 +21,7 @@ models/
 
 # Logs & runtime data
 logs/
+.tmp/
 
 # Test audio: keep the small sample clips (the startup warmup uses Testaudio_02.wav),
 # but exclude the large LongAudio.mp4 (~14 MB binary).
