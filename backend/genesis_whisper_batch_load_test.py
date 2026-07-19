@@ -25,7 +25,8 @@ def parse_args():
     parser.add_argument("--engine", default="local", help="Engine-Formfeld, standardmaessig 'local'.")
     parser.add_argument("--timeout", type=float, default=600.0, help="HTTP-Timeout pro Request in Sekunden.")
     parser.add_argument("--stagger-ms", type=int, default=0, help="Optionaler Startversatz pro Thread in Millisekunden.")
-    parser.add_argument("--admin-key", help="Optionaler Admin-Key fuer Queue-Snapshots.")
+    parser.add_argument("--admin-username", default="admin", help="Admin-Benutzername fuer optionale Queue-Snapshots.")
+    parser.add_argument("--admin-password", help="Admin-Passwort fuer optionale Queue-Snapshots.")
     parser.add_argument("--json-out", help="Optionaler Pfad fuer einen JSON-Report.")
     return parser.parse_args()
 
@@ -53,9 +54,14 @@ def build_request_plan(audio_files: List[Path], level: int) -> List[Path]:
     return list(itertools.islice(itertools.cycle(audio_files), level))
 
 
-def attach_admin_key(base_url: str, admin_key: str) -> requests.Session:
+def attach_admin_session(base_url: str, username: str, password: str) -> requests.Session:
     session = requests.Session()
-    session.headers.update({"X-Admin-Key": admin_key})
+    login_response = session.post(
+        f"{base_url.rstrip('/')}/api/admin/auth/login",
+        json={"username": username, "password": password},
+        timeout=20,
+    )
+    login_response.raise_for_status()
     response = session.get(f"{base_url.rstrip('/')}/api/admin/settings", timeout=20)
     response.raise_for_status()
     return session
@@ -248,9 +254,9 @@ def main():
     print("Audios lokal auf 16 kHz vorbereitet.")
 
     admin_session = None
-    if args.admin_key:
-        admin_session = attach_admin_key(args.base_url, args.admin_key)
-        print("Admin-Key akzeptiert. Queue-Snapshots werden mitgezogen.")
+    if args.admin_password:
+        admin_session = attach_admin_session(args.base_url, args.admin_username, args.admin_password)
+        print("Admin-Login akzeptiert. Queue-Snapshots werden mitgezogen.")
 
     report = {
         "base_url": args.base_url,

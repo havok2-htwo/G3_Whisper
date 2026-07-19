@@ -144,33 +144,6 @@ if errorlevel 1 (
     echo WARNUNG: ffmpeg wurde nicht gefunden. Einige Audio-/Videoformate koennen ohne ffmpeg nicht dekodiert werden.
 )
 
-if not defined GENESIS_STARTUP_ADMIN_KEY_TTL_SECONDS set "GENESIS_STARTUP_ADMIN_KEY_TTL_SECONDS=300"
-if not defined GENESIS_STARTUP_ADMIN_KEY_DISPLAY_SECONDS set "GENESIS_STARTUP_ADMIN_KEY_DISPLAY_SECONDS=15"
-set "GENESIS_STARTUP_ADMIN_KEY="
-set "TMP_DIR=%CD%\.tmp"
-set "STARTUP_ADMIN_KEY_FILE=%TMP_DIR%\startup_admin_key.txt"
-if not exist "%TMP_DIR%" mkdir "%TMP_DIR%" > nul 2>&1
-del /q "%STARTUP_ADMIN_KEY_FILE%" > nul 2>&1
-call "%VENV_PYTHON%" "%CD%\tools\generate_startup_admin_key.py" > "%STARTUP_ADMIN_KEY_FILE%" 2>nul
-if exist "%STARTUP_ADMIN_KEY_FILE%" (
-    set /p GENESIS_STARTUP_ADMIN_KEY=<"%STARTUP_ADMIN_KEY_FILE%"
-    del /q "%STARTUP_ADMIN_KEY_FILE%" > nul 2>&1
-)
-
-if defined GENESIS_STARTUP_ADMIN_KEY (
-    echo.
-    echo ============================================================
-    echo Temporary startup admin key ^(valid for %GENESIS_STARTUP_ADMIN_KEY_TTL_SECONDS% seconds after server start^):
-    echo %GENESIS_STARTUP_ADMIN_KEY%
-    echo Copy it now if you need emergency admin access in the browser.
-    echo This screen clears automatically in %GENESIS_STARTUP_ADMIN_KEY_DISPLAY_SECONDS% seconds...
-    echo ============================================================
-    timeout /t %GENESIS_STARTUP_ADMIN_KEY_DISPLAY_SECONDS% /nobreak > nul
-    cls
-) else (
-    echo WARNUNG: Temporarer Startup-Admin-Key konnte nicht erzeugt werden.
-)
-
 echo Nutze lokale venv unter "%CD%\venv" ...
 echo Starte den GENESIS Whisper Server...
 title G3 WHISPER Server

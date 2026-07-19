@@ -27,18 +27,20 @@ OpenAPI / interactive docs:
 
 Open/public routes:
 
-- no API key required
+- no API key is required while no client API keys exist
+- once at least one client API key exists, public transcription clients must send `X-API-Key`
 
 Protected admin routes:
 
-- require the request header `X-Admin-Key`
-- the persistent admin key is stored hashed in [`logs/genesis_whisper_secrets.json`](x:/dev/G3_WHISPER/logs/genesis_whisper_secrets.json)
-- a temporary startup admin key can also be valid for a short TTL if the launcher generated one
+- use a username/password login and an httpOnly same-origin session cookie
+- the default fresh-deploy account is `admin` / `admin`
+- the first login forces a password change before operational admin routes are available
+- users, sessions, and client API keys are stored in [`logs/genesis_whisper_secrets.json`](x:/dev/G3_WHISPER/logs/genesis_whisper_secrets.json)
 
-Example header:
+Client API key example:
 
 ```http
-X-Admin-Key: genesis_admin_xxxxxxxxxxxxxxxxxxxxxxxx
+X-API-Key: genesis_whisper_xxxxxxxxxxxxxxxxxxxxxxxx
 ```
 
 ## Public Transcription API
@@ -184,54 +186,91 @@ Hallo Welt
 
 ## Admin API
 
-All endpoints in this section require `X-Admin-Key`.
-
-### `GET /api/admin/keys`
+### `POST /api/admin/auth/login`
 
 Purpose:
 
-- returns metadata for the active persistent admin key
+- verifies an admin username/password
+- sets the `g3_whisper_session` httpOnly cookie
+- reports whether a password change is required
+
+Request:
+
+```json
+{
+  "username": "admin",
+  "password": "admin"
+}
+```
 
 Response:
 
 ```json
 {
-  "admin_key": {
-    "id": "admin",
-    "label": "Master Admin Key",
-    "created_at": "2026-04-13T09:00:00+00:00",
-    "last_used_at": "2026-04-13T09:05:00+00:00"
-  }
+  "username": "admin",
+  "must_change_password": true
 }
 ```
 
-### `POST /api/admin/keys`
+### `POST /api/admin/auth/change-password`
 
 Purpose:
 
-- rotates the persistent admin key
-- returns the new plaintext key exactly once
+- changes the password for the logged-in admin user
+- issues a fresh session cookie after the password change
+
+Request:
+
+```json
+{
+  "current_password": "admin",
+  "new_password": "new-password"
+}
+```
 
 Response:
 
 ```json
 {
-  "key": {
-    "id": "admin",
-    "label": "Master Admin Key",
-    "token": "genesis_admin_xxxxxxxxxxxxxxxxxxxxxxxx",
-    "created_at": "2026-04-13T09:10:00+00:00"
-  },
-  "keys": {
-    "admin_key": {
-      "id": "admin",
-      "label": "Master Admin Key",
-      "created_at": "2026-04-13T09:10:00+00:00",
-      "last_used_at": null
-    }
-  }
+  "ok": true,
+  "must_change_password": false
 }
 ```
+
+### `GET /api/admin/auth/whoami`
+
+Purpose:
+
+- validates the current session cookie
+- returns the active admin user and password-change state
+
+### `POST /api/admin/auth/logout`
+
+Purpose:
+
+- deletes the current admin session and clears the session cookie
+
+### `GET /api/admin/api-keys`
+
+Purpose:
+
+- lists client API key metadata
+- plaintext tokens are never returned after creation
+
+### `POST /api/admin/api-keys`
+
+Purpose:
+
+- creates a client API key for public transcription callers
+- returns the plaintext token exactly once
+
+### `DELETE /api/admin/api-keys/{key_id}`
+
+Purpose:
+
+- deletes a client API key
+
+All operational endpoints below require a completed admin login session.
 
 ### `GET /api/admin/settings`
 
