@@ -1,27 +1,25 @@
 # G3 Voice — Docker deployment
 
-`docker-compose.yml` in this repo runs **four** services (three on the GPU, one on CPU):
+`docker-compose.yml` in this repo runs **three** GPU services:
 
 | Service     | Description                                | URL                  | Port |
 |-------------|--------------------------------------------|----------------------|------|
 | `whisper`   | GENESIS Whisper ASR + speaker diarization  | `http://<host>:7861` | 7861 |
 | `omnivoice` | G3 OmniVoice TTS + voice cloning            | `http://<host>:8091` | 8091 |
 | `dia`       | GENESIS DIA speaker diarization             | `http://<host>:7864` | 7864 |
-| `embed`     | G3 EMBED text embeddings (CPU / OpenVINO)  | `http://<host>:8777` | 8777 |
 
 Whisper + DIA use **CUDA 12.8** wheels, OmniVoice the pinned **CUDA 13.0** stack — each
 container is self-contained, so the differing CUDA versions do not conflict. The three
-GPU services share the single NVIDIA GPU (verified on an RTX 5090 / `sm_120`); **EMBED is
-CPU-only** (OpenVINO/torch-CPU) and needs no GPU reservation.
+GPU services share the single NVIDIA GPU (verified on an RTX 5090 / `sm_120`).
 
 Each admin dashboard (`/admin`) is behind a **username/password login** — default
 `admin` / `admin`, with a forced password change on first login. The public processing
 APIs stay open until you create an API key in the dashboard; once a key exists callers
 must send a valid `X-API-Key` header (usage is tracked per key).
 
-## Layout — three sibling repos
+## Layout — two sibling repos
 
-This compose builds all services and expects the `g3_omnivoice`, `g3_dia` and `g3_embed`
+This compose builds all services and expects the `g3_omnivoice` and `g3_dia`
 repos **next to** this one:
 
 ```
@@ -30,8 +28,7 @@ repos **next to** this one:
 │  ├─ docker-compose.yml
 │  └─ .env
 ├─ g3_omnivoice/    <- clone of the g3_omnivoice repo
-├─ g3_dia/          <- clone of the g3_dia repo
-└─ g3_embed/        <- clone of the g3_embed repo
+└─ g3_dia/          <- clone of the g3_dia repo
 ```
 
 ## Host prerequisites (Ubuntu)
@@ -53,7 +50,6 @@ repos **next to** this one:
 git clone https://dev.it-breitenstein.de/ai-jointventure/g3_whisper.git
 git clone https://dev.it-breitenstein.de/ai-jointventure/g3_omnivoice.git
 git clone https://dev.it-breitenstein.de/ai-jointventure/g3_dia.git
-git clone https://dev.it-breitenstein.de/ai-jointventure/g3_embed.git
 cp g3_whisper/.env.example g3_whisper/.env      # set HUGGINGFACE_TOKEN (admin login is admin/admin)
 cd g3_whisper
 docker compose up -d --build
@@ -76,8 +72,6 @@ docker compose logs -f
 | `omnivoice_data`   | `/app/data`   | Runtime settings, voice profiles, secrets|
 | `dia_models`       | `/app/models` | DIA / pyannote HF model cache            |
 | `dia_logs`         | `/app/logs`   | Settings JSON + diarization log + secrets|
-| `embed_models`     | `/app/models` | EMBED sentence-transformer model cache   |
-| `embed_logs`       | `/app/logs`   | Settings JSON + embedding log + secrets  |
 
 Pre-seeding a volume from an existing local cache (skips the first download):
 
@@ -90,7 +84,7 @@ docker run --rm -v g3-voice_whisper_models:/dest -v /path/to/models:/src \
 > The `chown -R 1000:1000` is required — a pre-populated volume keeps the host files'
 > ownership, and the containers run as the non-root uid 1000, which must write the HF
 > cache/locks. Apply the same chown to any pre-seeded volume (`omnivoice_models`,
-> `omnivoice_data`, `dia_models`, `embed_models`, …).
+> `omnivoice_data`, `dia_models`, …).
 
 ## Common commands
 
