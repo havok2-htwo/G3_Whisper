@@ -290,6 +290,70 @@ button:disabled {
   color: var(--text-dim);
 }
 
+.dia-settings {
+  margin: 6px 0 2px;
+  padding: 20px;
+  border: 1px solid rgba(149, 242, 199, 0.16);
+  border-radius: 20px;
+  background: rgba(149, 242, 199, 0.035);
+}
+
+.settings-subheading {
+  display: flex;
+  align-items: start;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 18px;
+}
+
+.settings-subheading .eyebrow {
+  margin-bottom: 0.25rem;
+}
+
+.settings-subheading h3 {
+  margin: 0;
+  color: #f7f4ea;
+  font-size: 1.1rem;
+}
+
+.connection-status {
+  flex: 0 0 auto;
+  padding: 0.45rem 0.75rem;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 999px;
+  color: var(--text-dim);
+  background: rgba(255, 255, 255, 0.04);
+  font-size: 0.78rem;
+  font-weight: 700;
+}
+
+.connection-status.configured {
+  color: var(--mint);
+  border-color: rgba(149, 242, 199, 0.24);
+  background: rgba(149, 242, 199, 0.08);
+}
+
+.dia-settings-grid {
+  display: grid;
+  gap: 16px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.dia-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.dia-message {
+  flex: 1 1 260px;
+}
+
+.dia-message.error {
+  color: var(--danger);
+}
+
 .benchmark-form {
   display: grid;
   gap: 16px;
@@ -786,6 +850,7 @@ tbody tr:nth-child(even) {
   }
 
   .settings-form,
+  .dia-settings-grid,
   .metric-grid,
   .queue-metrics,
   .queue-insight-grid,

@@ -4,13 +4,19 @@
 
 | Service     | Description                                | URL                  | Port |
 |-------------|--------------------------------------------|----------------------|------|
-| `whisper`   | GENESIS Whisper ASR + speaker diarization  | `http://<host>:7861` | 7861 |
+| `whisper`   | GENESIS ASR + ReDimNet2 embedding/orchestration | `http://<host>:7861` | 7861 |
 | `omnivoice` | G3 OmniVoice TTS + voice cloning            | `http://<host>:8091` | 8091 |
 | `dia`       | GENESIS DIA speaker diarization             | `http://<host>:7864` | 7864 |
 
 Whisper + DIA use **CUDA 12.8** wheels, OmniVoice the pinned **CUDA 13.0** stack — each
 container is self-contained, so the differing CUDA versions do not conflict. The three
 GPU services share the single NVIDIA GPU (verified on an RTX 5090 / `sm_120`).
+
+Whisper calls DIA only for `POST /v2/audio/process` requests whose mode is
+`diarization`. The `embedding`, `transcript`, and `transcript_embedding` modes do not
+contact DIA. Whisper and DIA mount the same `gpu_coordination` volume and use
+`GENESIS_GPU_LEASE_PATH=/app/gpu-coordination/gpu.lock`, so their CUDA-heavy phases are
+serialized across the two containers.
 
 Each admin dashboard (`/admin`) is behind a **username/password login** — default
 `admin` / `admin`, with a forced password change on first login. The public processing
@@ -50,28 +56,52 @@ repos **next to** this one:
 git clone https://dev.it-breitenstein.de/ai-jointventure/g3_whisper.git
 git clone https://dev.it-breitenstein.de/ai-jointventure/g3_omnivoice.git
 git clone https://dev.it-breitenstein.de/ai-jointventure/g3_dia.git
-cp g3_whisper/.env.example g3_whisper/.env      # set HUGGINGFACE_TOKEN (admin login is admin/admin)
+cp g3_whisper/.env.example g3_whisper/.env      # set HUGGINGFACE_TOKEN and optional DIA_SERVER_API_KEY
 cd g3_whisper
 docker compose up -d --build
 docker compose logs -f
 ```
 
 > **First start is slow.** No models are baked into the images; each service downloads
-> them from Hugging Face into a named volume on first boot (Whisper `whisper-large-v3-turbo`
-> ~1.6 GB at warmup + diarization/Cohere lazily; OmniVoice `k2-fsa/OmniVoice` ~3 GB). The
+> them into a named volume on first boot (Whisper `whisper-large-v3-turbo` ~1.6 GB at
+> warmup, ReDimNet2-B6 on first embedding, and Cohere lazily; OmniVoice
+> `k2-fsa/OmniVoice` ~3 GB). The
 > server only accepts connections after warmup, which is why the healthchecks use a long
 > `start_period`.
+
+## Whisper to DIA configuration
+
+Compose defaults `DIA_SERVER_BASE_URL` to `http://dia:7864`. Create a client API key in
+the G3_DIA admin UI and either enter the DIA URL/key in the Whisper admin settings or set
+these environment values in `.env`:
+
+```dotenv
+DIA_SERVER_BASE_URL=http://dia:7864
+DIA_SERVER_API_KEY=dia_xxx
+```
+
+Saved Whisper settings take precedence over environment fallbacks. The DIA key is
+write-only: it is sent upstream as `X-API-Key`, is never returned or logged, and has a
+separate delete action. The admin connection test calls `GET /v2/capabilities` on DIA.
+Settings updates use partial-merge semantics so older admin clients cannot accidentally
+erase the DIA fields.
+
+The public embedding model is fixed; there is no model selector and no
+`embedding_space_id`. All new and legacy public voice vectors are 192-D L2-normalized
+ReDimNet2-B6 LM values. Existing 512-D profiles must be regenerated from reference
+audio. Old model files are not deleted automatically from an existing volume.
 
 ## Volumes (persist across rebuilds)
 
 | Volume             | Mount         | Contents                                 |
 |--------------------|---------------|------------------------------------------|
-| `whisper_models`   | `/app/models` | Whisper / diarization HF model cache     |
+| `whisper_models`   | `/app/models` | ASR and verified ReDimNet2 model cache   |
 | `whisper_logs`     | `/app/logs`   | Settings JSON + transcription log        |
 | `omnivoice_models` | `/app/models` | OmniVoice HF model cache                  |
 | `omnivoice_data`   | `/app/data`   | Runtime settings, voice profiles, secrets|
 | `dia_models`       | `/app/models` | DIA / pyannote HF model cache            |
 | `dia_logs`         | `/app/logs`   | Settings JSON + diarization log + secrets|
+| `gpu_coordination` | `/app/gpu-coordination` | Shared Whisper/DIA GPU lock file |
 
 Pre-seeding a volume from an existing local cache (skips the first download):
 
@@ -101,7 +131,9 @@ docker compose down -v           # stop + delete volumes (re-download next start
 - **torch.compile**: both images ship `build-essential`, so the Cohere transcribe path and
   OmniVoice's optional `compile_model` can JIT their CUDA kernels. Expect a one-time
   compile delay on the first request after a cold start.
-- **GPU sharing**: both models live on the same GPU. OmniVoice enforces a VRAM budget
-  (`OMNIVOICE_TTS_VRAM_BUDGET_MB`, default 24000); lower it if you run other GPU workloads.
+- **GPU sharing**: all services share the same GPU. Whisper serializes DIA, ASR, and
+  ReDim phases, and Whisper/DIA additionally share the Compose file lease. OmniVoice
+  enforces a VRAM budget (`OMNIVOICE_TTS_VRAM_BUDGET_MB`, default 24000); lower it if
+  you run other GPU workloads.
 - **`could not select device driver "nvidia"`** → NVIDIA Container Toolkit not installed or
   Docker not restarted after `nvidia-ctk runtime configure`.

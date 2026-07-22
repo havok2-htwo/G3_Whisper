@@ -13,6 +13,7 @@ import {
   changePassword,
   createApiKey,
   deleteApiKey,
+  deleteDiaApiKey,
   deleteModel,
   downloadModel,
   getModels,
@@ -24,6 +25,7 @@ import {
   logout,
   runBenchmark,
   saveSettings,
+  testDiaConnection,
   whoami,
 } from "./api";
 
@@ -77,6 +79,12 @@ const emptySettings: AdminSettings = {
   batch_max_segments: 16,
   batch_max_audio_seconds: 60.0,
   huggingface_token: "",
+  dia_server_base_url: "",
+  dia_api_key: "",
+  dia_api_key_configured: false,
+  dia_api_key_source: "none",
+  dia_server_base_url_effective: "",
+  dia_server_base_url_source: "none",
 };
 
 function formatValue(value: number | null | undefined, suffix = "") {
@@ -382,6 +390,9 @@ export default function App() {
   const [dashboardHistory, setDashboardHistory] = useState<DashboardHistoryPoint[]>([]);
   const [saveBusy, setSaveBusy] = useState(false);
   const [saveMessage, setSaveMessage] = useState("");
+  const [diaActionBusy, setDiaActionBusy] = useState<"test" | "clear" | null>(null);
+  const [diaActionMessage, setDiaActionMessage] = useState("");
+  const [diaActionSucceeded, setDiaActionSucceeded] = useState<boolean | null>(null);
   const [benchmarkFile, setBenchmarkFile] = useState<File | null>(null);
   const [benchmarkRepeatCount, setBenchmarkRepeatCount] = useState(1);
   const [benchmarkBusy, setBenchmarkBusy] = useState(false);
@@ -404,6 +415,9 @@ export default function App() {
       setApiKeys([]);
       setCreatedKey(null);
       setSaveMessage("");
+      setDiaActionBusy(null);
+      setDiaActionMessage("");
+      setDiaActionSucceeded(null);
       setBenchmarkMessage("");
       setBenchmarkResult(null);
       setModelActionId(null);
@@ -451,7 +465,7 @@ export default function App() {
   }
 
   function applySettings(payload: SettingsResponse) {
-    setSettingsForm(payload.settings);
+    setSettingsForm({ ...emptySettings, ...payload.settings, dia_api_key: "" });
     setSettingsOptions(payload.options);
     setManagedModels(payload.models ?? []);
     setLoadedModelIdentifier(payload.loaded_model_identifier);
@@ -652,6 +666,67 @@ export default function App() {
       setSaveMessage(error instanceof Error ? error.message : "Saving settings failed.");
     } finally {
       setSaveBusy(false);
+    }
+  }
+
+  async function handleTestDiaConnection() {
+    setDiaActionBusy("test");
+    setDiaActionMessage("");
+    setDiaActionSucceeded(null);
+    setGlobalError("");
+
+    try {
+      const response = await testDiaConnection(settingsForm.dia_server_base_url, settingsForm.dia_api_key);
+      setDiaActionMessage(`${response.message} (${response.base_url})`);
+      setDiaActionSucceeded(true);
+    } catch (error) {
+      if (handleApiError(error, "DIA connection test failed.")) {
+        return;
+      }
+      setDiaActionMessage(error instanceof Error ? error.message : "DIA connection test failed.");
+      setDiaActionSucceeded(false);
+    } finally {
+      setDiaActionBusy(null);
+    }
+  }
+
+  async function handleClearDiaApiKey() {
+    if (settingsForm.dia_api_key) {
+      updateSetting("dia_api_key", "");
+      setDiaActionMessage("The unsaved DIA API key was discarded.");
+      setDiaActionSucceeded(true);
+      return;
+    }
+    if (settingsForm.dia_api_key_source !== "settings") {
+      return;
+    }
+    if (!window.confirm("Delete the saved DIA API key? This does not remove an environment variable.")) {
+      return;
+    }
+
+    setDiaActionBusy("clear");
+    setDiaActionMessage("");
+    setDiaActionSucceeded(null);
+    setGlobalError("");
+    try {
+      const response = await deleteDiaApiKey();
+      applySettings(response);
+      setDiaActionMessage(
+        response.environment_fallback_active
+          ? "Saved DIA API key deleted. DIA_SERVER_API_KEY remains active as the environment fallback."
+          : response.removed
+            ? "Saved DIA API key deleted."
+            : "No saved DIA API key was present.",
+      );
+      setDiaActionSucceeded(true);
+    } catch (error) {
+      if (handleApiError(error, "The DIA API key could not be deleted.")) {
+        return;
+      }
+      setDiaActionMessage(error instanceof Error ? error.message : "The DIA API key could not be deleted.");
+      setDiaActionSucceeded(false);
+    } finally {
+      setDiaActionBusy(null);
     }
   }
 
@@ -1285,7 +1360,7 @@ export default function App() {
           <div className="section-heading">
             <div>
               <span className="eyebrow">Settings</span>
-              <h2>ASR Model, Language, and Batch Limits</h2>
+              <h2>ASR, DIA, Language, and Batch Limits</h2>
             </div>
             <div className="loaded-model">
               <span>Loaded Model</span>
@@ -1368,10 +1443,86 @@ export default function App() {
               />
             </label>
             <p className="field-note full-width">
-              Needed for gated Hugging Face models like <code>pyannote/embedding</code>. Save the settings to persist
-              it for runtime use; the current typed value is also sent with manual model downloads from the Cache
-              Manager.
+              Used for gated ASR models such as Cohere Transcribe. Save the settings to persist it; the current typed
+              value is also sent with manual model downloads from the Cache Manager.
             </p>
+
+            <div className="dia-settings full-width">
+              <div className="settings-subheading">
+                <div>
+                  <span className="eyebrow">DIA Integration</span>
+                  <h3>Diarization Server</h3>
+                </div>
+                <span className={`connection-status ${settingsForm.dia_api_key_configured ? "configured" : ""}`}>
+                  {settingsForm.dia_api_key_configured
+                    ? `API key: ${settingsForm.dia_api_key_source}`
+                    : "No API key configured"}
+                </span>
+              </div>
+
+              <div className="dia-settings-grid">
+                <label className="full-width">
+                  <span>DIA Server URL</span>
+                  <input
+                    type="url"
+                    placeholder={settingsForm.dia_server_base_url_effective || "http://dia:7864"}
+                    value={settingsForm.dia_server_base_url}
+                    onChange={(event) => updateSetting("dia_server_base_url", event.target.value)}
+                  />
+                </label>
+                {settingsForm.dia_server_base_url_source === "environment" && !settingsForm.dia_server_base_url && (
+                  <p className="field-note full-width">
+                    Using <code>{settingsForm.dia_server_base_url_effective}</code> from <code>DIA_SERVER_BASE_URL</code>.
+                  </p>
+                )}
+
+                <label className="full-width">
+                  <span>DIA API Key</span>
+                  <input
+                    type="password"
+                    autoComplete="new-password"
+                    placeholder={settingsForm.dia_api_key_configured ? "Enter a new key to replace the configured key" : "Optional"}
+                    value={settingsForm.dia_api_key}
+                    onChange={(event) => updateSetting("dia_api_key", event.target.value)}
+                  />
+                </label>
+                <p className="field-note full-width">
+                  Write-only: the server never returns the saved key. Leaving this field empty preserves the current
+                  key. Environment keys remain managed through <code>DIA_SERVER_API_KEY</code>.
+                </p>
+
+                <div className="dia-actions full-width">
+                  <button
+                    type="button"
+                    className="secondary-button"
+                    disabled={diaActionBusy !== null}
+                    onClick={() => void handleTestDiaConnection()}
+                  >
+                    {diaActionBusy === "test" ? "Testing..." : "Test DIA Connection"}
+                  </button>
+                  <button
+                    type="button"
+                    className="ghost-button danger-button"
+                    disabled={
+                      diaActionBusy !== null
+                      || (!settingsForm.dia_api_key && settingsForm.dia_api_key_source !== "settings")
+                    }
+                    onClick={() => void handleClearDiaApiKey()}
+                  >
+                    {diaActionBusy === "clear"
+                      ? "Deleting..."
+                      : settingsForm.dia_api_key
+                        ? "Discard Entered Key"
+                        : "Delete Saved Key"}
+                  </button>
+                  {diaActionMessage && (
+                    <p className={`message dia-message ${diaActionSucceeded === false ? "error" : ""}`}>
+                      {diaActionMessage}
+                    </p>
+                  )}
+                </div>
+              </div>
+            </div>
 
             <label>
               <span>Wait Time (ms)</span>
@@ -1537,7 +1688,7 @@ export default function App() {
                       <strong>{model.label}</strong>
                       <div className="muted mono model-id">{model.id}</div>
                     </td>
-                    <td>{model.backend === "cohere_transcribe" ? "Cohere" : model.backend === "pyannote" ? "Pyannote" : "Whisper"}</td>
+                    <td>{model.backend === "cohere_transcribe" ? "Cohere" : "Whisper"}</td>
                     <td>{formatModelSize(model)}</td>
                     <td className="model-status-cell">
                       <strong>{formatModelStatus(model.status)}</strong>
