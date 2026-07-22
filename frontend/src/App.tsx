@@ -1194,10 +1194,8 @@ export default function App() {
   const history = (stats?.history ?? []) as HistoryEntry[];
   const recentBatches = (queue?.recent_batches ?? []) as BatchEntry[];
   const latestBatchRealtime = computeBatchRealtime(recentBatches[0]);
-  const configuredModelLabel = resolveOptionLabel(settingsOptions.models, settingsForm.local_model, "No model configured");
   const configuredDeviceLabel = resolveOptionLabel(settingsOptions.devices, settingsForm.local_gpu_device, "Auto");
   const configuredLanguageLabel = resolveOptionLabel(settingsOptions.languages, settingsForm.transcription_language, "Auto");
-  const configuredPrecisionLabel = resolveOptionLabel(settingsOptions.precisions, settingsForm.local_model_precision, "FP16");
   const loadedModelLabel = loadedModelIdentifier ? loadedModelIdentifier.join(" | ") : "No model loaded";
 
   return (
@@ -1222,14 +1220,6 @@ export default function App() {
 
         <div className="status-grid">
           <div className="status-pill">
-            <span>Signed in as</span>
-            <strong>{currentUser || "admin"}</strong>
-          </div>
-          <div className="status-pill">
-            <span>Configured Model</span>
-            <strong>{configuredModelLabel}</strong>
-          </div>
-          <div className="status-pill">
             <span>Loaded Model</span>
             <strong>{loadedModelLabel}</strong>
           </div>
@@ -1240,10 +1230,6 @@ export default function App() {
           <div className="status-pill">
             <span>Language</span>
             <strong>{configuredLanguageLabel}</strong>
-          </div>
-          <div className="status-pill">
-            <span>Precision</span>
-            <strong>{configuredPrecisionLabel}</strong>
           </div>
         </div>
       </section>
