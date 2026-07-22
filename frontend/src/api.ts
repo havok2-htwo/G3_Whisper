@@ -12,6 +12,7 @@ export type AdminSettings = {
   batch_wait_time_ms: number;
   batch_max_segments: number;
   batch_max_audio_seconds: number;
+  cuda_memory_trim_after_batch: boolean;
   huggingface_token: string;
   dia_server_base_url: string;
   dia_api_key: string;
@@ -98,6 +99,123 @@ export type BenchmarkResponse = {
   transcript: string;
   peak_vram_reserved_mb: number | null;
   peak_vram_allocated_mb: number | null;
+};
+
+export type AudioProcessMode = "embedding" | "transcript" | "transcript_embedding" | "diarization";
+
+export type SpeakerRefinementMode = "off" | "shadow" | "conservative";
+
+export type KnownSpeakerProfile = {
+  id: string;
+  embeddings: number[][];
+};
+
+export type AudioProcessRequest = {
+  schema_version: "2.0";
+  mode: AudioProcessMode;
+  diarization?: {
+    expected_speakers?: number;
+    known_speakers: KnownSpeakerProfile[];
+    speaker_refinement?: SpeakerRefinementMode;
+    unknown_speaker_audio?: boolean;
+  };
+};
+
+export type UnknownSpeakerAudio = {
+  mime_type: string;
+  encoding: "base64";
+  data: string;
+  duration_ms: number;
+  snippets: Array<{
+    start_ms: number;
+    end_ms: number;
+    duration_ms: number;
+    centrality: number;
+  }>;
+};
+
+export type AudioProcessUnknownSpeaker = Record<string, unknown> & {
+  speaker_id: string;
+  diarization_speaker_id: string;
+  speaker_kind: "unknown" | "unresolved";
+  audio?: UnknownSpeakerAudio;
+};
+
+export type AudioProcessTranscriptSegment = {
+  start_ms: number;
+  end_ms: number;
+  speaker_id: string;
+  diarization_speaker_id: string;
+  refined_diarization_speaker_id?: string;
+  speaker_kind: "known" | "unknown" | "unresolved";
+  text: string;
+  overlap?: boolean;
+  [key: string]: unknown;
+};
+
+export type AudioProcessResult = {
+  transcript?: {
+    text: string;
+    segments?: AudioProcessTranscriptSegment[];
+  };
+  embedding?: {
+    vector: number[];
+  } | null;
+  speaker_counts?: {
+    expected: number | null;
+    detected: number;
+    known_provided: number;
+    known_assigned: number;
+    unknown: number;
+    unresolved: number;
+  };
+  speaker_assignments?: Array<Record<string, unknown>>;
+  unknown_speakers?: AudioProcessUnknownSpeaker[];
+  unresolved_speakers?: AudioProcessUnknownSpeaker[];
+  unresolved_known_speakers?: string[];
+  speaker_refinement?: {
+    mode: SpeakerRefinementMode;
+    status: "disabled" | "not_needed" | "shadow" | "applied" | "rejected";
+    eligible_windows: number;
+    proposed_turns: number;
+    applied_turns: number;
+    reassigned_duration_ms: number;
+    processing_ms: number;
+    rollback_reason: string | null;
+    changes_truncated: boolean;
+    changes: Array<{
+      turn_index: number;
+      start_ms: number;
+      end_ms: number;
+      from_speaker_id: string;
+      to_speaker_id: string;
+      supporting_windows: number;
+      evidence_duration_ms: number;
+      evidence_coverage: number;
+      weighted_vote_share: number;
+      target_cosine: number;
+      own_cosine: number;
+      similarity_gain: number;
+      runner_up_margin: number;
+      short_turn_exception: boolean;
+      applied: boolean;
+    }>;
+  };
+  [key: string]: unknown;
+};
+
+export type AudioProcessResponse = {
+  schema_version: "2.0";
+  request_id: string;
+  status: "completed" | "partial";
+  mode: AudioProcessMode;
+  audio: {
+    duration_ms: number;
+  };
+  models: Record<string, Record<string, unknown>>;
+  timings_ms: Record<string, number>;
+  result: AudioProcessResult;
+  warnings: Array<Record<string, unknown> | string>;
 };
 
 // --- Auth / API keys ---
@@ -309,4 +427,38 @@ export async function runBenchmark(file: File, repeatCount: number) {
   }
 
   return response.json() as Promise<BenchmarkResponse>;
+}
+
+export async function processAudioV2(file: File, request: AudioProcessRequest, apiKey?: string) {
+  const formData = new FormData();
+  formData.append("file", file);
+  formData.append(
+    "request",
+    new Blob([JSON.stringify(request)], { type: "application/json" }),
+    "request.json",
+  );
+
+  const headers = new Headers();
+  if (apiKey?.trim()) {
+    headers.set("X-API-Key", apiKey.trim());
+  }
+
+  const response = await fetch("/v2/audio/process", {
+    method: "POST",
+    credentials: "include",
+    headers,
+    body: formData,
+  });
+
+  if (!response.ok) {
+    const payload = (await response.json().catch(() => ({}))) as {
+      error?: { code?: string; message?: string };
+      detail?: string;
+    };
+    const message = payload.error?.message ?? payload.detail ?? `HTTP ${response.status}`;
+    const code = payload.error?.code;
+    throw new Error(code ? `${code}: ${message}` : message);
+  }
+
+  return response.json() as Promise<AudioProcessResponse>;
 }

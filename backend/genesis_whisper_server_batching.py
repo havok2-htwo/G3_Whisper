@@ -7,12 +7,18 @@ import time
 import uuid
 from collections import deque
 from dataclasses import dataclass
-from typing import Any, Callable, Deque, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Deque, Dict, List, Optional, Sequence, TypeVar
 
 import numpy as np
 
 from .genesis_whisper_server_globals import batch_history, batch_runtime_state, batch_state_lock, current_settings, settings_lock
 from .genesis_whisper_server_gpu import run_blocking_gpu_phase
+
+
+ASR_ENQUEUE_MIN_IN_FLIGHT = 2
+ASR_ENQUEUE_MAX_IN_FLIGHT = 256
+ASR_ENQUEUE_BATCH_MULTIPLIER = 2
+BatchResultT = TypeVar("BatchResultT")
 
 
 @dataclass
@@ -34,6 +40,109 @@ class QueuedWhisperSegment:
     @property
     def duration_seconds(self) -> float:
         return len(self.audio_data) / 16000.0
+
+
+@dataclass(frozen=True)
+class BatchEnqueueSpec:
+    """Metadata for one item submitted through the shared bounded scheduler."""
+
+    audio_data: np.ndarray
+    request_id: str
+    segment_index: int
+    total_segments: int
+
+
+def get_asr_enqueue_in_flight_limit() -> int:
+    """Keep two configured batches ready without allowing unbounded task bursts."""
+
+    with settings_lock:
+        configured_batch_size = max(1, int(current_settings.get("batch_max_segments", 16)))
+    return max(
+        ASR_ENQUEUE_MIN_IN_FLIGHT,
+        min(ASR_ENQUEUE_MAX_IN_FLIGHT, configured_batch_size * ASR_ENQUEUE_BATCH_MULTIPLIER),
+    )
+
+
+async def _run_bounded_enqueues(
+    item_count: int,
+    enqueue_at_index: Callable[[int], Awaitable[BatchResultT]],
+) -> list[BatchResultT]:
+    """Run lazy enqueue calls with bounded concurrency and stable result order."""
+
+    if item_count <= 0:
+        return []
+
+    result_slots: list[BatchResultT | None] = [None] * item_count
+    pending: dict[asyncio.Task[BatchResultT], int] = {}
+    next_index = 0
+    in_flight_limit = min(item_count, get_asr_enqueue_in_flight_limit())
+
+    def fill_window() -> None:
+        nonlocal next_index
+        while next_index < item_count and len(pending) < in_flight_limit:
+            index = next_index
+            next_index += 1
+            task = asyncio.create_task(enqueue_at_index(index))
+            pending[task] = index
+
+    try:
+        fill_window()
+        while pending:
+            done, _ = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                index = pending.pop(task)
+                result_slots[index] = task.result()
+            fill_window()
+    finally:
+        if pending:
+            remaining = list(pending)
+            for task in remaining:
+                task.cancel()
+            await asyncio.gather(*remaining, return_exceptions=True)
+
+    if any(result is None for result in result_slots):
+        raise RuntimeError("ASR-Batchverarbeitung lieferte nicht fuer jeden Chunk ein Ergebnis.")
+    return [result for result in result_slots if result is not None]
+
+
+async def enqueue_audio_segments_bounded(
+    batch_manager: Any,
+    audio_segments: Sequence[np.ndarray],
+    request_id: str,
+    processing_key: Any,
+) -> list[BatchTranscriptionResult]:
+    """Submit one request's audio segments without scheduling them all at once."""
+
+    total_segments = len(audio_segments)
+    return await _run_bounded_enqueues(
+        total_segments,
+        lambda index: batch_manager.enqueue(
+            audio_data=audio_segments[index],
+            request_id=request_id,
+            segment_index=index,
+            total_segments=total_segments,
+            processing_key=processing_key,
+        ),
+    )
+
+
+async def enqueue_batch_specs_bounded(
+    batch_manager: Any,
+    items: Sequence[BatchEnqueueSpec],
+    processing_key: Any,
+) -> list[BatchTranscriptionResult]:
+    """Submit pre-described items, used when one workload has several request IDs."""
+
+    return await _run_bounded_enqueues(
+        len(items),
+        lambda index: batch_manager.enqueue(
+            audio_data=items[index].audio_data,
+            request_id=items[index].request_id,
+            segment_index=items[index].segment_index,
+            total_segments=items[index].total_segments,
+            processing_key=processing_key,
+        ),
+    )
 
 
 class WhisperBatchManager:
@@ -110,7 +219,7 @@ class WhisperBatchManager:
         with settings_lock:
             return {
                 "wait_time_ms": int(current_settings.get("batch_wait_time_ms", 250)),
-                "max_segments": int(current_settings.get("batch_max_segments", 8)),
+                "max_segments": int(current_settings.get("batch_max_segments", 16)),
                 "max_audio_seconds": float(current_settings.get("batch_max_audio_seconds", 120.0)),
             }
 
@@ -130,6 +239,28 @@ class WhisperBatchManager:
         except Exception:
             pass
 
+    async def _trim_cuda_cache_if_enabled(self) -> bool:
+        """Trim only when the operator explicitly trades latency for idle VRAM.
+
+        ``torch.cuda.empty_cache()`` is process-wide rather than model-scoped.
+        Keeping this disabled therefore preserves the warm allocator state used
+        by both Cohere ASR and ReDimNet.  When enabled, serialize the trim with
+        every other local CUDA phase so it cannot race an embedding inference.
+        """
+
+        with settings_lock:
+            enabled = current_settings.get("cuda_memory_trim_after_batch", False) is True
+        if not enabled:
+            return False
+
+        async with self._gpu_lock:
+            # A request may have arrived while this worker waited for the GPU.
+            # Serving it has priority over an optional housekeeping operation.
+            if not self._queue.empty() or self._pending_items:
+                return False
+            await run_blocking_gpu_phase(self._trim_cuda_cache)
+        return True
+
     async def _worker_loop(self):
         dirty = False
         try:
@@ -139,7 +270,7 @@ class WhisperBatchManager:
                     # Queue drained: trim once after a burst so the inference reserved-pool
                     # spike is returned to the driver instead of staying pinned while idle.
                     if dirty:
-                        self._trim_cuda_cache()
+                        await self._trim_cuda_cache_if_enabled()
                         dirty = False
                     continue
                 batch_items = await self._collect_batch(first_item)
@@ -156,17 +287,25 @@ class WhisperBatchManager:
             raise
 
     async def _get_next_item(self) -> Optional[QueuedWhisperSegment]:
-        if self._pending_items:
-            item = self._pending_items.popleft()
-            self._update_queue_state()
-            return item
+        deadline = time.monotonic() + 0.25
+        while True:
+            if self._pending_items:
+                item = self._pending_items.popleft()
+                self._update_queue_state()
+            else:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                try:
+                    item = await asyncio.wait_for(self._queue.get(), timeout=remaining)
+                    self._update_queue_state()
+                except asyncio.TimeoutError:
+                    return None
 
-        try:
-            item = await asyncio.wait_for(self._queue.get(), timeout=0.25)
-            self._update_queue_state()
-            return item
-        except asyncio.TimeoutError:
-            return None
+            # Cancelling a request also cancels the Future it was awaiting.
+            # Do not spend ASR/GPU time on an item whose caller is already gone.
+            if not item.future.done():
+                return item
 
     async def _collect_batch(self, first_item: QueuedWhisperSegment) -> List[QueuedWhisperSegment]:
         limits = self._get_limits()
@@ -197,6 +336,9 @@ class WhisperBatchManager:
             if next_item is None:
                 break
 
+            if next_item.future.done():
+                continue
+
             if next_item.processing_key != first_item.processing_key:
                 self._pending_items.appendleft(next_item)
                 self._update_queue_state()
@@ -214,10 +356,14 @@ class WhisperBatchManager:
         return batch_items
 
     async def _process_batch(self, batch_items: List[QueuedWhisperSegment]):
+        batch_items = [item for item in batch_items if not item.future.done()]
+        if not batch_items:
+            self._update_queue_state()
+            return
+
         batch_id = f"batch-{uuid.uuid4().hex[:10]}"
         batch_started_at = time.monotonic()
         batch_started_at_wall = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        audio_batch = [item.audio_data for item in batch_items]
         total_audio_seconds = sum(item.duration_seconds for item in batch_items)
 
         with batch_state_lock:
@@ -229,6 +375,19 @@ class WhisperBatchManager:
 
         try:
             async with self._gpu_lock:
+                # A request may be cancelled while this batch waits behind a
+                # different GPU phase. Re-evaluate only after ownership is
+                # acquired so cancelled work never reaches the model.
+                batch_items = [item for item in batch_items if not item.future.done()]
+                if not batch_items:
+                    return
+
+                audio_batch = [item.audio_data for item in batch_items]
+                total_audio_seconds = sum(item.duration_seconds for item in batch_items)
+                with batch_state_lock:
+                    batch_runtime_state["active_batch_size"] = len(batch_items)
+                    batch_runtime_state["active_batch_audio_seconds"] = round(total_audio_seconds, 3)
+
                 results = await run_blocking_gpu_phase(
                     self._process_batch_fn,
                     audio_batch,

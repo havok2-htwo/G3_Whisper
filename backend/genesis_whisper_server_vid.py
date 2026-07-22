@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import itertools
 import math
 import os
 import sys
@@ -12,12 +13,11 @@ import urllib.request
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, Sequence
+from typing import Any, Dict, Iterable, Iterator, Sequence
 
 import numpy as np
 import torch
 
-from .genesis_whisper_server_chunking import extract_speech_audio
 from .genesis_whisper_server_globals import (
     PROJECT_ROOT,
     current_settings,
@@ -46,9 +46,17 @@ REDIMNET_EMBEDDING_DIMENSION = 192
 REDIMNET_SAMPLE_RATE = 16000
 REDIMNET_WINDOW_SECONDS = 3.0
 REDIMNET_WINDOW_SAMPLES = int(REDIMNET_SAMPLE_RATE * REDIMNET_WINDOW_SECONDS)
-REDIMNET_MIN_WINDOW_SECONDS = 1.0
+REDIMNET_MIN_WINDOW_SECONDS = 0.5
 REDIMNET_MIN_WINDOW_SAMPLES = int(REDIMNET_SAMPLE_RATE * REDIMNET_MIN_WINDOW_SECONDS)
+# Batch 16 is the measured throughput/memory sweet spot for B6 on the target
+# GPU; larger batches consume substantially more VRAM without improving steady
+# state throughput. OOM handling below still learns a smaller request-local
+# size for constrained cards.
 REDIMNET_DEFAULT_BATCH_SIZE = 16
+_ENERGY_VAD_FRAME_MS = 30
+_ENERGY_VAD_BATCH_FRAMES = 8192
+_ENERGY_VAD_MIN_RUN_MS = 150
+_ENERGY_VAD_MERGE_GAP_MS = 300
 
 
 @dataclass(frozen=True)
@@ -257,26 +265,35 @@ def _audio_quality(audio: np.ndarray) -> float | None:
     samples = np.asarray(audio, dtype=np.float32).reshape(-1)
     if len(samples) == 0 or not np.all(np.isfinite(samples)):
         return None
-    rms = float(np.sqrt(np.mean(np.square(samples), dtype=np.float64)))
-    if rms <= 10 ** (-50.0 / 20.0):
-        return None
-    clipped_ratio = float(np.mean(np.abs(samples) >= 0.999))
+    # ``np.square`` used to allocate one temporary the size of every 3-second
+    # window.  BLAS dot is allocation-free and substantially faster; FP32
+    # accumulation changes only sub-ULP quality weights for normalized audio.
+    clipped_count = int(np.count_nonzero(samples >= 0.999))
+    clipped_count += int(np.count_nonzero(samples <= -0.999))
+    clipped_ratio = clipped_count / len(samples)
     if clipped_ratio > 0.01:
+        return None
+    squared_sum = float(np.dot(samples, samples))
+    if not np.isfinite(squared_sum) or squared_sum < 0.0:
+        return None
+    rms = math.sqrt(squared_sum / len(samples))
+    if rms <= 10 ** (-50.0 / 20.0):
         return None
     # Preserve low-volume but valid speech with a smaller influence.
     loudness_weight = min(1.0, max(0.4, rms / 0.08))
     return loudness_weight
 
 
-def windows_from_audio(
+def iter_windows_from_audio(
     audio: np.ndarray,
     *,
     start_ms: int | None = None,
     stitched: bool = False,
     minimum_samples: int = REDIMNET_MIN_WINDOW_SAMPLES,
-) -> list[VoiceWindow]:
+) -> Iterator[VoiceWindow]:
+    """Yield fixed model windows without retaining a second audio-sized list."""
+
     samples = np.asarray(audio, dtype=np.float32).reshape(-1)
-    windows: list[VoiceWindow] = []
     for offset in range(0, len(samples), REDIMNET_WINDOW_SAMPLES):
         chunk = samples[offset : offset + REDIMNET_WINDOW_SAMPLES]
         if len(chunk) < minimum_samples:
@@ -289,25 +306,152 @@ def windows_from_audio(
         chunk_end_ms = None if chunk_start_ms is None else chunk_start_ms + round(duration_seconds * 1000)
         if stitched:
             quality *= 0.6
-        windows.append(
-            VoiceWindow(
-                audio=_fit_window(chunk),
-                start_ms=chunk_start_ms,
-                end_ms=chunk_end_ms,
-                clean_duration_seconds=duration_seconds,
-                quality=quality,
-                stitched=stitched,
-            )
+        yield VoiceWindow(
+            audio=_fit_window(chunk),
+            start_ms=chunk_start_ms,
+            end_ms=chunk_end_ms,
+            clean_duration_seconds=duration_seconds,
+            quality=quality,
+            stitched=stitched,
         )
-    return windows
+
+
+def windows_from_audio(
+    audio: np.ndarray,
+    *,
+    start_ms: int | None = None,
+    stitched: bool = False,
+    minimum_samples: int = REDIMNET_MIN_WINDOW_SAMPLES,
+) -> list[VoiceWindow]:
+    """Compatibility wrapper for callers that explicitly need a list."""
+
+    return list(
+        iter_windows_from_audio(
+            audio,
+            start_ms=start_ms,
+            stitched=stitched,
+            minimum_samples=minimum_samples,
+        )
+    )
+
+
+def _detect_embedding_speech_segments(
+    audio: np.ndarray,
+    *,
+    padding_ms: int = 120,
+) -> list[tuple[int, int]]:
+    """Energy VAD equivalent to the legacy extractor, but vectorized in blocks.
+
+    A two-hour file has roughly 240k VAD frames.  Processing those frames one
+    Python call at a time dominated the CPU phase and the old helper also made
+    two audio-sized copies.  Blocks keep the largest temporary below 16 MiB.
+    """
+
+    samples = np.asarray(audio, dtype=np.float32).reshape(-1)
+    if len(samples) == 0:
+        return []
+    frame_samples = int(REDIMNET_SAMPLE_RATE * _ENERGY_VAD_FRAME_MS / 1000)
+    if len(samples) < frame_samples:
+        if float(np.max(np.abs(samples))) < 0.0001:
+            return []
+        return [(0, len(samples))]
+
+    frame_count = (len(samples) - frame_samples) // frame_samples + 1
+    energies = np.empty(frame_count, dtype=np.float32)
+    for first_frame in range(0, frame_count, _ENERGY_VAD_BATCH_FRAMES):
+        last_frame = min(frame_count, first_frame + _ENERGY_VAD_BATCH_FRAMES)
+        block = samples[first_frame * frame_samples : last_frame * frame_samples]
+        frames = block.reshape(last_frame - first_frame, frame_samples)
+        # Keep the original float32 square/mean semantics, just apply them to
+        # many frames at once.  This is exactly equal for ordinary input in
+        # NumPy, including the percentile-derived threshold below.
+        energies[first_frame:last_frame] = np.sqrt(
+            np.mean(np.square(frames), axis=1)
+        )
+
+    if len(energies) == 0 or float(np.max(energies)) < 0.0001:
+        return []
+    noise_floor = float(np.percentile(energies, 5))
+    speech_peak = float(np.percentile(energies, 95))
+    threshold = max(0.0001, noise_floor + (speech_peak - noise_floor) * 0.05)
+    voiced = energies >= threshold
+
+    # Find true runs in vectorized form.  ``ends`` are exclusive frame indices.
+    bounded = np.empty(len(voiced) + 2, dtype=np.bool_)
+    bounded[0] = False
+    bounded[-1] = False
+    bounded[1:-1] = voiced
+    transitions = np.flatnonzero(bounded[1:] != bounded[:-1])
+    run_starts = transitions[0::2]
+    run_ends = transitions[1::2]
+    min_run_frames = max(1, int(_ENERGY_VAD_MIN_RUN_MS / _ENERGY_VAD_FRAME_MS))
+    padding_samples = int(padding_ms * REDIMNET_SAMPLE_RATE / 1000)
+    merge_gap_samples = int(_ENERGY_VAD_MERGE_GAP_MS * REDIMNET_SAMPLE_RATE / 1000)
+
+    merged: list[tuple[int, int]] = []
+    for run_start, run_end in zip(run_starts.tolist(), run_ends.tolist()):
+        if run_end - run_start < min_run_frames:
+            continue
+        start_sample = max(0, run_start * frame_samples - padding_samples)
+        end_sample = min(len(samples), run_end * frame_samples + padding_samples)
+        if merged and start_sample <= merged[-1][1] + merge_gap_samples:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end_sample))
+        elif end_sample > start_sample:
+            merged.append((start_sample, end_sample))
+    return merged
+
+
+def _iter_concatenated_segment_windows(
+    audio: np.ndarray,
+    segments: Sequence[tuple[int, int]],
+) -> Iterator[VoiceWindow]:
+    """Window the logical concatenation of VAD spans with bounded memory."""
+
+    segment_index = 0
+    segment_position = segments[0][0] if segments else 0
+    while segment_index < len(segments):
+        pieces: list[np.ndarray] = []
+        collected = 0
+        while collected < REDIMNET_WINDOW_SAMPLES and segment_index < len(segments):
+            segment_start, segment_end = segments[segment_index]
+            segment_position = max(segment_position, segment_start)
+            available = max(0, segment_end - segment_position)
+            if available == 0:
+                segment_index += 1
+                if segment_index < len(segments):
+                    segment_position = segments[segment_index][0]
+                continue
+            take = min(REDIMNET_WINDOW_SAMPLES - collected, available)
+            pieces.append(audio[segment_position : segment_position + take])
+            segment_position += take
+            collected += take
+            if segment_position >= segment_end:
+                segment_index += 1
+                if segment_index < len(segments):
+                    segment_position = segments[segment_index][0]
+
+        if collected < REDIMNET_MIN_WINDOW_SAMPLES:
+            break
+        chunk = pieces[0] if len(pieces) == 1 else np.concatenate(pieces)
+        quality = _audio_quality(chunk)
+        if quality is None:
+            continue
+        yield VoiceWindow(
+            audio=_fit_window(chunk),
+            clean_duration_seconds=collected / float(REDIMNET_SAMPLE_RATE),
+            quality=quality,
+        )
 
 
 def embed_voice_windows(
-    windows: Sequence[VoiceWindow],
+    windows: Iterable[VoiceWindow],
     *,
     batch_size: int = REDIMNET_DEFAULT_BATCH_SIZE,
 ) -> list[EmbeddedVoiceWindow]:
-    if not windows:
+    effective_batch_size = max(1, int(batch_size))
+    window_iterator = iter(windows)
+    pending = list(itertools.islice(window_iterator, effective_batch_size))
+    if not pending:
         return []
     if not load_vid_model():
         raise RuntimeError("ReDimNet2-B6 LM konnte nicht geladen werden.")
@@ -315,15 +459,16 @@ def embed_voice_windows(
     model = _redimnet_components["model"]
     device: torch.device = _redimnet_components["device"]
     dtype: torch.dtype = _redimnet_components["dtype"]
-    output_vectors: list[np.ndarray] = []
-    index = 0
-    effective_batch_size = max(1, int(batch_size))
+    output: list[EmbeddedVoiceWindow] = []
 
     with shared_gpu_lease():
-        while index < len(windows):
-            current_size = min(effective_batch_size, len(windows) - index)
-            current = windows[index : index + current_size]
+        while pending:
+            current_size = min(effective_batch_size, len(pending))
+            current = pending[:current_size]
             batch_np = np.stack([_fit_window(window.audio) for window in current], axis=0)
+            waveform = None
+            embeddings = None
+            retry_after_oom = False
             try:
                 waveform = torch.from_numpy(batch_np).to(device=device, dtype=torch.float32)
                 autocast = (
@@ -334,37 +479,54 @@ def embed_voice_windows(
                 with torch.inference_mode(), autocast:
                     embeddings = model(waveform)
                 embeddings_np = embeddings.detach().to(device="cpu", dtype=torch.float32).numpy()
-                del waveform, embeddings
             except RuntimeError as exc:
                 if "out of memory" in str(exc).lower() and current_size > 1:
                     effective_batch_size = max(1, current_size // 2)
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                    continue
-                raise
+                    retry_after_oom = True
+                else:
+                    raise
+            finally:
+                # Device tensors must not survive into the next batch.  This is
+                # especially important after an OOM backoff on a shared GPU.
+                del waveform, embeddings
 
-            for vector in embeddings_np:
+            if retry_after_oom:
+                # Run this after the exception context and device references
+                # are gone; otherwise PyTorch cannot release all cached blocks.
+                if device.type == "cuda" and torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                continue
+
+            if embeddings_np.ndim != 2 or embeddings_np.shape[0] != current_size:
+                raise RuntimeError("ReDimNet2 lieferte eine unerwartete Batch-Form.")
+
+            for window, vector in zip(current, embeddings_np):
                 vector = np.asarray(vector, dtype=np.float32).reshape(-1)
                 if len(vector) != REDIMNET_EMBEDDING_DIMENSION or not np.all(np.isfinite(vector)):
                     raise RuntimeError("ReDimNet2 lieferte einen ungueltigen Vektor.")
                 norm = float(np.linalg.norm(vector))
                 if norm <= 1e-12:
                     raise RuntimeError("ReDimNet2 lieferte einen Nullvektor.")
-                output_vectors.append((vector / norm).astype(np.float32, copy=False))
-            index += current_size
+                output.append(
+                    EmbeddedVoiceWindow(
+                        vector=(vector / norm).astype(np.float32, copy=False),
+                        start_ms=window.start_ms,
+                        end_ms=window.end_ms,
+                        clean_duration_seconds=window.clean_duration_seconds,
+                        quality=window.quality,
+                        stitched=window.stitched,
+                        source_spans=window.source_spans,
+                    )
+                )
+            del pending[:current_size]
+            pending.extend(
+                itertools.islice(
+                    window_iterator,
+                    max(0, effective_batch_size - len(pending)),
+                )
+            )
 
-    return [
-        EmbeddedVoiceWindow(
-            vector=vector,
-            start_ms=window.start_ms,
-            end_ms=window.end_ms,
-            clean_duration_seconds=window.clean_duration_seconds,
-            quality=window.quality,
-            stitched=window.stitched,
-            source_spans=window.source_spans,
-        )
-        for window, vector in zip(windows, output_vectors)
-    ]
+    return output
 
 
 def _weighted_normalized_mean(vectors: Iterable[np.ndarray], weights: Iterable[float]) -> np.ndarray:
@@ -384,15 +546,17 @@ def generate_voice_vector(audio_data_np: np.ndarray) -> np.ndarray:
     """Generate the one public 192-D embedding used by legacy and v2 APIs."""
 
     audio = np.asarray(audio_data_np, dtype=np.float32).reshape(-1)
-    speech_only = extract_speech_audio(audio)
-    if len(speech_only) < REDIMNET_MIN_WINDOW_SAMPLES:
+    speech_segments = _detect_embedding_speech_segments(audio)
+    speech_sample_count = sum(end - start for start, end in speech_segments)
+    if speech_sample_count < REDIMNET_MIN_WINDOW_SAMPLES:
         raise ValueError(
-            "Zu wenig Sprache fuer ein Stimmembedding: mindestens 1,0 Sekunde erforderlich."
+            "Zu wenig Sprache fuer ein Stimmembedding: mindestens "
+            f"{REDIMNET_MIN_WINDOW_SECONDS:.1f} Sekunden erforderlich."
         )
-    audio = speech_only
 
-    windows = windows_from_audio(audio)
-    embedded = embed_voice_windows(windows)
+    embedded = embed_voice_windows(
+        _iter_concatenated_segment_windows(audio, speech_segments)
+    )
     if not embedded:
         raise ValueError("Keine qualitativ geeigneten Sprachfenster fuer ein Stimmembedding gefunden.")
     return _weighted_normalized_mean(
@@ -411,6 +575,7 @@ __all__ = [
     "embed_voice_windows",
     "embedding_model_metadata",
     "generate_voice_vector",
+    "iter_windows_from_audio",
     "load_vid_model",
     "windows_from_audio",
 ]

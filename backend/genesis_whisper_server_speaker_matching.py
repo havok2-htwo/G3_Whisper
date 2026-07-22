@@ -16,7 +16,7 @@ from .genesis_whisper_server_vid import (
     REDIMNET_WINDOW_SAMPLES,
     VoiceWindow,
     embed_voice_windows,
-    windows_from_audio,
+    iter_windows_from_audio,
 )
 
 
@@ -34,6 +34,7 @@ NEAR_DUPLICATE_COSINE = 0.995
 MAX_RETURNED_EMBEDDINGS = 64
 MAX_STREAMING_COMPONENTS = 256
 MAX_REPRESENTATIVE_CANDIDATES = 512
+MATCH_SIMILARITY_BLOCK_SIZE = 256
 MIN_CLEAN_REGION_MS = 2000
 BOUNDARY_MARGIN_MS = 200
 
@@ -190,15 +191,22 @@ def _streaming_components(
     """
 
     components: list[list[int]] = []
-    weighted_sums: list[np.ndarray] = []
-    prototypes: list[np.ndarray] = []
+    # Fixed matrices avoid rebuilding ``np.stack(prototypes)`` for every
+    # candidate.  Long recordings normally have thousands of windows, while
+    # the number of plausible components is deliberately bounded.
+    component_capacity = min(MAX_STREAMING_COMPONENTS, max(1, len(samples)))
+    weighted_sums = np.zeros(
+        (component_capacity, REDIMNET_EMBEDDING_DIMENSION),
+        dtype=np.float64,
+    )
+    prototypes = np.zeros_like(weighted_sums)
     capacity_exceeded = False
 
     for index, sample in enumerate(samples):
         weight = max(sample.quality * sample.clean_duration_seconds, 1e-6)
-        if prototypes:
-            prototype_matrix = np.stack(prototypes, axis=0)
-            similarities = prototype_matrix @ sample.vector
+        component_count = len(components)
+        if component_count:
+            similarities = prototypes[:component_count] @ sample.vector
             component_index = int(np.argmax(similarities))
             best_similarity = float(similarities[component_index])
         else:
@@ -206,7 +214,7 @@ def _streaming_components(
             best_similarity = -1.0
 
         if best_similarity < COMPONENT_COSINE_MIN:
-            if len(components) >= MAX_STREAMING_COMPONENTS:
+            if len(components) >= component_capacity:
                 # The sample was still inspected, but assigning it to an
                 # unrelated component would fabricate evidence.  Mark the
                 # whole cloud unusable and continue scanning deterministically.
@@ -214,8 +222,9 @@ def _streaming_components(
                 continue
             components.append([index])
             weighted_sum = sample.vector.astype(np.float64) * weight
-            weighted_sums.append(weighted_sum)
-            prototypes.append(sample.vector.astype(np.float64, copy=True))
+            new_index = len(components) - 1
+            weighted_sums[new_index] = weighted_sum
+            prototypes[new_index] = sample.vector
             continue
 
         components[component_index].append(index)
@@ -396,19 +405,104 @@ def _subtract_intervals(
     end_ms: int,
     excluded: Sequence[tuple[int, int]],
 ) -> list[tuple[int, int]]:
-    pieces = [(start_ms, end_ms)]
+    # ``excluded`` is sorted and unioned by the caller.  A cursor is both
+    # simpler and avoids repeatedly rebuilding a growing pieces list for every
+    # overlap in a long recording.
+    pieces: list[tuple[int, int]] = []
+    cursor = start_ms
     for excluded_start, excluded_end in excluded:
-        next_pieces: list[tuple[int, int]] = []
-        for piece_start, piece_end in pieces:
-            if excluded_end <= piece_start or excluded_start >= piece_end:
-                next_pieces.append((piece_start, piece_end))
-                continue
-            if excluded_start > piece_start:
-                next_pieces.append((piece_start, excluded_start))
-            if excluded_end < piece_end:
-                next_pieces.append((excluded_end, piece_end))
-        pieces = next_pieces
+        if excluded_end <= cursor:
+            continue
+        if excluded_start >= end_ms:
+            break
+        if excluded_start > cursor:
+            pieces.append((cursor, min(excluded_start, end_ms)))
+        cursor = max(cursor, excluded_end)
+        if cursor >= end_ms:
+            break
+    if cursor < end_ms:
+        pieces.append((cursor, end_ms))
     return pieces
+
+
+def _merge_intervals(intervals: Sequence[tuple[int, int]]) -> list[tuple[int, int]]:
+    merged: list[tuple[int, int]] = []
+    for start_ms, end_ms in sorted(intervals):
+        if end_ms <= start_ms:
+            continue
+        if merged and start_ms <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end_ms))
+        else:
+            merged.append((start_ms, end_ms))
+    return merged
+
+
+def _iter_stitched_windows(
+    short_parts: Sequence[tuple[np.ndarray, int, int]],
+) -> Iterable[VoiceWindow]:
+    """Yield logical stitched windows without one speaker-sized concatenate."""
+
+    minimum_samples = round(MIN_CLEAN_REGION_MS * REDIMNET_SAMPLE_RATE / 1000)
+    part_index = 0
+    part_position = 0
+    while part_index < len(short_parts):
+        pieces: list[np.ndarray] = []
+        source_spans: list[tuple[int, int]] = []
+        collected = 0
+        while collected < REDIMNET_WINDOW_SAMPLES and part_index < len(short_parts):
+            part, original_start_ms, _ = short_parts[part_index]
+            available = len(part) - part_position
+            if available <= 0:
+                part_index += 1
+                part_position = 0
+                continue
+            take = min(REDIMNET_WINDOW_SAMPLES - collected, available)
+            pieces.append(part[part_position : part_position + take])
+            source_start_ms = original_start_ms + round(
+                part_position * 1000 / REDIMNET_SAMPLE_RATE
+            )
+            source_end_ms = original_start_ms + round(
+                (part_position + take) * 1000 / REDIMNET_SAMPLE_RATE
+            )
+            source_spans.append((source_start_ms, source_end_ms))
+            part_position += take
+            collected += take
+            if part_position >= len(part):
+                part_index += 1
+                part_position = 0
+
+        if collected < minimum_samples:
+            break
+        chunk = pieces[0] if len(pieces) == 1 else np.concatenate(pieces)
+        for window in iter_windows_from_audio(
+            chunk,
+            start_ms=None,
+            stitched=True,
+            minimum_samples=minimum_samples,
+        ):
+            yield replace(window, source_spans=tuple(source_spans))
+
+
+def _iter_speaker_windows(
+    audio: np.ndarray,
+    regions: Sequence[tuple[int, int]],
+) -> Iterable[VoiceWindow]:
+    minimum_samples = round(MIN_CLEAN_REGION_MS * REDIMNET_SAMPLE_RATE / 1000)
+    short_parts: list[tuple[np.ndarray, int, int]] = []
+    for start_ms, end_ms in regions:
+        start_sample = round(start_ms * REDIMNET_SAMPLE_RATE / 1000)
+        end_sample = round(end_ms * REDIMNET_SAMPLE_RATE / 1000)
+        region_audio = audio[start_sample:end_sample]
+        if end_ms - start_ms >= MIN_CLEAN_REGION_MS:
+            yield from iter_windows_from_audio(
+                region_audio,
+                start_ms=start_ms,
+                minimum_samples=minimum_samples,
+            )
+        elif len(region_audio) > 0:
+            short_parts.append((region_audio, start_ms, end_ms))
+    if short_parts:
+        yield from _iter_stitched_windows(short_parts)
 
 
 def extract_speaker_clouds(
@@ -416,11 +510,14 @@ def extract_speaker_clouds(
     exclusive_segments: Sequence[Mapping[str, Any]],
     overlaps: Sequence[Mapping[str, Any]],
 ) -> dict[str, SpeakerCloud]:
-    duration_ms = round(len(audio) * 1000 / REDIMNET_SAMPLE_RATE)
-    overlap_intervals = sorted(
-        (max(0, int(item["start_ms"])), min(duration_ms, int(item["end_ms"])))
-        for item in overlaps
-        if int(item.get("end_ms", 0)) > int(item.get("start_ms", 0))
+    audio_samples = np.asarray(audio, dtype=np.float32).reshape(-1)
+    duration_ms = round(len(audio_samples) * 1000 / REDIMNET_SAMPLE_RATE)
+    overlap_intervals = _merge_intervals(
+        [
+            (max(0, int(item["start_ms"])), min(duration_ms, int(item["end_ms"])))
+            for item in overlaps
+            if int(item.get("end_ms", 0)) > int(item.get("start_ms", 0))
+        ]
     )
     regions_by_speaker: dict[str, list[tuple[int, int]]] = {}
     for segment in exclusive_segments:
@@ -435,69 +532,32 @@ def extract_speaker_clouds(
             if clean_end > clean_start:
                 regions_by_speaker.setdefault(speaker_id, []).append((clean_start, clean_end))
 
-    clouds: dict[str, SpeakerCloud] = {}
     all_speaker_ids = sorted(
         {str(item.get("speaker_id") or "") for item in exclusive_segments if item.get("speaker_id")}
     )
-    for speaker_id in all_speaker_ids:
-        regions = sorted(regions_by_speaker.get(speaker_id, []))
-        voice_windows: list[VoiceWindow] = []
-        short_audio: list[np.ndarray] = []
-        short_spans: list[tuple[int, int]] = []
-        for start_ms, end_ms in regions:
-            start_sample = round(start_ms * REDIMNET_SAMPLE_RATE / 1000)
-            end_sample = round(end_ms * REDIMNET_SAMPLE_RATE / 1000)
-            region_audio = np.asarray(audio[start_sample:end_sample], dtype=np.float32)
-            if end_ms - start_ms >= MIN_CLEAN_REGION_MS:
-                voice_windows.extend(
-                    windows_from_audio(
-                        region_audio,
-                        start_ms=start_ms,
-                        minimum_samples=round(MIN_CLEAN_REGION_MS * REDIMNET_SAMPLE_RATE / 1000),
-                    )
-                )
-            elif len(region_audio) > 0:
-                short_audio.append(region_audio)
-                short_spans.append((start_ms, end_ms))
+    owners: list[str] = []
 
-        if short_audio:
-            stitched_audio = np.concatenate(short_audio)
-            if len(stitched_audio) >= round(MIN_CLEAN_REGION_MS * REDIMNET_SAMPLE_RATE / 1000):
-                stitched_windows = windows_from_audio(
-                    stitched_audio,
-                    start_ms=None,
-                    stitched=True,
-                    minimum_samples=round(MIN_CLEAN_REGION_MS * REDIMNET_SAMPLE_RATE / 1000),
-                )
-                part_offsets: list[tuple[int, int, int]] = []
-                cursor = 0
-                for part, (original_start_ms, _) in zip(short_audio, short_spans):
-                    part_offsets.append((cursor, cursor + len(part), original_start_ms))
-                    cursor += len(part)
-                for window_index, window in enumerate(stitched_windows):
-                    window_start = window_index * REDIMNET_WINDOW_SAMPLES
-                    window_end = min(
-                        len(stitched_audio),
-                        window_start + round(window.clean_duration_seconds * REDIMNET_SAMPLE_RATE),
-                    )
-                    source_spans: list[tuple[int, int]] = []
-                    for part_start, part_end, original_start_ms in part_offsets:
-                        overlap_start = max(window_start, part_start)
-                        overlap_end = min(window_end, part_end)
-                        if overlap_end <= overlap_start:
-                            continue
-                        source_start_ms = original_start_ms + round(
-                            (overlap_start - part_start) * 1000 / REDIMNET_SAMPLE_RATE
-                        )
-                        source_end_ms = original_start_ms + round(
-                            (overlap_end - part_start) * 1000 / REDIMNET_SAMPLE_RATE
-                        )
-                        source_spans.append((source_start_ms, source_end_ms))
-                    voice_windows.append(replace(window, source_spans=tuple(source_spans)))
+    def all_windows() -> Iterable[VoiceWindow]:
+        for speaker_id in all_speaker_ids:
+            regions = sorted(regions_by_speaker.get(speaker_id, []))
+            for window in _iter_speaker_windows(audio_samples, regions):
+                owners.append(speaker_id)
+                yield window
 
-        embedded = embed_voice_windows(voice_windows) if voice_windows else []
-        clouds[speaker_id] = build_robust_cloud(speaker_id, embedded)
-    return clouds
+    # One global call fills batches across speaker boundaries.  The previous
+    # per-speaker calls produced many tiny forwards in conversational audio.
+    embedded = embed_voice_windows(all_windows())
+    if len(embedded) != len(owners):
+        raise RuntimeError("ReDimNet2 lieferte nicht fuer jedes Sprecherfenster einen Vektor.")
+    by_speaker: dict[str, list[EmbeddedVoiceWindow]] = {
+        speaker_id: [] for speaker_id in all_speaker_ids
+    }
+    for speaker_id, item in zip(owners, embedded):
+        by_speaker[speaker_id].append(item)
+    return {
+        speaker_id: build_robust_cloud(speaker_id, by_speaker[speaker_id])
+        for speaker_id in all_speaker_ids
+    }
 
 
 def _profile_cloud(profile: Mapping[str, Any]) -> SpeakerCloud:
@@ -514,6 +574,39 @@ def _profile_cloud(profile: Mapping[str, Any]) -> SpeakerCloud:
         for vector in profile["vectors"]
     ]
     return build_robust_cloud(str(profile["id"]), samples)
+
+
+def _profile_support(
+    cluster_matrix: np.ndarray,
+    cluster_weights: np.ndarray,
+    profile_matrix: np.ndarray,
+) -> float:
+    """Compute exact max-cosine support with bounded temporary matrices."""
+
+    if len(cluster_matrix) == 0 or len(profile_matrix) == 0:
+        return 0.0
+    total_weight = float(np.sum(cluster_weights, dtype=np.float64))
+    if total_weight <= 0.0 or not np.isfinite(total_weight):
+        return 0.0
+    supported_weight = 0.0
+    block_size = max(1, int(MATCH_SIMILARITY_BLOCK_SIZE))
+    for cluster_start in range(0, len(cluster_matrix), block_size):
+        cluster_block = cluster_matrix[cluster_start : cluster_start + block_size]
+        maximum = np.full(len(cluster_block), -np.inf, dtype=np.float32)
+        for profile_start in range(0, len(profile_matrix), block_size):
+            profile_block = profile_matrix[profile_start : profile_start + block_size]
+            similarities = np.matmul(cluster_block, profile_block.T)
+            np.maximum(maximum, np.max(similarities, axis=1), out=maximum)
+        block_weights = cluster_weights[
+            cluster_start : cluster_start + len(cluster_block)
+        ]
+        supported_weight += float(
+            np.sum(
+                block_weights[maximum >= SAMPLE_SUPPORT_COSINE_MIN],
+                dtype=np.float64,
+            )
+        )
+    return supported_weight / total_weight
 
 
 def match_known_speakers(
@@ -571,21 +664,30 @@ def match_known_speakers(
     cosine_scores = np.zeros((profile_count, cluster_count), dtype=np.float64)
     supports = np.zeros((profile_count, cluster_count), dtype=np.float64)
     valid_edges = np.zeros((profile_count, cluster_count), dtype=bool)
+    cluster_evidence: list[tuple[np.ndarray, np.ndarray]] = []
+    for _, cluster_cloud in cluster_items:
+        inliers = cluster_cloud.inliers
+        if inliers:
+            matrix = np.stack([item.vector for item in inliers], axis=0)
+            weights = np.asarray(
+                [max(item.quality * item.clean_duration_seconds, 1e-6) for item in inliers],
+                dtype=np.float64,
+            )
+        else:
+            matrix = np.empty((0, REDIMNET_EMBEDDING_DIMENSION), dtype=np.float32)
+            weights = np.empty(0, dtype=np.float64)
+        cluster_evidence.append((matrix, weights))
     for profile_index, (_, _, profile_cloud) in enumerate(eligible_profiles):
         profile_matrix = np.stack([item.vector for item in profile_cloud.inliers], axis=0)
         for cluster_index, (_, cluster_cloud) in enumerate(cluster_items):
             score = float(profile_cloud.prototype @ cluster_cloud.prototype)
             cosine_scores[profile_index, cluster_index] = score
-            inliers = cluster_cloud.inliers
-            if inliers:
-                inlier_matrix = np.stack([item.vector for item in inliers], axis=0)
-                similarities = inlier_matrix @ profile_matrix.T
-                weights = np.asarray(
-                    [max(item.quality * item.clean_duration_seconds, 1e-6) for item in inliers],
-                    dtype=np.float64,
-                )
-                supported = np.max(similarities, axis=1) >= SAMPLE_SUPPORT_COSINE_MIN
-                supports[profile_index, cluster_index] = float(np.sum(weights[supported]) / np.sum(weights))
+            inlier_matrix, weights = cluster_evidence[cluster_index]
+            supports[profile_index, cluster_index] = _profile_support(
+                inlier_matrix,
+                weights,
+                profile_matrix,
+            )
             valid_edges[profile_index, cluster_index] = (
                 cluster_cloud.status == "ready"
                 and score >= MATCH_COSINE_MIN

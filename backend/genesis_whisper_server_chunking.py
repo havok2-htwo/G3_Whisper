@@ -46,13 +46,17 @@ def split_audio_for_whisper(
     if audio_data_np is None or len(audio_data_np) == 0:
         return []
 
-    audio = np.asarray(audio_data_np, dtype=np.float32).flatten()
+    # Keep a view of the decoded request whenever it is already a contiguous
+    # float32 array. Long recordings stay alive for the complete request, so
+    # copying the full waveform here and every returned chunk only increases
+    # peak RAM without providing isolation that any ASR caller relies on.
+    audio = np.asarray(audio_data_np, dtype=np.float32).reshape(-1)
     max_chunk_samples = max(int(max_chunk_seconds * sample_rate), sample_rate)
 
     # Short audio (≤ one Whisper window): skip VAD entirely to avoid
     # cutting speech at edges where TTS fades in/out quietly.
     if len(audio) <= max_chunk_samples:
-        return [audio.copy()]
+        return [audio]
 
     # Longer audio: use VAD to find speech regions, then chunk each one.
     segments = _detect_speech_segments(audio, sample_rate, padding_ms=padding_ms)
@@ -68,7 +72,7 @@ def split_audio_for_whisper(
     for start_sample, end_sample in segments:
         segment = audio[start_sample:end_sample]
         if len(segment) <= max_chunk_samples:
-            chunks.append(segment.copy())
+            chunks.append(segment)
             continue
 
         step = max(max_chunk_samples - overlap_samples, sample_rate)
@@ -76,7 +80,7 @@ def split_audio_for_whisper(
             chunk = segment[offset:offset + max_chunk_samples]
             if len(chunk) == 0:
                 continue
-            chunks.append(chunk.copy())
+            chunks.append(chunk)
             if offset + max_chunk_samples >= len(segment):
                 break
 

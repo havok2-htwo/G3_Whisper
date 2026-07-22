@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import inspect
 import json
 import math
 import time
@@ -19,7 +20,8 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.formparsers import MultiPartException, MultiPartParser
 
 from .genesis_whisper_server_audio import get_audio_duration_seconds, load_audio_file
-from .genesis_whisper_server_auth import authorize_api_key, get_auth_store
+from .genesis_whisper_server_auth import authorize_api_key, get_auth_store, require_admin
+from .genesis_whisper_server_batching import enqueue_audio_segments_bounded
 from .genesis_whisper_server_chunking import combine_transcription_chunks, split_audio_for_whisper
 from .genesis_whisper_server_dia_client import DiaClientError, diarize_v2
 from .genesis_whisper_server_globals import (
@@ -43,6 +45,8 @@ from .genesis_whisper_server_speaker_matching import (
     match_known_speakers,
     validate_known_speakers,
 )
+from .genesis_whisper_server_speaker_audio import build_unknown_speaker_audio_assets
+from .genesis_whisper_server_speaker_refinement import refine_speaker_turns
 from .genesis_whisper_server_storage import log_transcription
 from .genesis_whisper_server_vid import embedding_model_metadata, generate_voice_vector
 
@@ -50,6 +54,7 @@ from .genesis_whisper_server_vid import embedding_model_metadata, generate_voice
 V2_SCHEMA_VERSION = "2.0"
 V2_REQUEST_JSON_MAX_BYTES = 16 * 1024 * 1024
 V2_MODES = {"embedding", "transcript", "transcript_embedding", "diarization"}
+SPEAKER_REFINEMENT_MODES = {"off", "shadow", "conservative"}
 MAX_EXPECTED_SPEAKERS = 64
 MAX_TURN_CHUNK_SECONDS = 30.0
 TURN_MERGE_GAP_MS = 250
@@ -139,7 +144,16 @@ def _parse_request_json(raw_value: str | None) -> dict[str, Any]:
         diarization = {}
     if not isinstance(diarization, dict):
         raise V2ApiError(422, "INVALID_REQUEST", "diarization muss ein Objekt sein.")
-    _validate_object_keys(diarization, {"expected_speakers", "known_speakers"}, "request.diarization")
+    _validate_object_keys(
+        diarization,
+        {
+            "expected_speakers",
+            "known_speakers",
+            "speaker_refinement",
+            "unknown_speaker_audio",
+        },
+        "request.diarization",
+    )
 
     expected = diarization.get("expected_speakers")
     if expected is not None:
@@ -166,10 +180,29 @@ def _parse_request_json(raw_value: str | None) -> dict[str, Any]:
             "INVALID_REQUEST",
             "expected_speakers darf nicht kleiner als die Anzahl bekannter Sprecher sein.",
         )
+    speaker_refinement = diarization.get("speaker_refinement", "off")
+    if not isinstance(speaker_refinement, str) or speaker_refinement not in SPEAKER_REFINEMENT_MODES:
+        raise V2ApiError(
+            422,
+            "INVALID_REQUEST",
+            "speaker_refinement muss 'off', 'shadow' oder 'conservative' sein.",
+        )
+    unknown_speaker_audio = diarization.get("unknown_speaker_audio", False)
+    if not isinstance(unknown_speaker_audio, bool):
+        raise V2ApiError(
+            422,
+            "INVALID_REQUEST",
+            "unknown_speaker_audio muss ein boolescher Wert sein.",
+        )
     return {
         "schema_version": V2_SCHEMA_VERSION,
         "mode": mode,
-        "diarization": {"expected_speakers": expected, "known_speakers": known},
+        "diarization": {
+            "expected_speakers": expected,
+            "known_speakers": known,
+            "speaker_refinement": speaker_refinement,
+            "unknown_speaker_audio": unknown_speaker_audio,
+        },
     }
 
 
@@ -177,14 +210,20 @@ async def _parse_multipart_parts(http_request: Request) -> tuple[FormData, Starl
     content_type = http_request.headers.get("content-type", "")
     if not content_type.lower().startswith("multipart/form-data"):
         raise V2ApiError(400, "INVALID_MULTIPART", "Content-Type muss multipart/form-data sein.")
-    parser = _BoundedV2MultipartParser(
-        headers=http_request.headers,
-        stream=http_request.stream(),
-        max_files=2,
-        max_fields=2,
-        max_part_size=V2_REQUEST_JSON_MAX_BYTES,
-        request_part_max_bytes=V2_REQUEST_JSON_MAX_BYTES,
-    )
+    parser_options: dict[str, Any] = {
+        "headers": http_request.headers,
+        "stream": http_request.stream(),
+        "max_files": 2,
+        "max_fields": 2,
+        "request_part_max_bytes": V2_REQUEST_JSON_MAX_BYTES,
+    }
+    # Starlette added ``max_part_size`` after the minimum version supported by
+    # this service.  Our streaming callback independently enforces the same
+    # 16 MiB bound for the JSON part, so omitting the upstream convenience
+    # option on older installations does not weaken the request limit.
+    if "max_part_size" in inspect.signature(MultiPartParser.__init__).parameters:
+        parser_options["max_part_size"] = V2_REQUEST_JSON_MAX_BYTES
+    parser = _BoundedV2MultipartParser(**parser_options)
     try:
         form = await parser.parse()
     except (MultiPartException, StarletteHTTPException) as exc:
@@ -276,6 +315,31 @@ def _success_response(request_id: str, payload: dict[str, Any]) -> JSONResponse:
     )
 
 
+def _authorize_v2_request(request: Request) -> str | None:
+    """Accept the public API key or an authenticated admin UI session.
+
+    Client API keys remain the normal machine-to-machine credential.  The
+    same-origin admin dashboard already has a protected, HTTP-only session and
+    must not require operators to copy a client key back into their browser
+    merely to exercise the v2 test panel.
+    """
+
+    # An explicitly supplied key is always authoritative.  This keeps the
+    # admin tester useful for validating client credentials instead of
+    # silently accepting a bad key through the browser session fallback.
+    if request.headers.get("x-api-key") is not None:
+        return authorize_api_key(request)
+
+    try:
+        return authorize_api_key(request)
+    except HTTPException as api_key_error:
+        try:
+            require_admin(request)
+        except HTTPException:
+            raise api_key_error
+        return None
+
+
 def _ensure_asr_model(processing_key: tuple[str, str, str, str, str]) -> None:
     model_id, device, cache_path, _, precision = processing_key
     if load_local_asr_model(model_id, device, cache_path, precision):
@@ -299,17 +363,11 @@ async def _transcribe_audio(request: Request, audio: np.ndarray) -> tuple[str, i
         segments = await asyncio.to_thread(split_audio_for_whisper, audio)
     if not segments:
         return "", 0, 0, model_id
-    results = await asyncio.gather(
-        *[
-            batch_manager.enqueue(
-                audio_data=segment,
-                request_id=request_token,
-                segment_index=index,
-                total_segments=len(segments),
-                processing_key=processing_key,
-            )
-            for index, segment in enumerate(segments)
-        ]
+    results = await enqueue_audio_segments_bounded(
+        batch_manager,
+        segments,
+        request_token,
+        processing_key,
     )
     text = combine_transcription_chunks([result.text for result in results])
     return text, round((time.monotonic() - started) * 1000), len(segments), model_id
@@ -337,6 +395,8 @@ def _merge_exclusive_turns(items: Sequence[Mapping[str, Any]]) -> list[dict[str,
         if (
             merged
             and merged[-1]["speaker_id"] == current["speaker_id"]
+            and str(merged[-1].get("original_speaker_id", merged[-1]["speaker_id"]))
+            == str(current.get("original_speaker_id", current["speaker_id"]))
             and current["start_ms"] <= merged[-1]["end_ms"] + TURN_MERGE_GAP_MS
         ):
             merged[-1]["end_ms"] = max(merged[-1]["end_ms"], current["end_ms"])
@@ -371,9 +431,7 @@ async def _transcribe_turns(
 ) -> tuple[list[dict[str, Any]], int, str]:
     processing_key = _processing_key()
     model_id = processing_key[0]
-    pending: list[Any] = []
     turn_chunk_counts: list[int] = []
-    flat_index = 0
     prepared_chunks: list[np.ndarray] = []
     for turn in turns:
         chunks = _turn_audio_chunks(audio, int(turn["start_ms"]), int(turn["end_ms"]))
@@ -381,20 +439,13 @@ async def _transcribe_turns(
         prepared_chunks.extend(chunks)
     started = time.monotonic()
     request_token = uuid.uuid4().hex
-    total_chunks = len(prepared_chunks)
     batch_manager = request.app.state.whisper_batch_manager
-    for chunk in prepared_chunks:
-        pending.append(
-            batch_manager.enqueue(
-                audio_data=chunk,
-                request_id=request_token,
-                segment_index=flat_index,
-                total_segments=total_chunks,
-                processing_key=processing_key,
-            )
-        )
-        flat_index += 1
-    batch_results = await asyncio.gather(*pending) if pending else []
+    batch_results = await enqueue_audio_segments_bounded(
+        batch_manager,
+        prepared_chunks,
+        request_token,
+        processing_key,
+    )
     result_index = 0
     transcript_segments: list[dict[str, Any]] = []
     for turn_index, (turn, chunk_count) in enumerate(zip(turns, turn_chunk_counts)):
@@ -410,7 +461,14 @@ async def _transcribe_turns(
                 "index": turn_index,
                 "start_ms": int(turn["start_ms"]),
                 "end_ms": int(turn["end_ms"]),
-                "diarization_speaker_id": str(turn["speaker_id"]),
+                "diarization_speaker_id": str(
+                    turn.get("original_speaker_id", turn["speaker_id"])
+                ),
+                **(
+                    {"refined_diarization_speaker_id": str(turn["speaker_id"])}
+                    if "original_speaker_id" in turn
+                    else {}
+                ),
                 "text": text,
                 "overlap": _segment_has_overlap(turn, overlaps),
             }
@@ -459,6 +517,8 @@ async def _process_diarization(
 ) -> tuple[dict[str, Any], dict[str, int], dict[str, Any], list[dict[str, Any]], str]:
     expected_speakers = configuration.get("expected_speakers")
     known_speakers = list(configuration.get("known_speakers") or [])
+    speaker_refinement_mode = str(configuration.get("speaker_refinement") or "off")
+    include_unknown_speaker_audio = bool(configuration.get("unknown_speaker_audio", False))
     dia_started = time.monotonic()
     dia_response = await diarize_v2(
         file.file,
@@ -480,14 +540,6 @@ async def _process_diarization(
         for item in dia_response.get("overlaps", [])
         if int(item.get("end_ms", 0)) > int(item.get("start_ms", 0))
     ]
-    turns = _merge_exclusive_turns(exclusive)
-    transcript_segments, transcription_ms, asr_model_id = await _transcribe_turns(
-        http_request,
-        audio,
-        turns,
-        overlaps,
-        apply_repetition_filter,
-    )
 
     embedding_started = time.monotonic()
     async with http_request.app.state.local_gpu_lock:
@@ -496,6 +548,31 @@ async def _process_diarization(
         # remain reserved for ASR so overlapping speech is transcribed once.
         speaker_clouds = await run_blocking_gpu_phase(extract_speaker_clouds, audio, standard, overlaps)
     embedding_ms = round((time.monotonic() - embedding_started) * 1000)
+
+    refinement_diagnostics: dict[str, Any] | None = None
+    effective_exclusive = exclusive
+    if speaker_refinement_mode != "off":
+        refinement = await asyncio.to_thread(
+            refine_speaker_turns,
+            speaker_refinement_mode,
+            exclusive,
+            standard,
+            overlaps,
+            speaker_clouds,
+        )
+        effective_exclusive = refinement.turns
+        speaker_clouds = refinement.speaker_clouds
+        refinement_diagnostics = refinement.diagnostics
+
+    turns = _merge_exclusive_turns(effective_exclusive)
+    transcript_segments, transcription_ms, asr_model_id = await _transcribe_turns(
+        http_request,
+        audio,
+        turns,
+        overlaps,
+        apply_repetition_filter,
+    )
+
     try:
         assignments, unresolved_profile_ids, unresolved_clusters = match_known_speakers(
             known_speakers,
@@ -510,7 +587,15 @@ async def _process_diarization(
     unmatched_public_ids: dict[str, str] = {}
     all_unmatched_labels = sorted(
         set(detected_speakers)
-        | {str(segment["diarization_speaker_id"]) for segment in transcript_segments}
+        | {
+            str(
+                segment.get(
+                    "refined_diarization_speaker_id",
+                    segment["diarization_speaker_id"],
+                )
+            )
+            for segment in transcript_segments
+        }
     )
     for dia_speaker_id in all_unmatched_labels:
         if dia_speaker_id in assignments:
@@ -527,7 +612,12 @@ async def _process_diarization(
         reserved_public_ids.add(candidate)
 
     for segment in transcript_segments:
-        dia_speaker_id = segment["diarization_speaker_id"]
+        dia_speaker_id = str(
+            segment.get(
+                "refined_diarization_speaker_id",
+                segment["diarization_speaker_id"],
+            )
+        )
         assignment = assignments.get(dia_speaker_id)
         if assignment:
             segment["speaker_id"] = assignment["speaker_id"]
@@ -544,6 +634,24 @@ async def _process_diarization(
     unknown_speakers: list[dict[str, Any]] = []
     unresolved_speakers: list[dict[str, Any]] = []
     warnings: list[dict[str, Any]] = []
+    unknown_audio_assets: dict[str, dict[str, Any]] = {}
+    unknown_audio_ms: int | None = None
+    unidentified_dia_ids = sorted(
+        speaker_id for speaker_id in detected_speakers if speaker_id not in assignments
+    )
+    if include_unknown_speaker_audio and unidentified_dia_ids:
+        unknown_audio_started = time.monotonic()
+        try:
+            unknown_audio_assets = await asyncio.to_thread(
+                build_unknown_speaker_audio_assets,
+                audio,
+                speaker_clouds,
+                unidentified_dia_ids,
+            )
+        except (RuntimeError, ValueError):
+            warnings.append({"code": "UNKNOWN_SPEAKER_AUDIO_ENCODING_FAILED"})
+        unknown_audio_ms = round((time.monotonic() - unknown_audio_started) * 1000)
+
     for dia_speaker_id in detected_speakers:
         cloud = speaker_clouds[dia_speaker_id]
         assignment = assignments.get(dia_speaker_id)
@@ -584,6 +692,8 @@ async def _process_diarization(
             "purity": round(cloud.purity, 6) if cloud.purity is not None else None,
             **(unresolved_match or {}),
         }
+        if dia_speaker_id in unknown_audio_assets:
+            public_speaker["audio"] = unknown_audio_assets[dia_speaker_id]
         if unresolved_match:
             unresolved_speakers.append(public_speaker)
         else:
@@ -594,6 +704,22 @@ async def _process_diarization(
                     "code": "SPEAKER_EMBEDDING_QUALITY",
                     "speaker_id": dia_speaker_id,
                     "status": cloud.status,
+                }
+            )
+
+    if include_unknown_speaker_audio and unidentified_dia_ids and not any(
+        warning.get("code") == "UNKNOWN_SPEAKER_AUDIO_ENCODING_FAILED" for warning in warnings
+    ):
+        unavailable_audio_ids = [
+            unmatched_public_ids[speaker_id]
+            for speaker_id in unidentified_dia_ids
+            if speaker_id not in unknown_audio_assets
+        ]
+        if unavailable_audio_ids:
+            warnings.append(
+                {
+                    "code": "UNKNOWN_SPEAKER_AUDIO_UNAVAILABLE",
+                    "speaker_ids": unavailable_audio_ids,
                 }
             )
 
@@ -628,11 +754,17 @@ async def _process_diarization(
         "unresolved_speakers": unresolved_speakers,
         "unresolved_known_speakers": unresolved_profile_ids,
     }
+    if refinement_diagnostics is not None:
+        result["speaker_refinement"] = refinement_diagnostics
     timings = {
         "diarization": dia_duration_ms,
         "transcription": transcription_ms,
         "embedding": embedding_ms,
     }
+    if refinement_diagnostics is not None:
+        timings["speaker_refinement"] = int(refinement_diagnostics["processing_ms"])
+    if unknown_audio_ms is not None:
+        timings["unknown_speaker_audio"] = unknown_audio_ms
     models = {
         "asr": {"id": asr_model_id},
         "diarization": dia_response.get("model") or {},
@@ -673,7 +805,7 @@ def create_v2_api(app: FastAPI) -> FastAPI:
         mode: str | None = None
         try:
             try:
-                api_key_id = authorize_api_key(http_request)
+                api_key_id = _authorize_v2_request(http_request)
             except HTTPException as exc:
                 raise V2ApiError(exc.status_code, "INVALID_API_KEY", str(exc.detail), False) from exc
             form_data, file, request_json = await _parse_multipart_parts(http_request)
@@ -715,10 +847,26 @@ def create_v2_api(app: FastAPI) -> FastAPI:
                 transcript_text, transcription_ms, _, asr_model_id = await _transcribe_audio(http_request, audio)
                 if filter_enabled:
                     transcript_text = filter_repeated_patterns(transcript_text)
-                vector, embedding_ms = await _generate_embedding(http_request, audio)
+                embedding_started = time.monotonic()
+                try:
+                    vector, embedding_ms = await _generate_embedding(http_request, audio)
+                    embedding_result: dict[str, Any] | None = {"vector": vector}
+                except ValueError as exc:
+                    # A transcript remains useful even when a short/quiet live
+                    # microphone window cannot support reliable speaker
+                    # identity.  Keep the combined mode successful-but-partial
+                    # instead of discarding the ASR result with HTTP 422.
+                    embedding_ms = round((time.monotonic() - embedding_started) * 1000)
+                    embedding_result = None
+                    warnings.append(
+                        {
+                            "code": "VOICE_EMBEDDING_UNAVAILABLE",
+                            "message": str(exc),
+                        }
+                    )
                 timings.update({"transcription": transcription_ms, "embedding": embedding_ms})
                 models.update({"asr": {"id": asr_model_id}, "embedding": embedding_model_metadata()})
-                result = {"transcript": {"text": transcript_text}, "embedding": {"vector": vector}}
+                result = {"transcript": {"text": transcript_text}, "embedding": embedding_result}
             else:
                 result, mode_timings, models, warnings, transcript_text = await _process_diarization(
                     http_request,

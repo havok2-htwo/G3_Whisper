@@ -9,7 +9,7 @@ import unittest
 from unittest import mock
 
 import numpy as np
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 from starlette.requests import Request
 from starlette.datastructures import FormData, UploadFile
@@ -44,6 +44,29 @@ def _ready_cloud(speaker_id: str, vector: np.ndarray):
         for index in range(3)
     ]
     return build_robust_cloud(speaker_id, samples)
+
+
+def _refinement_diagnostics(
+    mode: str,
+    status: str,
+    *,
+    proposed_turns: int = 0,
+    applied_turns: int = 0,
+    reassigned_duration_ms: int = 0,
+    rollback_reason: str | None = None,
+) -> dict:
+    return {
+        "mode": mode,
+        "status": status,
+        "eligible_windows": 6,
+        "proposed_turns": proposed_turns,
+        "applied_turns": applied_turns,
+        "reassigned_duration_ms": reassigned_duration_ms,
+        "processing_ms": 17,
+        "rollback_reason": rollback_reason,
+        "changes": [],
+        "changes_truncated": False,
+    }
 
 
 class _CapturingApp:
@@ -115,6 +138,91 @@ class V2RequestValidationTests(unittest.TestCase):
             )
         )
         self.assertEqual(parsed["diarization"]["expected_speakers"], 5)
+
+    def test_speaker_refinement_defaults_off_and_accepts_supported_modes(self) -> None:
+        parsed = v2._parse_request_json(
+            json.dumps({"schema_version": "2.0", "mode": "diarization"})
+        )
+        self.assertEqual(parsed["diarization"]["speaker_refinement"], "off")
+
+        for mode in ("off", "shadow", "conservative"):
+            with self.subTest(mode=mode):
+                parsed = v2._parse_request_json(
+                    json.dumps(
+                        {
+                            "schema_version": "2.0",
+                            "mode": "diarization",
+                            "diarization": {"speaker_refinement": mode},
+                        }
+                    )
+                )
+                self.assertEqual(parsed["diarization"]["speaker_refinement"], mode)
+
+    def test_invalid_speaker_refinement_values_return_422(self) -> None:
+        for value in (None, True, 1, "", "ON", "aggressive"):
+            with self.subTest(value=value):
+                with self.assertRaises(v2.V2ApiError) as raised:
+                    v2._parse_request_json(
+                        json.dumps(
+                            {
+                                "schema_version": "2.0",
+                                "mode": "diarization",
+                                "diarization": {"speaker_refinement": value},
+                            }
+                        )
+                    )
+                self.assertEqual(raised.exception.status_code, 422)
+                self.assertEqual(raised.exception.code, "INVALID_REQUEST")
+
+    def test_speaker_refinement_is_rejected_outside_diarization_mode(self) -> None:
+        for mode in ("embedding", "transcript", "transcript_embedding"):
+            with self.subTest(mode=mode):
+                with self.assertRaises(v2.V2ApiError) as raised:
+                    v2._parse_request_json(
+                        json.dumps(
+                            {
+                                "schema_version": "2.0",
+                                "mode": mode,
+                                "diarization": {"speaker_refinement": "shadow"},
+                            }
+                        )
+                    )
+                self.assertEqual(raised.exception.status_code, 422)
+
+    def test_unknown_speaker_audio_defaults_false_and_accepts_boolean(self) -> None:
+        parsed = v2._parse_request_json(
+            json.dumps({"schema_version": "2.0", "mode": "diarization"})
+        )
+        self.assertIs(parsed["diarization"]["unknown_speaker_audio"], False)
+
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled):
+                parsed = v2._parse_request_json(
+                    json.dumps(
+                        {
+                            "schema_version": "2.0",
+                            "mode": "diarization",
+                            "diarization": {"unknown_speaker_audio": enabled},
+                        }
+                    )
+                )
+                self.assertIs(parsed["diarization"]["unknown_speaker_audio"], enabled)
+
+    def test_unknown_speaker_audio_rejects_non_boolean_values(self) -> None:
+        for value in (None, 0, 1, "false", "true", [], {}):
+            with self.subTest(value=value):
+                with self.assertRaises(v2.V2ApiError) as raised:
+                    v2._parse_request_json(
+                        json.dumps(
+                            {
+                                "schema_version": "2.0",
+                                "mode": "diarization",
+                                "diarization": {"unknown_speaker_audio": value},
+                            }
+                        )
+                    )
+                self.assertEqual(raised.exception.status_code, 422)
+                self.assertEqual(raised.exception.code, "INVALID_REQUEST")
 
     def test_512_256_nan_and_zero_profiles_return_422_validation_error(self) -> None:
         invalid_vectors = (
@@ -309,6 +417,47 @@ class V2EndpointTests(unittest.TestCase):
         self.assertEqual(payload["models"]["embedding"]["dimension"], 192)
         self.assertNotIn("embedding_space_id", json.dumps(payload))
 
+    def test_authenticated_admin_session_can_use_v2_tester_without_client_key(self) -> None:
+        normalized = _vector(0).tolist()
+        with (
+            mock.patch.object(
+                v2,
+                "authorize_api_key",
+                side_effect=HTTPException(status_code=401, detail="API key required"),
+            ),
+            mock.patch.object(v2, "require_admin", return_value={"username": "admin"}) as require_admin,
+            mock.patch.object(v2, "load_audio_file", return_value=self.audio),
+            mock.patch.object(v2, "_record_log"),
+            mock.patch.object(
+                v2,
+                "_generate_embedding",
+                new=mock.AsyncMock(return_value=(normalized, 3)),
+            ),
+        ):
+            response = self._call({"schema_version": "2.0", "mode": "embedding"})
+
+        self.assertEqual(response.status_code, 200, _payload(response))
+        require_admin.assert_called_once()
+
+    def test_v2_preserves_api_key_error_without_admin_session(self) -> None:
+        with (
+            mock.patch.object(
+                v2,
+                "authorize_api_key",
+                side_effect=HTTPException(status_code=401, detail="API key required"),
+            ),
+            mock.patch.object(
+                v2,
+                "require_admin",
+                side_effect=HTTPException(status_code=401, detail="Authentication required"),
+            ),
+        ):
+            response = self._call({"schema_version": "2.0", "mode": "embedding"})
+
+        payload = _payload(response)
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(payload["error"]["code"], "INVALID_API_KEY")
+
     def test_transcript_mode_has_no_embedding_or_dia_model(self) -> None:
         patches = self._base_patches()
         with patches[0], patches[1], patches[2], mock.patch.object(
@@ -322,6 +471,21 @@ class V2EndpointTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(payload["result"], {"transcript": {"text": "Ein Transkript"}})
         self.assertEqual(payload["models"], {"asr": {"id": "asr-model"}})
+
+    def test_explicit_invalid_api_key_is_not_hidden_by_admin_session(self) -> None:
+        with (
+            mock.patch.object(v2, "authorize_api_key", side_effect=HTTPException(status_code=401, detail="bad key")),
+            mock.patch.object(v2, "require_admin", return_value={"username": "admin"}) as require_admin,
+        ):
+            response = self._call(
+                {"schema_version": "2.0", "mode": "embedding"},
+                headers={"X-API-Key": "invalid"},
+            )
+
+        payload = _payload(response)
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(payload["error"]["code"], "INVALID_API_KEY")
+        require_admin.assert_not_called()
 
     def test_transcript_embedding_returns_both_and_only_192_dimensions(self) -> None:
         normalized = _vector(3).tolist()
@@ -347,6 +511,45 @@ class V2EndpointTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(payload["result"]["transcript"]["text"], "Ein Transkript")
         self.assertEqual(len(payload["result"]["embedding"]["vector"]), 192)
+        self.assertEqual(payload["models"]["embedding"]["dimension"], 192)
+
+    def test_transcript_embedding_keeps_transcript_when_voice_window_is_unsuitable(self) -> None:
+        patches = self._base_patches()
+        with (
+            patches[0],
+            patches[1],
+            patches[2],
+            mock.patch.object(
+                v2,
+                "_transcribe_audio",
+                new=mock.AsyncMock(return_value=("Trotzdem transkribiert", 7, 1, "asr-model")),
+            ),
+            mock.patch.object(
+                v2,
+                "_generate_embedding",
+                new=mock.AsyncMock(
+                    side_effect=ValueError(
+                        "Keine qualitativ geeigneten Sprachfenster fuer ein Stimmembedding gefunden."
+                    )
+                ),
+            ),
+        ):
+            response = self._call(
+                {"schema_version": "2.0", "mode": "transcript_embedding"}
+            )
+
+        payload = _payload(response)
+        self.assertEqual(response.status_code, 200, payload)
+        self.assertEqual(payload["status"], "partial")
+        self.assertEqual(
+            payload["result"],
+            {
+                "transcript": {"text": "Trotzdem transkribiert"},
+                "embedding": None,
+            },
+        )
+        self.assertEqual(payload["warnings"][0]["code"], "VOICE_EMBEDDING_UNAVAILABLE")
+        self.assertIn("embedding", payload["timings_ms"])
         self.assertEqual(payload["models"]["embedding"]["dimension"], 192)
 
     def test_dia_orchestration_runs_only_for_diarization_mode(self) -> None:
@@ -398,6 +601,103 @@ class V2EndpointTests(unittest.TestCase):
         configuration = process_dia.await_args.args[3]
         self.assertEqual(configuration["expected_speakers"], 5)
 
+    def test_default_diarization_passes_refinement_off_without_changing_result_shape(self) -> None:
+        legacy_result = {
+            "transcript": {"text": "Diarisiert", "segments": []},
+            "speaker_counts": {"expected": None, "detected": 1},
+            "speaker_assignments": [],
+            "unknown_speakers": [],
+            "unresolved_speakers": [],
+            "unresolved_known_speakers": [],
+        }
+        process_dia = mock.AsyncMock(
+            return_value=(
+                legacy_result,
+                {"diarization": 4, "transcription": 5, "embedding": 6},
+                {
+                    "asr": {"id": "asr"},
+                    "diarization": {"id": "community-1"},
+                    "embedding": {"id": "ReDimNet2-B6", "dimension": 192},
+                },
+                [],
+                "Diarisiert",
+            )
+        )
+        patches = self._base_patches()
+        with (
+            patches[0],
+            patches[1],
+            patches[2],
+            mock.patch.object(v2, "_process_diarization", new=process_dia),
+        ):
+            response = self._call({"schema_version": "2.0", "mode": "diarization"})
+
+        payload = _payload(response)
+        self.assertEqual(response.status_code, 200, payload)
+        configuration = process_dia.await_args.args[3]
+        self.assertEqual(configuration["speaker_refinement"], "off")
+        self.assertEqual(payload["result"], legacy_result)
+        self.assertNotIn("speaker_refinement", payload["result"])
+        self.assertNotIn("speaker_refinement", payload["timings_ms"])
+
+    def test_enabled_refinement_metadata_and_timing_pass_through_v2_response(self) -> None:
+        diagnostics = _refinement_diagnostics(
+            "shadow",
+            "shadow",
+            proposed_turns=2,
+        )
+        process_dia = mock.AsyncMock(
+            return_value=(
+                {
+                    "transcript": {"text": "Diarisiert", "segments": []},
+                    "speaker_counts": {"expected": None, "detected": 2},
+                    "speaker_assignments": [],
+                    "unknown_speakers": [],
+                    "unresolved_speakers": [],
+                    "unresolved_known_speakers": [],
+                    "speaker_refinement": diagnostics,
+                },
+                {
+                    "diarization": 4,
+                    "speaker_refinement": 17,
+                    "transcription": 5,
+                    "embedding": 6,
+                },
+                {
+                    "asr": {"id": "asr"},
+                    "diarization": {"id": "community-1"},
+                    "embedding": {"id": "ReDimNet2-B6", "dimension": 192},
+                },
+                [],
+                "Diarisiert",
+            )
+        )
+        patches = self._base_patches()
+        with (
+            patches[0],
+            patches[1],
+            patches[2],
+            mock.patch.object(v2, "_process_diarization", new=process_dia),
+        ):
+            response = self._call(
+                {
+                    "schema_version": "2.0",
+                    "mode": "diarization",
+                    "diarization": {
+                        "speaker_refinement": "shadow",
+                        "unknown_speaker_audio": True,
+                    },
+                }
+            )
+
+        payload = _payload(response)
+        self.assertEqual(response.status_code, 200, payload)
+        configuration = process_dia.await_args.args[3]
+        self.assertEqual(configuration["speaker_refinement"], "shadow")
+        self.assertIs(configuration["unknown_speaker_audio"], True)
+        self.assertEqual(payload["result"]["speaker_refinement"], diagnostics)
+        self.assertEqual(payload["timings_ms"]["speaker_refinement"], 17)
+
     def test_invalid_profiles_are_api_422_before_audio_decode(self) -> None:
         invalid_vectors = (
             [1.0] * 512,
@@ -435,8 +735,300 @@ class V2EndpointTests(unittest.TestCase):
                 self.assertEqual(payload["warnings"], [])
                 decode.assert_not_called()
 
+    def test_invalid_diarization_options_are_api_422_before_audio_decode(self) -> None:
+        invalid_options = (
+            {"speaker_refinement": "aggressive"},
+            {"speaker_refinement": None},
+            {"unknown_speaker_audio": "true"},
+            {"unknown_speaker_audio": 1},
+        )
+        for options in invalid_options:
+            with self.subTest(options=options):
+                decode = mock.Mock(return_value=self.audio)
+                with (
+                    mock.patch.object(v2, "authorize_api_key", return_value=None),
+                    mock.patch.object(v2, "load_audio_file", new=decode),
+                ):
+                    response = self._call(
+                        {
+                            "schema_version": "2.0",
+                            "mode": "diarization",
+                            "diarization": options,
+                        }
+                    )
+
+                payload = _payload(response)
+                self.assertEqual(response.status_code, 422)
+                self.assertEqual(payload["error"]["code"], "INVALID_REQUEST")
+                decode.assert_not_called()
+
 
 class V2DiarizationAssemblyTests(unittest.TestCase):
+    def _run_refinement_fixture(
+        self,
+        *,
+        mode: str,
+        refined_turns: list[dict],
+        diagnostics: dict,
+    ):
+        original_turns = [
+            {"start_ms": 0, "end_ms": 6000, "speaker_id": "SPEAKER_A"},
+            {"start_ms": 6000, "end_ms": 12000, "speaker_id": "SPEAKER_A"},
+            {"start_ms": 12000, "end_ms": 18000, "speaker_id": "SPEAKER_B"},
+        ]
+        clouds = {
+            "SPEAKER_A": _ready_cloud("SPEAKER_A", _vector(0)),
+            "SPEAKER_B": _ready_cloud("SPEAKER_B", _vector(1)),
+        }
+        dia_response = {
+            "model": {"id": "community-1"},
+            "diarization": original_turns,
+            "exclusive_diarization": original_turns,
+            "overlaps": [],
+        }
+        result_object = types.SimpleNamespace(
+            turns=refined_turns,
+            speaker_clouds=clouds,
+            diagnostics=diagnostics,
+        )
+        events: list[str] = []
+        extract_mock = mock.Mock(side_effect=lambda *_args: events.append("embedding") or clouds)
+        refine_mock = mock.Mock(side_effect=lambda *_args, **_kwargs: events.append("refinement") or result_object)
+
+        async def transcribe(_request, _audio, turns, _overlaps, _filter):
+            events.append("transcription")
+            segments = []
+            for index, turn in enumerate(turns):
+                original_id = str(turn.get("original_speaker_id", turn["speaker_id"]))
+                refined_id = str(turn["speaker_id"])
+                segment = {
+                    "index": index,
+                    "start_ms": int(turn["start_ms"]),
+                    "end_ms": int(turn["end_ms"]),
+                    "diarization_speaker_id": original_id,
+                    "refined_diarization_speaker_id": refined_id,
+                    "text": f"Turn {index}",
+                    "overlap": False,
+                }
+                segments.append(segment)
+            return segments, 20, "asr-model"
+
+        app = _CapturingApp()
+        request = _request(app)
+        audio = np.full(16000 * 18, 0.1, dtype=np.float32)
+        with (
+            mock.patch.object(v2, "diarize_v2", new=mock.AsyncMock(return_value=dia_response)),
+            mock.patch.object(v2, "extract_speaker_clouds", new=extract_mock),
+            mock.patch.object(
+                v2,
+                "generate_voice_vector",
+                side_effect=AssertionError("Refinement must reuse speaker-cloud embeddings"),
+            ),
+            mock.patch.object(v2, "refine_speaker_turns", new=refine_mock),
+            mock.patch.object(v2, "_transcribe_turns", new=mock.AsyncMock(side_effect=transcribe)),
+        ):
+            processed = asyncio.run(
+                v2._process_diarization(
+                    request,
+                    _upload(),
+                    audio,
+                    {
+                        "expected_speakers": 2,
+                        "known_speakers": [],
+                        "speaker_refinement": mode,
+                        "unknown_speaker_audio": False,
+                    },
+                    True,
+                )
+            )
+        return processed, events, extract_mock, refine_mock
+
+    def test_conservative_refinement_runs_once_before_asr_and_preserves_provenance(self) -> None:
+        refined_turns = [
+            {
+                "start_ms": 0,
+                "end_ms": 6000,
+                "speaker_id": "SPEAKER_A",
+                "original_speaker_id": "SPEAKER_A",
+            },
+            {
+                "start_ms": 6000,
+                "end_ms": 12000,
+                "speaker_id": "SPEAKER_B",
+                "original_speaker_id": "SPEAKER_A",
+            },
+            {
+                "start_ms": 12000,
+                "end_ms": 18000,
+                "speaker_id": "SPEAKER_B",
+                "original_speaker_id": "SPEAKER_B",
+            },
+        ]
+        diagnostics = _refinement_diagnostics(
+            "conservative",
+            "applied",
+            proposed_turns=1,
+            applied_turns=1,
+            reassigned_duration_ms=6000,
+        )
+
+        (result, timings, _models, _warnings, _text), events, extract, refine = (
+            self._run_refinement_fixture(
+                mode="conservative",
+                refined_turns=refined_turns,
+                diagnostics=diagnostics,
+            )
+        )
+
+        self.assertEqual(events, ["embedding", "refinement", "transcription"])
+        extract.assert_called_once()
+        refine.assert_called_once()
+        refine_mode = refine.call_args.kwargs.get("mode")
+        if refine_mode is None:
+            refine_mode = refine.call_args.args[0]
+        self.assertEqual(refine_mode, "conservative")
+        self.assertEqual(result["speaker_refinement"], diagnostics)
+        self.assertEqual(timings["speaker_refinement"], 17)
+        changed = next(
+            segment
+            for segment in result["transcript"]["segments"]
+            if segment["start_ms"] == 6000
+        )
+        self.assertEqual(changed["diarization_speaker_id"], "SPEAKER_A")
+        self.assertEqual(changed["refined_diarization_speaker_id"], "SPEAKER_B")
+        self.assertEqual(changed["speaker_id"], "SPEAKER_B")
+
+    def test_rejected_refinement_rolls_back_all_turn_labels(self) -> None:
+        rolled_back_turns = [
+            {**turn, "original_speaker_id": turn["speaker_id"]}
+            for turn in (
+                {"start_ms": 0, "end_ms": 6000, "speaker_id": "SPEAKER_A"},
+                {"start_ms": 6000, "end_ms": 12000, "speaker_id": "SPEAKER_A"},
+                {"start_ms": 12000, "end_ms": 18000, "speaker_id": "SPEAKER_B"},
+            )
+        ]
+        diagnostics = _refinement_diagnostics(
+            "conservative",
+            "rejected",
+            proposed_turns=1,
+            rollback_reason="moved_speech_limit_exceeded",
+        )
+
+        (result, timings, _models, _warnings, _text), events, extract, _refine = (
+            self._run_refinement_fixture(
+                mode="conservative",
+                refined_turns=rolled_back_turns,
+                diagnostics=diagnostics,
+            )
+        )
+
+        self.assertEqual(events, ["embedding", "refinement", "transcription"])
+        extract.assert_called_once()
+        self.assertEqual(result["speaker_refinement"]["status"], "rejected")
+        self.assertEqual(
+            result["speaker_refinement"]["rollback_reason"],
+            "moved_speech_limit_exceeded",
+        )
+        self.assertEqual(timings["speaker_refinement"], 17)
+        for segment in result["transcript"]["segments"]:
+            self.assertEqual(
+                segment["refined_diarization_speaker_id"],
+                segment["diarization_speaker_id"],
+            )
+
+    def test_shadow_reports_proposals_without_applying_labels(self) -> None:
+        shadow_turns = [
+            {**turn, "original_speaker_id": turn["speaker_id"]}
+            for turn in (
+                {"start_ms": 0, "end_ms": 6000, "speaker_id": "SPEAKER_A"},
+                {"start_ms": 6000, "end_ms": 12000, "speaker_id": "SPEAKER_A"},
+                {"start_ms": 12000, "end_ms": 18000, "speaker_id": "SPEAKER_B"},
+            )
+        ]
+        diagnostics = _refinement_diagnostics(
+            "shadow",
+            "shadow",
+            proposed_turns=1,
+            applied_turns=0,
+            reassigned_duration_ms=0,
+        )
+
+        (result, timings, _models, _warnings, _text), _events, extract, _refine = (
+            self._run_refinement_fixture(
+                mode="shadow",
+                refined_turns=shadow_turns,
+                diagnostics=diagnostics,
+            )
+        )
+
+        extract.assert_called_once()
+        self.assertEqual(result["speaker_refinement"]["status"], "shadow")
+        self.assertEqual(result["speaker_refinement"]["proposed_turns"], 1)
+        self.assertEqual(result["speaker_refinement"]["applied_turns"], 0)
+        self.assertEqual(timings["speaker_refinement"], 17)
+        for segment in result["transcript"]["segments"]:
+            self.assertEqual(
+                segment["refined_diarization_speaker_id"],
+                segment["diarization_speaker_id"],
+            )
+
+    def test_refined_turns_preserve_original_dia_provenance(self) -> None:
+        turns = [
+            {
+                "start_ms": 0,
+                "end_ms": 3000,
+                "speaker_id": "SPEAKER_B",
+                "original_speaker_id": "SPEAKER_A",
+            }
+        ]
+        app = _CapturingApp()
+        app.state.whisper_batch_manager = object()
+        request = _request(app)
+        audio = np.full(16000 * 3, 0.1, dtype=np.float32)
+        batch_result = types.SimpleNamespace(text="Korrigierter Turn")
+
+        with (
+            mock.patch.object(
+                v2,
+                "_processing_key",
+                return_value=("asr", "cuda", "cache", "de", "fp16"),
+            ),
+            mock.patch.object(
+                v2,
+                "enqueue_audio_segments_bounded",
+                new=mock.AsyncMock(return_value=[batch_result]),
+            ),
+        ):
+            segments, _duration_ms, _model_id = asyncio.run(
+                v2._transcribe_turns(request, audio, turns, [], True)
+            )
+
+        self.assertEqual(len(segments), 1)
+        self.assertEqual(segments[0]["diarization_speaker_id"], "SPEAKER_A")
+        self.assertEqual(segments[0]["refined_diarization_speaker_id"], "SPEAKER_B")
+
+    def test_merge_does_not_erase_original_speaker_boundary(self) -> None:
+        turns = [
+            {
+                "start_ms": 0,
+                "end_ms": 3000,
+                "speaker_id": "SPEAKER_B",
+                "original_speaker_id": "SPEAKER_A",
+            },
+            {
+                "start_ms": 3000,
+                "end_ms": 6000,
+                "speaker_id": "SPEAKER_B",
+                "original_speaker_id": "SPEAKER_B",
+            },
+        ]
+
+        merged = v2._merge_exclusive_turns(turns)
+
+        self.assertEqual(len(merged), 2)
+        self.assertEqual(merged[0]["original_speaker_id"], "SPEAKER_A")
+        self.assertEqual(merged[1]["original_speaker_id"], "SPEAKER_B")
+
     def test_five_expected_four_known_and_one_unknown_are_assembled(self) -> None:
         vectors = [_vector(index) for index in range(5)]
         clouds = {
@@ -473,11 +1065,13 @@ class V2DiarizationAssemblyTests(unittest.TestCase):
         audio = np.full(16000 * 10, 0.1, dtype=np.float32)
         dia_mock = mock.AsyncMock(return_value=dia_response)
         transcribe_mock = mock.AsyncMock(return_value=(segments, 20, "asr-model"))
+        build_audio_mock = mock.Mock()
 
         with (
             mock.patch.object(v2, "diarize_v2", new=dia_mock),
             mock.patch.object(v2, "_transcribe_turns", new=transcribe_mock),
             mock.patch.object(v2, "extract_speaker_clouds", return_value=clouds),
+            mock.patch.object(v2, "build_unknown_speaker_audio_assets", new=build_audio_mock),
         ):
             result, timings, models, warnings, transcript = asyncio.run(
                 v2._process_diarization(
@@ -490,6 +1084,7 @@ class V2DiarizationAssemblyTests(unittest.TestCase):
             )
 
         dia_mock.assert_awaited_once()
+        build_audio_mock.assert_not_called()
         self.assertEqual(dia_mock.await_args.kwargs["num_speakers"], 5)
         self.assertIsNone(dia_mock.await_args.kwargs["min_speakers"])
         self.assertEqual(result["speaker_counts"]["detected"], 5)
@@ -513,6 +1108,166 @@ class V2DiarizationAssemblyTests(unittest.TestCase):
         self.assertEqual(by_dia_id["SPEAKER_00"]["speaker_kind"], "known")
         self.assertEqual(by_dia_id["SPEAKER_04"]["speaker_id"], "SPEAKER_04")
         self.assertEqual(by_dia_id["SPEAKER_04"]["speaker_kind"], "unknown")
+
+    def test_requested_audio_assets_are_added_only_to_unknown_and_unresolved_speakers(self) -> None:
+        speaker_ids = ("SPEAKER_KNOWN", "SPEAKER_UNKNOWN", "SPEAKER_UNRESOLVED")
+        clouds = {
+            speaker_id: _ready_cloud(speaker_id, _vector(index))
+            for index, speaker_id in enumerate(speaker_ids)
+        }
+        turns = [
+            {"start_ms": index * 6000, "end_ms": (index + 1) * 6000, "speaker_id": speaker_id}
+            for index, speaker_id in enumerate(speaker_ids)
+        ]
+        transcript_segments = [
+            {
+                "index": index,
+                "start_ms": turn["start_ms"],
+                "end_ms": turn["end_ms"],
+                "diarization_speaker_id": turn["speaker_id"],
+                "text": f"Turn {index}",
+                "overlap": False,
+            }
+            for index, turn in enumerate(turns)
+        ]
+        dia_response = {
+            "model": {"id": "community-1"},
+            "diarization": turns,
+            "exclusive_diarization": turns,
+            "overlaps": [],
+        }
+        audio_assets = {
+            "SPEAKER_UNKNOWN": {
+                "mime_type": "audio/mpeg",
+                "encoding": "base64",
+                "data": "dW5rbm93bg==",
+                "duration_ms": 6000,
+                "snippets": [
+                    {"start_ms": 6000, "end_ms": 12000, "duration_ms": 6000, "centrality": 0.9}
+                ],
+            },
+            "SPEAKER_UNRESOLVED": {
+                "mime_type": "audio/mpeg",
+                "encoding": "base64",
+                "data": "dW5yZXNvbHZlZA==",
+                "duration_ms": 6000,
+                "snippets": [
+                    {"start_ms": 12000, "end_ms": 18000, "duration_ms": 6000, "centrality": 0.8}
+                ],
+            },
+        }
+        build_audio = mock.Mock(return_value=audio_assets)
+        matches = (
+            {"SPEAKER_KNOWN": {"speaker_id": "person-known", "cosine_similarity": 0.9}},
+            ["person-unresolved"],
+            {"SPEAKER_UNRESOLVED": {"reason": "weak_evidence"}},
+        )
+        app = _CapturingApp()
+        request = _request(app)
+        audio = np.full(16000 * 18, 0.1, dtype=np.float32)
+
+        with (
+            mock.patch.object(v2, "diarize_v2", new=mock.AsyncMock(return_value=dia_response)),
+            mock.patch.object(
+                v2,
+                "_transcribe_turns",
+                new=mock.AsyncMock(return_value=(transcript_segments, 20, "asr-model")),
+            ),
+            mock.patch.object(v2, "extract_speaker_clouds", return_value=clouds),
+            mock.patch.object(v2, "match_known_speakers", return_value=matches),
+            mock.patch.object(v2, "build_unknown_speaker_audio_assets", new=build_audio),
+        ):
+            result, _timings, _models, _warnings, _transcript = asyncio.run(
+                v2._process_diarization(
+                    request,
+                    _upload(),
+                    audio,
+                    {
+                        "expected_speakers": 3,
+                        "known_speakers": [
+                            {"id": "person-known", "embeddings": [_vector(0).tolist()]},
+                            {"id": "person-unresolved", "embeddings": [_vector(2).tolist()]},
+                        ],
+                        "speaker_refinement": "off",
+                        "unknown_speaker_audio": True,
+                    },
+                    True,
+                )
+            )
+
+        build_audio.assert_called_once()
+        requested_ids = set(build_audio.call_args.args[2])
+        self.assertEqual(requested_ids, {"SPEAKER_UNKNOWN", "SPEAKER_UNRESOLVED"})
+        unknown = {item["diarization_speaker_id"]: item for item in result["unknown_speakers"]}
+        unresolved = {
+            item["diarization_speaker_id"]: item for item in result["unresolved_speakers"]
+        }
+        self.assertEqual(unknown["SPEAKER_UNKNOWN"]["audio"], audio_assets["SPEAKER_UNKNOWN"])
+        self.assertEqual(
+            unresolved["SPEAKER_UNRESOLVED"]["audio"],
+            audio_assets["SPEAKER_UNRESOLVED"],
+        )
+        known_assignment = next(
+            item for item in result["speaker_assignments"] if item["kind"] == "known"
+        )
+        self.assertNotIn("audio", known_assignment)
+
+    def test_missing_requested_unknown_audio_is_omitted_with_aggregated_warning(self) -> None:
+        speaker_id = "SPEAKER_UNKNOWN"
+        turns = [{"start_ms": 0, "end_ms": 6000, "speaker_id": speaker_id}]
+        cloud = _ready_cloud(speaker_id, _vector(0))
+        dia_response = {
+            "model": {"id": "community-1"},
+            "diarization": turns,
+            "exclusive_diarization": turns,
+            "overlaps": [],
+        }
+        segments = [
+            {
+                "index": 0,
+                "start_ms": 0,
+                "end_ms": 6000,
+                "diarization_speaker_id": speaker_id,
+                "text": "Unbekannt",
+                "overlap": False,
+            }
+        ]
+        app = _CapturingApp()
+        request = _request(app)
+        audio = np.full(16000 * 6, 0.1, dtype=np.float32)
+        with (
+            mock.patch.object(v2, "diarize_v2", new=mock.AsyncMock(return_value=dia_response)),
+            mock.patch.object(
+                v2,
+                "_transcribe_turns",
+                new=mock.AsyncMock(return_value=(segments, 20, "asr-model")),
+            ),
+            mock.patch.object(v2, "extract_speaker_clouds", return_value={speaker_id: cloud}),
+            mock.patch.object(v2, "build_unknown_speaker_audio_assets", return_value={}),
+        ):
+            result, _timings, _models, warnings, _transcript = asyncio.run(
+                v2._process_diarization(
+                    request,
+                    _upload(),
+                    audio,
+                    {
+                        "expected_speakers": 1,
+                        "known_speakers": [],
+                        "speaker_refinement": "off",
+                        "unknown_speaker_audio": True,
+                    },
+                    True,
+                )
+            )
+
+        self.assertNotIn("audio", result["unknown_speakers"][0])
+        self.assertIn(
+            {
+                "code": "UNKNOWN_SPEAKER_AUDIO_UNAVAILABLE",
+                "speaker_ids": [speaker_id],
+            },
+            warnings,
+        )
 
 
 if __name__ == "__main__":

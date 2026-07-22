@@ -60,8 +60,13 @@ Old Gradio, OpenAI, Voxtral, and side-server paths are no longer active. Such le
   - RTF (Real-Time Factor)
   - Peak VRAM
   - Transcript display
+- Interactive v2 pipeline tester in the admin panel with drag-and-drop upload, all four
+  processing modes, optional DIA speaker count/profiles, conservative speaker refinement,
+  unknown-speaker listening samples, phase timings, speaker turns, warnings, and the
+  complete JSON response
 - Optional voice vector generation
-- ReDimNet2 profile matching and return of unknown-speaker embeddings after DIA diarization
+- ReDimNet2 profile matching and return of unknown-speaker embeddings plus optional MP3
+  reference samples after DIA diarization
 - Conservative exact-pattern repetition filtering, enabled by default on every transcript-producing route and the admin benchmark
 - Pause/VAD-based segmentation for Whisper
 - Speech-only pre-filtering for the voice vector
@@ -137,13 +142,18 @@ of four modes:
 
 - `embedding`: one L2-normalized ReDimNet2 192-D embedding, without ASR or DIA
 - `transcript`: one cleaned transcript, without DIA
-- `transcript_embedding`: the transcript plus one recording-level ReDimNet2 embedding, without DIA
+- `transcript_embedding`: the transcript plus one recording-level ReDimNet2 embedding, without DIA; if no suitable embedding window exists, the transcript is still returned with `status: partial`, `embedding: null`, and a warning
 - `diarization`: G3_DIA speaker separation, ASR per exclusive speaker turn, ReDimNet2 profile matching, and unknown-speaker embeddings
 
 Only `diarization` contacts G3_DIA. The other three modes do not pay a DIA round trip and
 do not load or expose the DIA model. The DIA `community-1` pipeline still uses its own
 internal 256-D representation, but that representation is never serialized or used for
 identity matching. Public voice vectors use only ReDimNet2.
+
+The authenticated admin SPA can call this route with its existing same-origin session.
+Machine clients continue to use `X-API-Key` whenever client keys are configured. If the
+tester explicitly supplies an API key, that key is validated normally and an invalid key
+is not hidden by the admin session.
 
 In `diarization` mode, clients may provide an exact `expected_speakers` value from `1` to
 `64` and zero or more known profiles. Every profile has a unique application-level `id`
@@ -153,12 +163,34 @@ vectors are rejected with HTTP 422. If `expected_speakers` is omitted, DIA selec
 speaker count automatically; supplied known profiles set only the lower bound. Known
 profiles are expected to represent speakers that are present in the recording.
 
+Two independent, optional DIA result enhancements are available. `speaker_refinement`
+accepts `off` (the default), `shadow`, or `conservative` and uses the already-computed
+ReDimNet2 windows to detect high-confidence whole-turn label mistakes before ASR. The
+default only disables this additional correction pass; DIA itself still runs normally.
+`unknown_speaker_audio` is a boolean with default `false`. When enabled, it adds a short
+MP3 listening reference to eligible unknown and unresolved speakers. It does not enable,
+disable, or otherwise alter DIA or speaker refinement.
+
 The result retains both the assigned application `speaker_id` and the original
-`diarization_speaker_id`, millisecond timecodes, speaker kind, text, and overlap flag.
+`diarization_speaker_id`, millisecond timecodes, speaker kind, text, and overlap flag. If
+refinement was requested, `refined_diarization_speaker_id` records the effective DIA label
+while the original field remains unchanged. Refinement diagnostics report proposals,
+applied turns, moved duration, evidence, runtime, truncation, and any rollback reason.
 Unknown speakers return a robust prototype plus at most 63 diverse time-coded
 representatives, for a deterministic maximum of 64 vectors per speaker. Weak or
 ambiguous evidence is not forced into a known identity and is reported through
 unresolved profile IDs, assignment/quality information, and warnings.
+
+Requested listening references are returned as raw base64-encoded `audio/mpeg` data in
+the corresponding `unknown_speakers` or `unresolved_speakers` item. Each reference is at
+most 30 seconds and concatenates only source snippets of at least five contiguous seconds,
+selected from central, timed, non-stitched final cloud inliers. The response also lists
+the original time range and centrality of every source snippet. Known speakers never
+receive this audio field. If no suitable source exists, or MP3 encoding fails, embeddings
+remain available and the response carries a warning instead.
+
+These DIA options leave Cohere transcription unchanged. No glossary, hotword, vocabulary,
+prompt-biasing, or additional ASR-model behavior is introduced.
 
 There is intentionally no embedding-model selector and no client-supplied
 `embedding_space_id`. API version 2 is permanently tied to this exact ReDimNet2 model
@@ -206,7 +238,8 @@ Important rules:
 
 - Legacy `POST /transcribe/` generates it only when `voice_ident=true`; v2 also exposes it through `embedding` and `transcript_embedding`.
 - VAD removes silence, the remaining speech is split into fixed three-second windows, windows are embedded in batches, and a quality-weighted mean is L2-normalized.
-- Invalid, silent, or heavily clipped windows are discarded. At least one second of usable input is required for a recording-level embedding.
+- Invalid, silent, or heavily clipped windows are discarded. At least 0.5 seconds of usable input is required for a recording-level embedding; DIA speaker clouds deliberately keep their stricter two-second clean-speech requirement.
+- In v2 `transcript_embedding`, ASR runs first. If no window survives the embedding checks, the request remains successful with `status: partial`, the complete transcript, `embedding: null`, and warning code `VOICE_EMBEDDING_UNAVAILABLE`. Pure `embedding` requests still fail with HTTP 422 because they have no independent result to return.
 - Multi-speaker input outside `diarization` mode intentionally produces a mixed recording-level vector; no identity assignment is attempted.
 - The model is lazy-loaded once, warmed once, uses FP16 on CUDA and FP32 on CPU, and is deliberately not passed through `torch.compile`.
 
@@ -236,6 +269,19 @@ Initial matching thresholds are cosine `0.60`, support `0.60`, and stability mar
 `0.04`; speaker-cloud components start at cosine `0.45` and need a dominant component
 share of `0.60`. Quality states are `ready`, `low_support`, `mixed_cluster`, and
 `insufficient_clean_speech`.
+
+Optional `speaker_refinement=shadow` evaluates suspicious original exclusive DIA turns
+without changing them. `conservative` can reassign a complete turn only when multiple
+quality, centrality, vote, and overlap gates agree. It uses frozen speaker seeds and no
+second embedding inference. The complete proposal set is applied synchronously and then
+validated; speaker-count, seed, cloud-quality, timeline, or moved-duration violations roll
+the whole pass back. Profile matching happens afterwards, so client-provided identities
+cannot steer the correction.
+
+Optional `unknown_speaker_audio=true` selects only timed, non-stitched final inliers with
+quality at least `0.60`, ranks their contiguous source runs by prototype centrality, and
+encodes up to 30 seconds as 16 kHz mono MP3 at 64 kbit/s. Every selected source run is at
+least five seconds. The `audio.data` value is plain base64 without a data-URL prefix.
 
 ### Transcript Repetition Filter
 
@@ -268,9 +314,18 @@ Detection path:
 - active runtime path: energy-based speech detection only
 - `webrtcvad` helper code still exists in the file but is intentionally disabled for the current main path because telephone/filtered speech performed less reliably there
 
-### Benchmark
+### Pipeline Tester and Benchmark
 
-In the admin panel, there is a benchmark workflow. An audio or video file can be uploaded there and the number of repetitions can be set.
+The admin panel first exposes the production v2 pipeline itself: drop an audio/video file,
+select `embedding`, `transcript`, `transcript_embedding`, or `diarization`, and inspect
+client/server runtime, every server phase, model metadata, speaker counts, time-coded turns,
+warnings, and the raw response. Diarization additionally accepts `expected_speakers` and a
+strictly validated JSON array of known 192-D ReDimNet2 profiles. It also exposes the
+independent speaker-refinement mode and unknown-speaker-audio switch, renders refinement
+diagnostics, and provides an audio player for returned listening references.
+
+The same file can then be reused in the collapsible parallel ASR benchmark, where the number
+of repetitions can be set.
 
 The benchmark shows:
 
@@ -328,9 +383,16 @@ The local ASR path already utilizes several optimizations:
 - `sdpa` as the attention standard
 - `flash_attention_2` only if `flash_attn` is installed
 - Batch queue for Whisper
+- bounded enqueue windows (`2 * batch_max_segments`, minimum 2, maximum 256) on legacy,
+  v2, diarization, and benchmark paths; this keeps the GPU worker fed without retaining
+  thousands of request tasks for long recordings
+- real batched inference: Whisper uses one processor/model forward per worker batch;
+  Cohere uses sub-batches of at most 16 audio items and performs its own long-audio chunking
 - startup warmup of the configured ASR model with a sample clip (see "Startup Warmup" below)
-- idle CUDA-cache trimming so idle VRAM drops back to the model floor (see "Idle VRAM Trimming" below)
-- ReDimNet2 window batching with automatic CUDA-OOM batch-size reduction
+- optional idle CUDA-cache trimming, disabled by default to preserve low tail latency (see "Idle VRAM Trimming" below)
+- ReDimNet2 window batching (default 16) with automatic CUDA-OOM batch-size reduction,
+  one shared batch stream across DIA speakers, block-vectorized VAD, and lazy audio windows
+  that avoid full recording/speech copies
 - serial DIA, ASR, and ReDim phases on the local GPU; an optional cross-process file lease coordinates Whisper and DIA when they share a physical GPU
 
 ### Startup Warmup
@@ -345,10 +407,13 @@ never blocks server startup.
 
 ### Idle VRAM Trimming
 
-The Whisper batch worker releases the reserved CUDA cache pool once the queue drains after a burst
-of work, rather than after every batch (so there is no per-batch churn under sustained load). When
-the server is idle, VRAM therefore drops back to the model floor and leaves room for other GPU
-tenants. The `start.bat` launcher additionally sets
+The `cuda_memory_trim_after_batch` admin checkbox mirrors OmniVoice's "Auto VRAM trim after batch"
+setting and defaults to `false`. With the low-latency default, the Whisper batch worker does not call
+the process-wide `torch.cuda.empty_cache()` after the queue drains, preserving the warm allocator
+state used by both Cohere and ReDimNet. If an operator explicitly enables the option, cleanup waits
+until the queue has been empty for 250 ms, is serialized with the local GPU lock, and yields to newly
+queued ASR work. Explicit model unload/free-memory operations and emergency CUDA-OOM recovery remain
+separate from this automatic setting. The `start.bat` launcher additionally sets
 `PYTORCH_CUDA_ALLOC_CONF=garbage_collection_threshold:0.8,max_split_size_mb:256` before launch to
 reduce reserved-pool fragmentation (note: `expandable_segments` is ignored on Windows).
 
@@ -446,8 +511,9 @@ The active default values come from [backend/genesis_whisper_server_storage.py](
 - `local_model_cache_path`: `.\models`
 - `transcription_language`: `auto`
 - `batch_wait_time_ms`: `500`
-- `batch_max_segments`: `32`
+- `batch_max_segments`: `16`
 - `batch_max_audio_seconds`: `300.0`
+- `cuda_memory_trim_after_batch`: `false`
 - `huggingface_token`: empty string
 - `dia_server_base_url`: empty string (falls back to `DIA_SERVER_BASE_URL`)
 - `dia_api_key`: empty string (write-only; falls back to `DIA_SERVER_API_KEY`)

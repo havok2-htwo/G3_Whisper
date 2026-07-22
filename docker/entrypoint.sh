@@ -21,8 +21,9 @@ if [ ! -f "${SETTINGS_FILE}" ]; then
     "local_model_cache_path": "/app/models",
     "transcription_language": "auto",
     "batch_wait_time_ms": 500,
-    "batch_max_segments": 32,
+    "batch_max_segments": 16,
     "batch_max_audio_seconds": 300.0,
+    "cuda_memory_trim_after_batch": false,
     "huggingface_token": ""
 }
 JSON
