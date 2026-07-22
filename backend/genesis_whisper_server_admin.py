@@ -10,7 +10,7 @@ import torch
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, Response, UploadFile
 from pydantic import BaseModel
 
-from .genesis_whisper_server_audio import get_audio_duration_seconds, load_audio_bytes
+from .genesis_whisper_server_audio import get_audio_duration_seconds, load_audio_file
 from .genesis_whisper_server_auth import (
     SESSION_COOKIE_NAME,
     clear_session_cookie,
@@ -416,8 +416,7 @@ def create_admin_api(app: FastAPI) -> FastAPI:
 
         filename = file.filename or "benchmark-audio"
         try:
-            audio_bytes = await file.read()
-            audio_data = load_audio_bytes(audio_bytes, filename)
+            audio_data = await asyncio.to_thread(load_audio_file, file.file, filename)
         except HTTPException:
             raise
         except Exception as exc:
