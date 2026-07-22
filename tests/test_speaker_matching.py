@@ -3,6 +3,7 @@ from unittest.mock import patch
 
 import numpy as np
 
+from backend import genesis_whisper_server_speaker_matching as matching
 from backend.genesis_whisper_server_speaker_matching import (
     SpeakerCloud,
     SpeakerProfileValidationError,
@@ -361,6 +362,93 @@ class SpeakerMatchingTests(unittest.TestCase):
         self.assertEqual(first[0]["kind"], "prototype")
         self.assertTrue(all(len(item["vector"]) == 192 for item in first))
         self.assertEqual(len({item.get("start_ms") for item in first[1:]}), 63)
+
+
+class SpeakerCloudExtractionPerformanceTests(unittest.TestCase):
+    def test_profile_support_is_exact_with_bounded_similarity_blocks(self) -> None:
+        rng = np.random.default_rng(47)
+        cluster = rng.normal(size=(513, REDIMNET_EMBEDDING_DIMENSION)).astype(np.float32)
+        cluster /= np.linalg.norm(cluster, axis=1, keepdims=True)
+        profiles = rng.normal(size=(777, REDIMNET_EMBEDDING_DIMENSION)).astype(np.float32)
+        profiles /= np.linalg.norm(profiles, axis=1, keepdims=True)
+        # Ensure a known supported subset, rather than relying on random cosine
+        # values near the threshold.
+        profiles[:100] = cluster[:100]
+        weights = rng.uniform(0.5, 3.0, size=len(cluster)).astype(np.float64)
+        expected_mask = np.max(cluster @ profiles.T, axis=1) >= matching.SAMPLE_SUPPORT_COSINE_MIN
+        expected = float(np.sum(weights[expected_mask]) / np.sum(weights))
+        multiplication_shapes: list[tuple[int, int]] = []
+        original_matmul = np.matmul
+
+        def tracked_matmul(left, right, *args, **kwargs):
+            multiplication_shapes.append((left.shape[0], right.shape[1]))
+            return original_matmul(left, right, *args, **kwargs)
+
+        with (
+            patch.object(matching, "MATCH_SIMILARITY_BLOCK_SIZE", 64),
+            patch.object(matching.np, "matmul", side_effect=tracked_matmul),
+        ):
+            actual = matching._profile_support(cluster, weights, profiles)
+
+        self.assertAlmostEqual(actual, expected, places=12)
+        self.assertTrue(multiplication_shapes)
+        self.assertTrue(all(rows <= 64 and columns <= 64 for rows, columns in multiplication_shapes))
+
+    def test_all_speakers_share_one_batched_embedding_call(self) -> None:
+        audio = np.full(14 * 16_000, 0.08, dtype=np.float32)
+        segments = [
+            {"speaker_id": "SPEAKER_00", "start_ms": 0, "end_ms": 6400},
+            {"speaker_id": "SPEAKER_01", "start_ms": 7000, "end_ms": 13400},
+        ]
+        calls: list[list[int | None]] = []
+
+        def fake_embed(windows):
+            materialized = list(windows)
+            calls.append([item.start_ms for item in materialized])
+            embedded = []
+            for item in materialized:
+                vector_index = 0 if (item.start_ms or 0) < 7000 else 1
+                embedded.append(
+                    EmbeddedVoiceWindow(
+                        vector=_normalized((vector_index, 1.0)),
+                        start_ms=item.start_ms,
+                        end_ms=item.end_ms,
+                        clean_duration_seconds=item.clean_duration_seconds,
+                        quality=item.quality,
+                        stitched=item.stitched,
+                        source_spans=item.source_spans,
+                    )
+                )
+            return embedded
+
+        with patch.object(matching, "embed_voice_windows", side_effect=fake_embed):
+            clouds = matching.extract_speaker_clouds(audio, segments, [])
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0], [200, 3200, 7200, 10200])
+        self.assertEqual(set(clouds), {"SPEAKER_00", "SPEAKER_01"})
+        self.assertTrue(all(cloud.status == "ready" for cloud in clouds.values()))
+
+    def test_stitched_short_regions_never_build_a_speaker_sized_audio_copy(self) -> None:
+        short_parts = [
+            (np.full(16_000, 0.08, dtype=np.float32), index * 2000, index * 2000 + 1000)
+            for index in range(100)
+        ]
+        concatenate_sizes: list[int] = []
+        original_concatenate = np.concatenate
+
+        def tracked_concatenate(parts, *args, **kwargs):
+            concatenate_sizes.append(sum(len(part) for part in parts))
+            return original_concatenate(parts, *args, **kwargs)
+
+        with patch.object(matching.np, "concatenate", side_effect=tracked_concatenate):
+            windows = list(matching._iter_stitched_windows(short_parts))
+
+        self.assertEqual(len(windows), 33)
+        self.assertTrue(concatenate_sizes)
+        self.assertLessEqual(max(concatenate_sizes), matching.REDIMNET_WINDOW_SAMPLES)
+        self.assertTrue(all(window.stitched for window in windows))
+        self.assertTrue(all(len(window.source_spans or ()) == 3 for window in windows))
 
 
 if __name__ == "__main__":

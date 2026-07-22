@@ -58,13 +58,15 @@ The four modes are:
 
 - `embedding`: returns exactly one 192-D recording-level ReDimNet2 embedding; it does not run ASR or DIA
 - `transcript`: returns a cleaned transcript; it does not run DIA
-- `transcript_embedding`: returns a cleaned transcript and exactly one 192-D recording-level embedding; it does not run DIA
+- `transcript_embedding`: returns a cleaned transcript and normally one 192-D recording-level embedding; it does not run DIA. If no suitable embedding window exists, the transcript is still returned as a partial success with `embedding: null` and a warning
 - `diarization`: runs G3_DIA, transcribes exclusive speaker turns, matches optional known ReDimNet2 profiles, and returns unknown/unresolved speaker vectors
 
 Only `diarization` contacts the configured DIA server. Recording-level embeddings in
 the other modes use VAD, fixed three-second windows, batched inference, quality
 weighting, and final L2 normalization. If such a recording contains multiple speakers,
 the returned value is intentionally a mixed vector; these modes do not identify people.
+Recording-level embeddings accept usable speech windows from 0.5 seconds upward. The
+two-second minimum for clean per-speaker windows in `diarization` mode remains unchanged.
 
 All success responses contain `schema_version`, a generated `request_id`, `status`,
 `mode`, `audio`, informative `models`, millisecond `timings_ms`, `result`, and
@@ -174,12 +176,43 @@ Mode-specific result (vector shortened in this documentation):
 }
 ```
 
+ASR is completed before the recording-level embedding is generated. If all candidate
+windows are too short or fail the loudness, clipping, or finite-sample checks, the route
+still returns HTTP 200 with the transcript intact:
+
+```json
+{
+  "status": "partial",
+  "result": {
+    "transcript": { "text": "Hallo Welt." },
+    "embedding": null
+  },
+  "warnings": [
+    {
+      "code": "VOICE_EMBEDDING_UNAVAILABLE",
+      "message": "Keine qualitativ geeigneten Sprachfenster fuer ein Stimmembedding gefunden."
+    }
+  ]
+}
+```
+
+The pure `embedding` mode continues to return HTTP 422 when no embedding can be created,
+because that mode has no independent transcript result to preserve.
+
 #### `diarization` request
 
 The optional `diarization` object accepts:
 
 - `expected_speakers`: exact DIA speaker count, integer `1..64`
-- `known_speakers`: at most 64 profiles; each has a unique non-empty `id` (at most 128 UTF-8 bytes) and one or more `embeddings`
+- `known_speakers`: at most 64 profiles; each has a unique non-empty `id` (at most 128 UTF-8 bytes) and one or more `embeddings`; defaults to `[]`
+- `speaker_refinement`: `off`, `shadow`, or `conservative`; defaults to `off`
+- `unknown_speaker_audio`: JSON boolean; defaults to `false`
+
+These last two fields are independent result enhancements. Their defaults do not disable
+DIA: every `mode: "diarization"` request still invokes the configured DIA server.
+`speaker_refinement: "off"` disables only the additional ReDimNet label-correction pass,
+while `unknown_speaker_audio: false` disables only the MP3 listening references. Values
+such as `"true"`, `1`, or `null` are not accepted for the boolean field.
 
 Every supplied embedding must contain exactly 192 finite numeric values and have a
 non-zero norm. The server normalizes valid inputs before comparison. Duplicate IDs,
@@ -201,6 +234,8 @@ Example request JSON (`vector-...` denotes an actual array of exactly 192 number
   "mode": "diarization",
   "diarization": {
     "expected_speakers": 5,
+    "speaker_refinement": "conservative",
+    "unknown_speaker_audio": true,
     "known_speakers": [
       {
         "id": "person-17",
@@ -220,6 +255,16 @@ curl -sS http://127.0.0.1:7861/v2/audio/process \
   -H "X-API-Key: $WHISPER_API_KEY" \
   -F 'file=@meeting.m4a' \
   -F 'request={"schema_version":"2.0","mode":"diarization","diarization":{"expected_speakers":5,"known_speakers":[]}};type=application/json'
+```
+
+Copy-paste call that also requests conservative label refinement and MP3 references for
+unknown/unresolved speakers:
+
+```bash
+curl -sS http://127.0.0.1:7861/v2/audio/process \
+  -H "X-API-Key: $WHISPER_API_KEY" \
+  -F 'file=@meeting.m4a' \
+  -F 'request={"schema_version":"2.0","mode":"diarization","diarization":{"expected_speakers":5,"known_speakers":[],"speaker_refinement":"conservative","unknown_speaker_audio":true}};type=application/json'
 ```
 
 To send real profiles, save valid JSON containing full 192-value arrays as
@@ -246,6 +291,24 @@ filtering remove near duplicates and outliers. Starting thresholds are component
 matching enforces a global one-to-one assignment. Quality is one of `ready`,
 `low_support`, `mixed_cluster`, or `insufficient_clean_speech`.
 
+When refinement is `shadow` or `conservative`, the server evaluates the original,
+unmerged exclusive DIA turns after the ReDimNet clouds have been computed and before
+ASR. It reuses those vectors; no second model inference occurs. `shadow` only reports
+high-confidence proposals. `conservative` applies whole-turn proposals synchronously,
+rebuilds the clouds from the same vectors, and accepts the pass only if speaker-count,
+seed, cloud-quality, timeline, and moved-duration invariants remain valid. Otherwise all
+label changes are rolled back. Known profiles are matched only after this step and cannot
+steer it. Cohere transcription itself is unchanged; this feature adds no glossary,
+hotword, vocabulary, or prompt-biasing behavior.
+
+If `unknown_speaker_audio` is `true`, the server can add a listening reference to every
+eligible `unknown` or `unresolved` speaker after final refinement and profile matching.
+Selection is restricted to timed, non-stitched final cloud inliers with quality at least
+`0.60`. Every source snippet is a contiguous run of at least five seconds. Runs are ranked
+by cosine centrality to the final speaker prototype and concatenated, in source-time
+order, to at most 30 seconds. The result is a 16 kHz mono MP3 at 64 kbit/s. Known speakers
+never receive a listening reference.
+
 #### `diarization` response
 
 Each transcript segment contains:
@@ -253,6 +316,7 @@ Each transcript segment contains:
 - `start_ms`, `end_ms`
 - assigned `speaker_id`
 - original `diarization_speaker_id`
+- effective `refined_diarization_speaker_id` when refinement was requested
 - `speaker_kind`: `known`, `unknown`, or `unresolved`
 - `text`
 - `overlap`
@@ -262,6 +326,31 @@ stable DIA-derived ID and return their cleaned vector collection for later enrol
 Each such collection contains at most 64 entries: one `prototype`, followed by at most
 63 diverse time-coded `representative` entries. The cap and representative selection
 are deterministic.
+
+`diarization_speaker_id` is immutable provenance from DIA. When refinement is enabled,
+`refined_diarization_speaker_id` is the label used for final cloud/profile assignment; it
+equals the original label for unchanged, shadowed, or rolled-back turns. A known match can
+then replace the public `speaker_id` with the client-supplied profile ID without changing
+either provenance field.
+
+Enabled refinement adds `result.speaker_refinement` and
+`timings_ms.speaker_refinement`. Its status is `not_needed`, `shadow`, `applied`, or
+`rejected`. Diagnostics include eligible-window/proposal counts, applied count, moved
+duration, processing time, rollback reason, and at most 100 evidence-bearing changes;
+`changes_truncated` reports whether more existed. Every change states whether it was
+actually applied.
+
+An eligible unidentified speaker receives an `audio` object next to its embeddings:
+
+- `mime_type`: always `audio/mpeg`
+- `encoding`: always `base64`
+- `data`: raw base64 MP3 bytes, without a `data:` URL prefix
+- `duration_ms`: duration of the concatenated listening reference, at most `30000`
+- `snippets`: original `start_ms`, `end_ms`, `duration_ms`, and prototype `centrality`
+  for every source excerpt; every excerpt is at least `5000` ms
+
+The same schema is used in both `unknown_speakers` and `unresolved_speakers`. The field is
+omitted when it was not requested or no safe source run exists; vectors remain available.
 
 Abridged response example (all vectors are shortened in this documentation):
 
@@ -273,16 +362,18 @@ Abridged response example (all vectors are shortened in this documentation):
   "mode": "diarization",
   "audio": { "duration_ms": 90421 },
   "models": {
-    "asr": { "id": "openai/whisper-large-v3-turbo" },
+    "asr": { "id": "CohereLabs/cohere-transcribe-03-2026" },
     "diarization": { "id": "pyannote/speaker-diarization-community-1" },
     "embedding": { "id": "ReDimNet2-B6", "dimension": 192, "normalization": "l2" }
   },
   "timings_ms": {
     "decode": 128,
     "diarization": 2100,
+    "speaker_refinement": 180,
     "transcription": 3310,
     "embedding": 483,
-    "total": 6044
+    "unknown_speaker_audio": 42,
+    "total": 6250
   },
   "result": {
     "transcript": {
@@ -303,7 +394,8 @@ Abridged response example (all vectors are shortened in this documentation):
           "start_ms": 3310,
           "end_ms": 5900,
           "speaker_id": "SPEAKER_04",
-          "diarization_speaker_id": "SPEAKER_04",
+          "diarization_speaker_id": "SPEAKER_03",
+          "refined_diarization_speaker_id": "SPEAKER_04",
           "speaker_kind": "unknown",
           "text": "Hallo zusammen.",
           "overlap": false
@@ -332,6 +424,7 @@ Abridged response example (all vectors are shortened in this documentation):
     "unknown_speakers": [
       {
         "speaker_id": "SPEAKER_04",
+        "diarization_speaker_id": "SPEAKER_04",
         "speaker_kind": "unknown",
         "embedding_status": "ready",
         "embeddings": [
@@ -350,11 +443,55 @@ Abridged response example (all vectors are shortened in this documentation):
         "candidate_count": 3,
         "retained_count": 3,
         "discarded_outliers": 0,
-        "purity": 1.0
+        "purity": 1.0,
+        "audio": {
+          "mime_type": "audio/mpeg",
+          "encoding": "base64",
+          "data": "SUQzBAAAAAAAI1RTU0UAAAAPAAADTGF2ZjYwLjE2LjEwMA...",
+          "duration_ms": 6000,
+          "snippets": [
+            {
+              "start_ms": 12000,
+              "end_ms": 18000,
+              "duration_ms": 6000,
+              "centrality": 0.934121
+            }
+          ]
+        }
       }
     ],
     "unresolved_speakers": [],
-    "unresolved_known_speakers": []
+    "unresolved_known_speakers": [],
+    "speaker_refinement": {
+      "mode": "conservative",
+      "status": "applied",
+      "eligible_windows": 120,
+      "proposed_turns": 1,
+      "applied_turns": 1,
+      "reassigned_duration_ms": 2590,
+      "processing_ms": 180,
+      "rollback_reason": null,
+      "changes_truncated": false,
+      "changes": [
+        {
+          "turn_index": 1,
+          "start_ms": 3310,
+          "end_ms": 5900,
+          "from_speaker_id": "SPEAKER_03",
+          "to_speaker_id": "SPEAKER_04",
+          "supporting_windows": 1,
+          "evidence_duration_ms": 2590,
+          "evidence_coverage": 1.0,
+          "weighted_vote_share": 1.0,
+          "target_cosine": 0.81,
+          "own_cosine": 0.49,
+          "similarity_gain": 0.32,
+          "runner_up_margin": 0.18,
+          "short_turn_exception": true,
+          "applied": true
+        }
+      ]
+    }
   },
   "warnings": [
     {
@@ -365,6 +502,17 @@ Abridged response example (all vectors are shortened in this documentation):
   ]
 }
 ```
+
+MP3 generation is best-effort. `UNKNOWN_SPEAKER_AUDIO_UNAVAILABLE` lists unidentified
+public speaker IDs for which no qualifying five-second source run existed.
+`UNKNOWN_SPEAKER_AUDIO_ENCODING_FAILED` indicates that local ffmpeg MP3 encoding failed.
+Both warnings leave transcript and embedding data intact. When encoding was attempted,
+its wall time is exposed as `timings_ms.unknown_speaker_audio`.
+
+Both request fields are additive and default to the previous behavior. Omitting them
+keeps transcript/embedding response shapes unchanged: no refinement object, no refined
+label, and no embedded MP3. Existing `/transcribe/`, `/v1/audio/transcriptions`, and
+G3_DIA interfaces are unaffected.
 
 #### v2 errors
 
@@ -677,8 +825,9 @@ Response shape:
     "local_model_cache_path": ".\\models",
     "transcription_language": "auto",
     "batch_wait_time_ms": 500,
-    "batch_max_segments": 32,
+    "batch_max_segments": 16,
     "batch_max_audio_seconds": 300.0,
+    "cuda_memory_trim_after_batch": false,
     "huggingface_token": "hf_xxx",
     "dia_server_base_url": "http://dia:7864",
     "dia_server_base_url_effective": "http://dia:7864",
@@ -743,8 +892,9 @@ Request body:
   "local_model_cache_path": ".\\models",
   "transcription_language": "auto",
   "batch_wait_time_ms": 500,
-  "batch_max_segments": 32,
+  "batch_max_segments": 16,
   "batch_max_audio_seconds": 300.0,
+  "cuda_memory_trim_after_batch": false,
   "huggingface_token": "hf_xxx",
   "dia_server_base_url": "http://dia:7864",
   "dia_api_key": "dia_xxx"
@@ -763,6 +913,8 @@ Response fields:
 Notes:
 
 - `huggingface_token` can be stored via this route and is then reused by later manual cache downloads and runtime model loads.
+- `batch_max_segments` defaults to `16` for both the worker batch and its bounded enqueue window.
+- `cuda_memory_trim_after_batch` defaults to `false`. When enabled, Whisper may release unused process-wide CUDA allocator memory only after the ASR queue has drained; keeping it disabled preserves the warm Cohere/ReDimNet allocator state for low latency.
 - updates are partial merges; omitted fields keep their saved value, so older admin clients cannot remove newer settings
 - `dia_server_base_url` configures the DIA service used by diarization requests
 - `dia_api_key` is write-only: a non-empty value replaces the saved key, while an omitted or empty value preserves it

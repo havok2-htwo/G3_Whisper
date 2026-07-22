@@ -26,8 +26,9 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "local_model_cache_path": ".\\models",
     "transcription_language": "auto",
     "batch_wait_time_ms": 500,
-    "batch_max_segments": 32,
+    "batch_max_segments": 16,
     "batch_max_audio_seconds": 300.0,
+    "cuda_memory_trim_after_batch": False,
     "huggingface_token": "",
     "dia_server_base_url": "",
     "dia_api_key": "",
@@ -93,6 +94,16 @@ def normalize_settings(settings: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         normalized["batch_max_audio_seconds"] = max(1.0, float(source.get("batch_max_audio_seconds", DEFAULT_SETTINGS["batch_max_audio_seconds"])))
     except (TypeError, ValueError):
         normalized["batch_max_audio_seconds"] = DEFAULT_SETTINGS["batch_max_audio_seconds"]
+
+    configured_cuda_trim = source.get(
+        "cuda_memory_trim_after_batch",
+        DEFAULT_SETTINGS["cuda_memory_trim_after_batch"],
+    )
+    normalized["cuda_memory_trim_after_batch"] = (
+        configured_cuda_trim
+        if isinstance(configured_cuda_trim, bool)
+        else DEFAULT_SETTINGS["cuda_memory_trim_after_batch"]
+    )
 
     return normalized
 

@@ -3,13 +3,18 @@ import { FormEvent, startTransition, useEffect, useState } from "react";
 import {
   AdminOption,
   AdminSettings,
+  AudioProcessMode,
+  AudioProcessRequest,
+  AudioProcessResponse,
   ApiKeyInfo,
   BenchmarkResponse,
   CreatedApiKey,
   ManagedModel,
   QueueResponse,
   SettingsResponse,
+  SpeakerRefinementMode,
   StatsResponse,
+  UnknownSpeakerAudio,
   changePassword,
   createApiKey,
   deleteApiKey,
@@ -23,6 +28,7 @@ import {
   listApiKeys,
   login,
   logout,
+  processAudioV2,
   runBenchmark,
   saveSettings,
   testDiaConnection,
@@ -63,6 +69,21 @@ type DashboardHistoryPoint = {
 
 type AuthState = "loading" | "login" | "change" | "ready";
 
+const PIPELINE_MODES: Array<{ value: AudioProcessMode; label: string; description: string }> = [
+  { value: "embedding", label: "Voice embedding", description: "One normalized 192-D ReDimNet2 voice vector." },
+  { value: "transcript", label: "Transcript", description: "ASR transcript with repetition filtering." },
+  {
+    value: "transcript_embedding",
+    label: "Transcript + embedding",
+    description: "ASR transcript plus one mixed 192-D voice vector.",
+  },
+  {
+    value: "diarization",
+    label: "Full diarization",
+    description: "DIA speaker separation, ASR, speaker profile matching, and unknown voices.",
+  },
+];
+
 const NUMBER_LOCALE = "de-DE";
 const DASHBOARD_POLL_SECONDS = 5;
 const DASHBOARD_HISTORY_POINTS = 72;
@@ -78,6 +99,7 @@ const emptySettings: AdminSettings = {
   batch_wait_time_ms: 1000,
   batch_max_segments: 16,
   batch_max_audio_seconds: 60.0,
+  cuda_memory_trim_after_batch: false,
   huggingface_token: "",
   dia_server_base_url: "",
   dia_api_key: "",
@@ -189,6 +211,97 @@ function formatRealtimeFactor(value: number | null | undefined) {
     return `${value.toFixed(1)}x`;
   }
   return `${value.toFixed(2)}x`;
+}
+
+function parseKnownSpeakerProfiles(rawValue: string) {
+  if (new TextEncoder().encode(rawValue).byteLength > 16 * 1024 * 1024) {
+    throw new Error("Known-speaker JSON must not exceed 16 MiB.");
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(rawValue || "[]");
+  } catch {
+    throw new Error("Known speakers must be valid JSON.");
+  }
+  if (!Array.isArray(parsed)) {
+    throw new Error("Known speakers must be a JSON array.");
+  }
+  if (parsed.length > 64) {
+    throw new Error("At most 64 known speakers are allowed.");
+  }
+
+  const ids = new Set<string>();
+  return parsed.map((entry, speakerIndex) => {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      throw new Error(`Known speaker ${speakerIndex + 1} must be an object.`);
+    }
+    const profile = entry as Record<string, unknown>;
+    const unsupportedKeys = Object.keys(profile).filter((key) => key !== "id" && key !== "embeddings");
+    if (unsupportedKeys.length > 0) {
+      throw new Error(`Known speaker ${speakerIndex + 1} contains unsupported field "${unsupportedKeys[0]}".`);
+    }
+    const id = typeof profile.id === "string" ? profile.id.trim() : "";
+    if (!id) {
+      throw new Error(`Known speaker ${speakerIndex + 1} needs a non-empty id.`);
+    }
+    if (new TextEncoder().encode(id).byteLength > 128) {
+      throw new Error(`Known speaker id "${id}" exceeds 128 UTF-8 bytes.`);
+    }
+    if (ids.has(id)) {
+      throw new Error(`Known speaker id "${id}" occurs more than once.`);
+    }
+    ids.add(id);
+
+    if (!Array.isArray(profile.embeddings) || profile.embeddings.length === 0) {
+      throw new Error(`Known speaker "${id}" needs at least one embedding.`);
+    }
+    const embeddings = profile.embeddings.map((candidate, embeddingIndex) => {
+      if (!Array.isArray(candidate) || candidate.length !== 192) {
+        throw new Error(`Embedding ${embeddingIndex + 1} for "${id}" must contain exactly 192 values.`);
+      }
+      if (candidate.some((value) => typeof value !== "number" || !Number.isFinite(value))) {
+        throw new Error(`Embedding ${embeddingIndex + 1} for "${id}" contains a non-finite value.`);
+      }
+      const vector = candidate as number[];
+      if (Math.max(...vector.map((value) => Math.abs(value))) <= 0) {
+        throw new Error(`Embedding ${embeddingIndex + 1} for "${id}" must have a non-zero norm.`);
+      }
+      return vector;
+    });
+    return { id, embeddings };
+  });
+}
+
+function describeModel(model: Record<string, unknown> | undefined) {
+  if (!model) {
+    return "n/a";
+  }
+  const id = typeof model.id === "string" ? model.id : typeof model.model === "string" ? model.model : "configured";
+  const dimension = typeof model.dimension === "number" ? ` · ${model.dimension}-D` : "";
+  return `${id}${dimension}`;
+}
+
+function resolveEmbeddingDimension(response: AudioProcessResponse) {
+  const directVector = response.result.embedding?.vector;
+  if (Array.isArray(directVector)) {
+    return directVector.length;
+  }
+  const modelDimension = response.models.embedding?.dimension;
+  return typeof modelDimension === "number" ? modelDimension : null;
+}
+
+function formatTimecode(milliseconds: number) {
+  const totalMilliseconds = Math.max(0, Math.round(milliseconds));
+  const hours = Math.floor(totalMilliseconds / 3_600_000);
+  const minutes = Math.floor((totalMilliseconds % 3_600_000) / 60_000);
+  const seconds = Math.floor((totalMilliseconds % 60_000) / 1000);
+  const millis = totalMilliseconds % 1000;
+  return `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}.${String(millis).padStart(3, "0")}`;
+}
+
+function speakerAudioSource(audio: UnknownSpeakerAudio) {
+  return `data:${audio.mime_type};base64,${audio.data}`;
 }
 
 function computeNiceScaleMax(value: number) {
@@ -398,6 +511,18 @@ export default function App() {
   const [benchmarkBusy, setBenchmarkBusy] = useState(false);
   const [benchmarkMessage, setBenchmarkMessage] = useState("");
   const [benchmarkResult, setBenchmarkResult] = useState<BenchmarkResponse | null>(null);
+  const [pipelineMode, setPipelineMode] = useState<AudioProcessMode>("diarization");
+  const [pipelineExpectedSpeakers, setPipelineExpectedSpeakers] = useState("");
+  const [pipelineKnownSpeakers, setPipelineKnownSpeakers] = useState("[]");
+  const [pipelineSpeakerRefinement, setPipelineSpeakerRefinement] = useState<SpeakerRefinementMode>("off");
+  const [pipelineUnknownSpeakerAudio, setPipelineUnknownSpeakerAudio] = useState(false);
+  const [pipelineApiKey, setPipelineApiKey] = useState("");
+  const [pipelineBusy, setPipelineBusy] = useState(false);
+  const [pipelineDragActive, setPipelineDragActive] = useState(false);
+  const [pipelineMessage, setPipelineMessage] = useState("");
+  const [pipelineResult, setPipelineResult] = useState<AudioProcessResponse | null>(null);
+  const [pipelineWallTimeMs, setPipelineWallTimeMs] = useState<number | null>(null);
+  const [pipelineJsonExpanded, setPipelineJsonExpanded] = useState(false);
   const [modelActionId, setModelActionId] = useState<string | null>(null);
   const [modelActionKind, setModelActionKind] = useState<"refresh" | "download" | "delete" | null>(null);
   const hasDownloadingModels = managedModels.some((model) => model.status === "downloading");
@@ -420,6 +545,19 @@ export default function App() {
       setDiaActionSucceeded(null);
       setBenchmarkMessage("");
       setBenchmarkResult(null);
+      setBenchmarkFile(null);
+      setPipelineMode("diarization");
+      setPipelineExpectedSpeakers("");
+      setPipelineKnownSpeakers("[]");
+      setPipelineSpeakerRefinement("off");
+      setPipelineUnknownSpeakerAudio(false);
+      setPipelineApiKey("");
+      setPipelineBusy(false);
+      setPipelineDragActive(false);
+      setPipelineMessage("");
+      setPipelineResult(null);
+      setPipelineWallTimeMs(null);
+      setPipelineJsonExpanded(false);
       setModelActionId(null);
       setModelActionKind(null);
       setActionMessage("");
@@ -823,6 +961,84 @@ export default function App() {
     }, MODEL_STATUS_POLL_MS);
     return () => window.clearInterval(intervalId);
   }, [authState, hasDownloadingModels, managedModels, settingsForm.local_model_cache_path]);
+
+  function selectPipelineFile(file: File | null) {
+    setBenchmarkFile(file);
+    setPipelineMessage("");
+    setPipelineResult(null);
+    setPipelineWallTimeMs(null);
+    setPipelineJsonExpanded(false);
+    setBenchmarkMessage("");
+    setBenchmarkResult(null);
+  }
+
+  async function handleRunPipeline(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!benchmarkFile) {
+      setPipelineMessage("Please select or drop an audio or video file first.");
+      return;
+    }
+
+    let request: AudioProcessRequest = { schema_version: "2.0", mode: pipelineMode };
+    try {
+      if (pipelineMode === "diarization") {
+        const knownSpeakers = parseKnownSpeakerProfiles(pipelineKnownSpeakers);
+        const expectedRaw = pipelineExpectedSpeakers.trim();
+        let expectedSpeakers: number | undefined;
+        if (expectedRaw) {
+          if (!/^\d+$/.test(expectedRaw)) {
+            throw new Error("Expected speakers must be a whole number from 1 to 64.");
+          }
+          expectedSpeakers = Number(expectedRaw);
+          if (expectedSpeakers < 1 || expectedSpeakers > 64) {
+            throw new Error("Expected speakers must be between 1 and 64.");
+          }
+          if (knownSpeakers.length > expectedSpeakers) {
+            throw new Error("Expected speakers cannot be lower than the number of known speakers.");
+          }
+        }
+        request = {
+          ...request,
+          diarization: {
+            ...(expectedSpeakers === undefined ? {} : { expected_speakers: expectedSpeakers }),
+            known_speakers: knownSpeakers,
+            speaker_refinement: pipelineSpeakerRefinement,
+            ...(pipelineUnknownSpeakerAudio ? { unknown_speaker_audio: true } : {}),
+          },
+        };
+      }
+      if (new TextEncoder().encode(JSON.stringify(request)).byteLength > 16 * 1024 * 1024) {
+        throw new Error("Pipeline request JSON must not exceed 16 MiB.");
+      }
+    } catch (error) {
+      setPipelineMessage(error instanceof Error ? error.message : "The pipeline request is invalid.");
+      return;
+    }
+
+    setPipelineBusy(true);
+    setPipelineMessage("");
+    setPipelineResult(null);
+    setPipelineWallTimeMs(null);
+    setPipelineJsonExpanded(false);
+    const startedAt = performance.now();
+    try {
+      const response = await processAudioV2(benchmarkFile, request, pipelineApiKey);
+      const wallTimeMs = Math.round(performance.now() - startedAt);
+      startTransition(() => {
+        setPipelineResult(response);
+        setPipelineWallTimeMs(wallTimeMs);
+        setPipelineMessage(
+          `Pipeline finished with status ${response.status} in ${formatValue(response.timings_ms.total, " ms")} server time.`,
+        );
+      });
+      await refreshOperationalData();
+    } catch (error) {
+      setPipelineWallTimeMs(Math.round(performance.now() - startedAt));
+      setPipelineMessage(error instanceof Error ? error.message : "Pipeline request failed.");
+    } finally {
+      setPipelineBusy(false);
+    }
+  }
 
   async function handleRunBenchmark(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -1234,125 +1450,493 @@ export default function App() {
           </div>
         </section>
 
-        <section className="panel stack benchmark-widget">
-          <p className="eyebrow">Benchmark</p>
-          <h2>Run Audio Through the Active Pipeline</h2>
-          <p className="section-copy">
-            The benchmark uses the saved server settings and fires repeated runs through the currently active
-            batch and chunk pipeline.
-          </p>
+        </div>
+      </section>
 
-          <form className="benchmark-form" onSubmit={handleRunBenchmark}>
-            <label className="full-width">
-              <span>Audio File</span>
-              <input
-                type="file"
-                accept="audio/*,video/*"
-                onChange={(event) => setBenchmarkFile(event.target.files?.[0] ?? null)}
-              />
+      <section className="panel stack pipeline-tester">
+        <div className="pipeline-heading">
+          <div>
+            <p className="eyebrow">API v2 Pipeline Tester</p>
+            <h2>Process Audio in Any Production Mode</h2>
+            <p className="section-copy">
+              Drop one file, choose a mode, and inspect the complete response from <code>POST /v2/audio/process</code>.
+            </p>
+          </div>
+          <span className="pipeline-mode-pill">
+            {PIPELINE_MODES.find((entry) => entry.value === pipelineMode)?.label}
+          </span>
+        </div>
+
+        <form className="pipeline-form" onSubmit={handleRunPipeline}>
+          <div
+            className={`pipeline-drop-zone ${pipelineDragActive ? "drag-active" : ""} ${benchmarkFile ? "has-file" : ""}`.trim()}
+            onDragEnter={(event) => {
+              event.preventDefault();
+              setPipelineDragActive(true);
+            }}
+            onDragOver={(event) => {
+              event.preventDefault();
+              event.dataTransfer.dropEffect = "copy";
+              setPipelineDragActive(true);
+            }}
+            onDragLeave={(event) => {
+              event.preventDefault();
+              setPipelineDragActive(false);
+            }}
+            onDrop={(event) => {
+              event.preventDefault();
+              setPipelineDragActive(false);
+              selectPipelineFile(event.dataTransfer.files?.[0] ?? null);
+            }}
+          >
+            <input
+              id="pipeline-file"
+              className="pipeline-file-input"
+              type="file"
+              accept="audio/*,video/*"
+              onChange={(event) => selectPipelineFile(event.target.files?.[0] ?? null)}
+            />
+            <label htmlFor="pipeline-file" className="pipeline-drop-label">
+              <strong>{benchmarkFile ? benchmarkFile.name : "Drop audio or video here"}</strong>
+              <span>
+                {benchmarkFile
+                  ? `${formatFixed(benchmarkFile.size / 1024 / 1024, 2, " MiB")} · click to replace`
+                  : "or click to choose a file"}
+              </span>
+            </label>
+          </div>
+
+          <div className="pipeline-control-grid">
+            <label>
+              <span>Processing Mode</span>
+              <select
+                value={pipelineMode}
+                onChange={(event) => {
+                  setPipelineMode(event.target.value as AudioProcessMode);
+                  setPipelineMessage("");
+                  setPipelineResult(null);
+                }}
+              >
+                {PIPELINE_MODES.map((mode) => (
+                  <option key={mode.value} value={mode.value}>{mode.label}</option>
+                ))}
+              </select>
             </label>
 
             <label>
-              <span>Repeats (parallel)</span>
+              <span>Whisper API Key (optional)</span>
               <input
-                type="number"
-                min={1}
-                max={64}
-                value={benchmarkRepeatCount}
-                onChange={(event) => setBenchmarkRepeatCount(Math.max(1, Math.min(64, Number(event.target.value) || 1)))}
+                type="password"
+                autoComplete="off"
+                value={pipelineApiKey}
+                onChange={(event) => setPipelineApiKey(event.target.value)}
+                placeholder="Optional credential override; admin session is used otherwise"
               />
             </label>
+          </div>
 
-            <div className="form-actions full-width">
-              <button type="submit" disabled={benchmarkBusy}>
-                {benchmarkBusy ? "Benchmark running..." : "Run Benchmark"}
-              </button>
-              {benchmarkMessage && (
-                <p className={`message ${benchmarkResult ? "" : "error"}`.trim()}>{benchmarkMessage}</p>
-              )}
-            </div>
-          </form>
+          <p className="pipeline-mode-description">
+            {PIPELINE_MODES.find((entry) => entry.value === pipelineMode)?.description}
+          </p>
 
-          {benchmarkResult && (
-            <div className="benchmark-results">
-              <div className="benchmark-grid">
-                <article className="benchmark-card">
-                  <span>Workflow</span>
-                  <strong>{describeBenchmarkWorkflow(benchmarkResult.workflow)}</strong>
-                </article>
-                <article className="benchmark-card">
-                  <span>RTF</span>
-                  <strong>{formatFixed(benchmarkResult.rtf, 3)}</strong>
-                </article>
-                <article className="benchmark-card">
-                  <span>Total Time</span>
-                  <strong>{formatValue(benchmarkResult.total_wall_time_ms, " ms")}</strong>
-                </article>
-                <article className="benchmark-card">
-                  <span>Time / Run</span>
-                  <strong>{formatFixed(benchmarkResult.avg_wall_time_per_run_ms, 2, " ms")}</strong>
-                </article>
-                <article className="benchmark-card">
-                  <span>Chunks / Run</span>
-                  <strong>{benchmarkResult.chunks_per_run}</strong>
-                </article>
-                <article className="benchmark-card">
-                  <span>Total Chunks</span>
-                  <strong>{benchmarkResult.total_chunks}</strong>
-                </article>
-                <article className="benchmark-card">
-                  <span>Audio / Run</span>
-                  <strong>{formatFixed(benchmarkResult.audio_seconds, 3, " s")}</strong>
-                </article>
-                <article className="benchmark-card">
-                  <span>Total Audio</span>
-                  <strong>{formatFixed(benchmarkResult.total_audio_seconds, 3, " s")}</strong>
-                </article>
-                <article className="benchmark-card">
-                  <span>Batches Used</span>
-                  <strong>{benchmarkResult.batches_used}</strong>
-                </article>
-                <article className="benchmark-card">
-                  <span>Peak VRAM</span>
-                  <strong>{formatVram(benchmarkResult.peak_vram_reserved_mb)}</strong>
-                </article>
-                <article className="benchmark-card">
-                  <span>Allocated VRAM</span>
-                  <strong>{formatVram(benchmarkResult.peak_vram_allocated_mb)}</strong>
-                </article>
-                <article className="benchmark-card">
-                  <span>Text Match</span>
-                  <strong>{benchmarkResult.transcripts_match ? "yes" : "no"}</strong>
-                </article>
-              </div>
+          {pipelineMode === "diarization" && (
+            <div className="pipeline-diarization-fields">
+              <label>
+                <span>Expected Speakers (optional)</span>
+                <input
+                  type="number"
+                  min={1}
+                  max={64}
+                  step={1}
+                  value={pipelineExpectedSpeakers}
+                  onChange={(event) => setPipelineExpectedSpeakers(event.target.value)}
+                  placeholder="Automatic"
+                />
+              </label>
 
-              <div className="benchmark-meta">
-                <div>
-                  <span>File</span>
-                  <strong>{benchmarkResult.file_name}</strong>
-                </div>
-                <div>
-                  <span>Model</span>
-                  <strong>{benchmarkResult.model_id}</strong>
-                </div>
-                <div>
-                  <span>Language</span>
-                  <strong>{benchmarkResult.transcription_language}</strong>
-                </div>
-                <div>
-                  <span>Repeats</span>
-                  <strong>{benchmarkResult.repeat_count}</strong>
-                </div>
-              </div>
+              <label>
+                <span>Speaker Refinement</span>
+                <select
+                  value={pipelineSpeakerRefinement}
+                  onChange={(event) => setPipelineSpeakerRefinement(event.target.value as SpeakerRefinementMode)}
+                >
+                  <option value="off">Off (existing behavior)</option>
+                  <option value="shadow">Shadow (diagnostics only)</option>
+                  <option value="conservative">Conservative (apply safe changes)</option>
+                </select>
+              </label>
 
-              <div className="benchmark-transcript-wrap">
-                <span className="benchmark-transcript-label">Transcript</span>
-                <pre className="benchmark-transcript">{benchmarkResult.transcript || "No transcript available."}</pre>
-              </div>
+              <p className="field-note pipeline-json-note">
+                Shadow reports proposed DIA-label corrections without changing the transcript. Conservative applies
+                only changes that pass all safety checks and otherwise rolls back the full refinement pass.
+              </p>
+
+              <label className="pipeline-checkbox pipeline-json-field">
+                <input
+                  type="checkbox"
+                  checked={pipelineUnknownSpeakerAudio}
+                  onChange={(event) => setPipelineUnknownSpeakerAudio(event.target.checked)}
+                />
+                <span>Include playable MP3 samples for unknown and unresolved speakers</span>
+              </label>
+
+              <label className="pipeline-json-field">
+                <span>Known Speakers (JSON array)</span>
+                <textarea
+                  value={pipelineKnownSpeakers}
+                  onChange={(event) => setPipelineKnownSpeakers(event.target.value)}
+                  spellCheck={false}
+                  placeholder={'[{"id":"person-17","embeddings":[[/* 192 values */]]}]'}
+                />
+              </label>
+              <p className="field-note pipeline-json-note">
+                Each id must be unique. Every profile needs one or more finite, non-zero 192-D ReDimNet2 embeddings.
+                Leave the array empty when no known profiles are available.
+              </p>
             </div>
           )}
-        </section>
-        </div>
+
+          <div className="form-actions">
+            <button type="submit" disabled={pipelineBusy || !benchmarkFile}>
+              {pipelineBusy ? "Processing..." : "Run v2 Pipeline"}
+            </button>
+            {pipelineMessage && (
+              <p className={`message ${pipelineResult ? "" : "error"}`.trim()}>{pipelineMessage}</p>
+            )}
+          </div>
+        </form>
+
+        {pipelineResult && (
+          <div className="pipeline-results">
+            <div className="pipeline-summary-grid">
+              <article className="benchmark-card">
+                <span>Status</span>
+                <strong className={`pipeline-status ${pipelineResult.status}`}>{pipelineResult.status}</strong>
+              </article>
+              <article className="benchmark-card">
+                <span>Mode</span>
+                <strong>{PIPELINE_MODES.find((entry) => entry.value === pipelineResult.mode)?.label ?? pipelineResult.mode}</strong>
+              </article>
+              <article className="benchmark-card">
+                <span>Server Total</span>
+                <strong>{formatValue(pipelineResult.timings_ms.total, " ms")}</strong>
+              </article>
+              <article className="benchmark-card">
+                <span>Client Wall Time</span>
+                <strong>{formatValue(pipelineWallTimeMs, " ms")}</strong>
+              </article>
+              <article className="benchmark-card">
+                <span>Audio</span>
+                <strong>{formatFixed(pipelineResult.audio.duration_ms / 1000, 3, " s")}</strong>
+              </article>
+              <article className="benchmark-card">
+                <span>Embedding</span>
+                <strong>{resolveEmbeddingDimension(pipelineResult) === null ? "n/a" : `${resolveEmbeddingDimension(pipelineResult)}-D`}</strong>
+              </article>
+              <article className="benchmark-card">
+                <span>Warnings</span>
+                <strong>{pipelineResult.warnings.length}</strong>
+              </article>
+            </div>
+
+            <div className="pipeline-result-section">
+              <h3>Phase Timings</h3>
+              <div className="pipeline-timing-grid">
+                {Object.entries(pipelineResult.timings_ms).map(([phase, duration]) => (
+                  <div key={phase}>
+                    <span>{phase.replace(/_/g, " ")}</span>
+                    <strong>{formatValue(duration, " ms")}</strong>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            <div className="pipeline-result-section">
+              <h3>Models</h3>
+              <div className="pipeline-model-grid">
+                {Object.entries(pipelineResult.models).map(([role, model]) => (
+                  <div key={role}>
+                    <span>{role}</span>
+                    <strong>{describeModel(model)}</strong>
+                  </div>
+                ))}
+                {Object.keys(pipelineResult.models).length === 0 && <p className="muted">No model metadata returned.</p>}
+              </div>
+            </div>
+
+            {pipelineResult.result.speaker_counts && (
+              <div className="pipeline-result-section">
+                <h3>Speakers</h3>
+                <div className="pipeline-speaker-grid">
+                  {Object.entries(pipelineResult.result.speaker_counts).map(([label, value]) => (
+                    <div key={label}>
+                      <span>{label.replace(/_/g, " ")}</span>
+                      <strong>{value ?? "auto"}</strong>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {[
+              ...(pipelineResult.result.unknown_speakers ?? []),
+              ...(pipelineResult.result.unresolved_speakers ?? []),
+            ].some((speaker) => speaker.audio) && (
+              <div className="pipeline-result-section">
+                <h3>Unknown-Speaker MP3 Samples</h3>
+                <div className="pipeline-speaker-audio-grid">
+                  {[
+                    ...(pipelineResult.result.unknown_speakers ?? []),
+                    ...(pipelineResult.result.unresolved_speakers ?? []),
+                  ].filter((speaker) => speaker.audio).map((speaker) => (
+                    <article key={`${speaker.speaker_kind}-${speaker.diarization_speaker_id}`}>
+                      <div className="pipeline-speaker-audio-heading">
+                        <div>
+                          <span>{speaker.speaker_kind}</span>
+                          <strong>{speaker.speaker_id}</strong>
+                          <small>Original DIA: {speaker.diarization_speaker_id}</small>
+                        </div>
+                        <div className="pipeline-speaker-audio-meta">
+                          <strong>{formatFixed((speaker.audio?.duration_ms ?? 0) / 1000, 2, " s")}</strong>
+                          <small>{speaker.audio?.snippets.length ?? 0} snippets</small>
+                        </div>
+                      </div>
+                      {speaker.audio && (
+                        <audio controls preload="none" src={speakerAudioSource(speaker.audio)}>
+                          Your browser does not support embedded MP3 playback.
+                        </audio>
+                      )}
+                    </article>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {pipelineResult.result.speaker_refinement && (
+              <div className="pipeline-result-section">
+                <h3>Speaker Refinement</h3>
+                <div className="pipeline-refinement-grid">
+                  <div>
+                    <span>Mode</span>
+                    <strong>{pipelineResult.result.speaker_refinement.mode}</strong>
+                  </div>
+                  <div>
+                    <span>Status</span>
+                    <strong className={`pipeline-refinement-status ${pipelineResult.result.speaker_refinement.status}`}>
+                      {pipelineResult.result.speaker_refinement.status.replace(/_/g, " ")}
+                    </strong>
+                  </div>
+                  <div>
+                    <span>Eligible Windows</span>
+                    <strong>{pipelineResult.result.speaker_refinement.eligible_windows}</strong>
+                  </div>
+                  <div>
+                    <span>Proposed Turns</span>
+                    <strong>{pipelineResult.result.speaker_refinement.proposed_turns}</strong>
+                  </div>
+                  <div>
+                    <span>Applied Turns</span>
+                    <strong>{pipelineResult.result.speaker_refinement.applied_turns}</strong>
+                  </div>
+                  <div>
+                    <span>Reassigned Audio</span>
+                    <strong>
+                      {formatFixed(pipelineResult.result.speaker_refinement.reassigned_duration_ms / 1000, 3, " s")}
+                    </strong>
+                  </div>
+                  <div>
+                    <span>Processing Time</span>
+                    <strong>{formatValue(pipelineResult.result.speaker_refinement.processing_ms, " ms")}</strong>
+                  </div>
+                  <div>
+                    <span>Rollback</span>
+                    <strong>{pipelineResult.result.speaker_refinement.rollback_reason ?? "none"}</strong>
+                  </div>
+                </div>
+
+                {pipelineResult.result.speaker_refinement.changes.length > 0 && (
+                  <div className="table-wrap">
+                    <table className="pipeline-refinement-table">
+                      <thead>
+                        <tr>
+                          <th>Time</th>
+                          <th>DIA Label</th>
+                          <th>Support</th>
+                          <th>Similarity Evidence</th>
+                          <th>Outcome</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {pipelineResult.result.speaker_refinement.changes.map((change) => (
+                          <tr key={`${change.turn_index}-${change.start_ms}-${change.end_ms}`}>
+                            <td className="mono">
+                              {formatTimecode(change.start_ms)}–{formatTimecode(change.end_ms)}
+                            </td>
+                            <td>
+                              <strong>{change.from_speaker_id}</strong>
+                              <small>→ {change.to_speaker_id}</small>
+                            </td>
+                            <td>
+                              <strong>{change.supporting_windows} windows · {formatFixed(change.evidence_duration_ms / 1000, 2, " s")}</strong>
+                              <small>{formatFixed(change.evidence_coverage * 100, 1, "%")} coverage · {formatFixed(change.weighted_vote_share * 100, 1, "%")} vote</small>
+                            </td>
+                            <td className="mono">
+                              <strong>target {formatFixed(change.target_cosine, 3)} · own {formatFixed(change.own_cosine, 3)}</strong>
+                              <small>gain {formatFixed(change.similarity_gain, 3)} · runner-up {formatFixed(change.runner_up_margin, 3)}</small>
+                            </td>
+                            <td>
+                              <strong>{change.applied ? "applied" : "proposed"}</strong>
+                              {change.short_turn_exception && <small>short-turn exception</small>}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+
+                {pipelineResult.result.speaker_refinement.changes_truncated && (
+                  <p className="field-note">Only the first 100 refinement changes are shown.</p>
+                )}
+              </div>
+            )}
+
+            {pipelineResult.result.transcript && (
+              <div className="benchmark-transcript-wrap">
+                <span className="benchmark-transcript-label">
+                  Transcript
+                  {pipelineResult.result.transcript.segments
+                    ? ` · ${pipelineResult.result.transcript.segments.length} speaker segments`
+                    : ""}
+                </span>
+                <pre className="benchmark-transcript">
+                  {pipelineResult.result.transcript.text || "No transcript available."}
+                </pre>
+              </div>
+            )}
+
+            {pipelineResult.result.transcript?.segments && pipelineResult.result.transcript.segments.length > 0 && (
+              <div className="pipeline-result-section">
+                <h3>Speaker Turns</h3>
+                <div className="table-wrap">
+                  <table className="pipeline-segment-table">
+                    <thead>
+                      <tr>
+                        <th>Time</th>
+                        <th>Speaker</th>
+                        <th>Kind</th>
+                        <th>Overlap</th>
+                        <th>Text</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {pipelineResult.result.transcript.segments.map((segment, index) => (
+                        <tr key={`${segment.start_ms}-${segment.end_ms}-${index}`}>
+                          <td className="mono">{formatTimecode(segment.start_ms)}–{formatTimecode(segment.end_ms)}</td>
+                          <td>
+                            <strong>{segment.speaker_id}</strong>
+                            <small>Original DIA: {segment.diarization_speaker_id}</small>
+                            {segment.refined_diarization_speaker_id && (
+                              <small
+                                className={
+                                  segment.refined_diarization_speaker_id !== segment.diarization_speaker_id
+                                    ? "refined-speaker-label"
+                                    : ""
+                                }
+                              >
+                                Refined DIA: {segment.refined_diarization_speaker_id}
+                              </small>
+                            )}
+                          </td>
+                          <td>{segment.speaker_kind}</td>
+                          <td>{segment.overlap ? "yes" : "no"}</td>
+                          <td>{segment.text}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+
+            {pipelineResult.warnings.length > 0 && (
+              <div className="pipeline-warnings">
+                <strong>Warnings</strong>
+                <ul>
+                  {pipelineResult.warnings.map((warning, index) => (
+                    <li key={index}>{typeof warning === "string" ? warning : JSON.stringify(warning)}</li>
+                  ))}
+                </ul>
+              </div>
+            )}
+
+            <details
+              className="pipeline-json-response"
+              onToggle={(event) => setPipelineJsonExpanded(event.currentTarget.open)}
+            >
+              <summary>Full JSON response · request {pipelineResult.request_id}</summary>
+              {pipelineJsonExpanded && <pre>{JSON.stringify(pipelineResult, null, 2)}</pre>}
+            </details>
+          </div>
+        )}
+
+        <details className="legacy-benchmark">
+          <summary>Parallel ASR benchmark (repeat / RTF)</summary>
+          <div className="legacy-benchmark-body">
+            <p className="section-copy">
+              Reuse the file above for repeated runs through the active ASR batch and chunk pipeline.
+            </p>
+            <form className="benchmark-form" onSubmit={handleRunBenchmark}>
+              <label>
+                <span>Repeats (parallel)</span>
+                <input
+                  type="number"
+                  min={1}
+                  max={64}
+                  value={benchmarkRepeatCount}
+                  onChange={(event) => setBenchmarkRepeatCount(Math.max(1, Math.min(64, Number(event.target.value) || 1)))}
+                />
+              </label>
+              <div className="form-actions full-width">
+                <button type="submit" disabled={benchmarkBusy || !benchmarkFile}>
+                  {benchmarkBusy ? "Benchmark running..." : "Run ASR Benchmark"}
+                </button>
+                {benchmarkMessage && (
+                  <p className={`message ${benchmarkResult ? "" : "error"}`.trim()}>{benchmarkMessage}</p>
+                )}
+              </div>
+            </form>
+
+            {benchmarkResult && (
+              <div className="benchmark-results">
+                <div className="benchmark-grid">
+                  <article className="benchmark-card"><span>Workflow</span><strong>{describeBenchmarkWorkflow(benchmarkResult.workflow)}</strong></article>
+                  <article className="benchmark-card"><span>RTF</span><strong>{formatFixed(benchmarkResult.rtf, 3)}</strong></article>
+                  <article className="benchmark-card"><span>Total Time</span><strong>{formatValue(benchmarkResult.total_wall_time_ms, " ms")}</strong></article>
+                  <article className="benchmark-card"><span>Time / Run</span><strong>{formatFixed(benchmarkResult.avg_wall_time_per_run_ms, 2, " ms")}</strong></article>
+                  <article className="benchmark-card"><span>Chunks / Run</span><strong>{benchmarkResult.chunks_per_run}</strong></article>
+                  <article className="benchmark-card"><span>Total Chunks</span><strong>{benchmarkResult.total_chunks}</strong></article>
+                  <article className="benchmark-card"><span>Audio / Run</span><strong>{formatFixed(benchmarkResult.audio_seconds, 3, " s")}</strong></article>
+                  <article className="benchmark-card"><span>Total Audio</span><strong>{formatFixed(benchmarkResult.total_audio_seconds, 3, " s")}</strong></article>
+                  <article className="benchmark-card"><span>Batches Used</span><strong>{benchmarkResult.batches_used}</strong></article>
+                  <article className="benchmark-card"><span>Peak VRAM</span><strong>{formatVram(benchmarkResult.peak_vram_reserved_mb)}</strong></article>
+                  <article className="benchmark-card"><span>Allocated VRAM</span><strong>{formatVram(benchmarkResult.peak_vram_allocated_mb)}</strong></article>
+                  <article className="benchmark-card"><span>Text Match</span><strong>{benchmarkResult.transcripts_match ? "yes" : "no"}</strong></article>
+                </div>
+                <div className="benchmark-meta">
+                  <div><span>File</span><strong>{benchmarkResult.file_name}</strong></div>
+                  <div><span>Model</span><strong>{benchmarkResult.model_id}</strong></div>
+                  <div><span>Language</span><strong>{benchmarkResult.transcription_language}</strong></div>
+                  <div><span>Repeats</span><strong>{benchmarkResult.repeat_count}</strong></div>
+                </div>
+                <div className="benchmark-transcript-wrap">
+                  <span className="benchmark-transcript-label">Transcript</span>
+                  <pre className="benchmark-transcript">{benchmarkResult.transcript || "No transcript available."}</pre>
+                </div>
+              </div>
+            )}
+          </div>
+        </details>
       </section>
 
       <div className="content-grid">
@@ -1553,6 +2137,21 @@ export default function App() {
                 value={settingsForm.batch_max_audio_seconds}
                 onChange={(event) => updateSetting("batch_max_audio_seconds", Number(event.target.value))}
               />
+            </label>
+
+            <label className="settings-checkbox full-width">
+              <input
+                type="checkbox"
+                checked={settingsForm.cuda_memory_trim_after_batch}
+                onChange={(event) => updateSetting("cuda_memory_trim_after_batch", event.target.checked)}
+              />
+              <span>
+                Auto VRAM trim after batch
+                <small>
+                  Disabled for low latency. Enabling it releases unused process-wide CUDA allocator memory after an
+                  ASR burst and can make the next Cohere or ReDimNet request slower.
+                </small>
+              </span>
             </label>
 
             <div className="form-actions full-width">

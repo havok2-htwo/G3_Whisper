@@ -21,6 +21,7 @@ from .genesis_whisper_server_auth import (
     require_session,
     set_session_cookie,
 )
+from .genesis_whisper_server_batching import BatchEnqueueSpec, enqueue_batch_specs_bounded
 from .genesis_whisper_server_chunking import combine_transcription_chunks, split_audio_for_whisper
 from .genesis_whisper_server_globals import (
     AVAILABLE_DEVICES,
@@ -60,6 +61,7 @@ class AdminSettingsPayload(BaseModel):
     batch_wait_time_ms: int | None = None
     batch_max_segments: int | None = None
     batch_max_audio_seconds: float | None = None
+    cuda_memory_trim_after_batch: bool | None = None
     huggingface_token: str | None = None
     dia_server_base_url: str | None = None
     dia_api_key: str | None = None
@@ -254,22 +256,25 @@ async def _run_admin_benchmark(request: Request, audio_data, repeat_count: int) 
     batch_manager = request.app.state.whisper_batch_manager
     benchmark_id = uuid.uuid4().hex[:10]
 
-    pending_results = []
+    enqueue_specs: List[BatchEnqueueSpec] = []
     for repeat_index in range(repeat_count):
         request_id = f"benchmark-{benchmark_id}-{repeat_index}"
         for segment_index, segment in enumerate(segments_per_run):
-            pending_results.append(
-                batch_manager.enqueue(
+            enqueue_specs.append(
+                BatchEnqueueSpec(
                     audio_data=segment,
                     request_id=request_id,
                     segment_index=segment_index,
                     total_segments=chunks_per_run,
-                    processing_key=processing_key,
                 )
             )
 
     try:
-        batch_results = await asyncio.gather(*pending_results)
+        batch_results = await enqueue_batch_specs_bounded(
+            batch_manager,
+            enqueue_specs,
+            processing_key,
+        )
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
