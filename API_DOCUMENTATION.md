@@ -584,6 +584,8 @@ Special case:
 
 - audio is normalized to mono `float32` at `16 kHz`
 - direct `soundfile` decode is preferred; `ffmpeg` is the fallback for unsupported formats
+- the `ffmpeg` fallback uses a seekable temporary input, so MP4/M4A/MOV containers with metadata at the end are supported
+- upload decoding runs outside the async request loop and does not first copy the complete upload into a second in-memory bytes object
 - Whisper chunking currently uses the energy-based speech detector
 - Cohere uses the active saved language, and when the server setting is `auto`, it falls back to `de`
 - For gated Cohere models, the runtime loader reuses the saved Hugging Face token and completes incomplete local snapshots before loading from the finished local snapshot.

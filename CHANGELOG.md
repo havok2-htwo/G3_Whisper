@@ -12,6 +12,8 @@ Dieses Dokument wird bewusst knapp gehalten und bei kuenftigen Arbeiten fortgesc
 
 ## Unreleased
 
+- **Fix:** Der ffmpeg-Fallback dekodiert Uploads jetzt ueber eine seekbare Tempdatei statt `pipe:0`; dadurch funktionieren insbesondere MP4/M4A/MOV-Dateien mit `moov` am Dateiende. Public API und Admin-Benchmark vermeiden dabei eine zusaetzliche Vollkopie des Uploads im RAM und fuehren den Decode ausserhalb des Async-Request-Loops aus.
+- **Fix:** Der ffmpeg-Fallback respektiert nun die angeforderte Ziel-Samplerate; Normalisierung und PCM-Konvertierung vermeiden unnoetige Vollgroessen-Kopien bei langen Aufnahmen.
 - **Fix:** Gated Hugging Face token from Admin Settings or `HUGGINGFACE_TOKEN` / `HF_TOKEN` is now reused during direct local ASR model loading, not only during explicit cache downloads.
 - **Fix:** Der Cohere-Ladepfad erkennt unvollstaendige lokale Snapshots jetzt korrekt als `partial`, fuehrt bei Bedarf einen vollstaendigen `snapshot_download(...)` aus und laedt erst danach aus dem fertigen lokalen Snapshot.
 - **Fix:** Der Cache Manager markiert `CohereLabs/cohere-transcribe-03-2026` nicht mehr vorschnell als `ready`; fuer `ready` muessen jetzt Remote-Code-Dateien, `tokenizer.model` und Modellgewichte vollstaendig lokal vorliegen.

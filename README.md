@@ -500,6 +500,8 @@ Notes:
 
 - Formats directly readable by `soundfile` work without external tools.
 - For many video/container formats and some audio codecs, `ffmpeg` on `PATH` is required for the fallback decode path.
+- The `ffmpeg` fallback stages its input as a seekable temporary file. This also supports MP4/M4A/MOV files whose `moov` metadata is stored after the media payload instead of at the beginning.
+- Public uploads and admin benchmark uploads are decoded from the spooled upload stream in a worker thread, avoiding an additional full-file RAM copy and blocking work on the async request loop.
 
 The admin benchmark also accepts audio or video and uses the same audio loading path.
 

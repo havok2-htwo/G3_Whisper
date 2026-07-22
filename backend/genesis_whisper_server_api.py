@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 
-from .genesis_whisper_server_audio import get_audio_duration_seconds, load_audio_bytes
+from .genesis_whisper_server_audio import get_audio_duration_seconds, load_audio_file
 from .genesis_whisper_server_auth import authorize_api_key, get_auth_store
 from .genesis_whisper_server_chunking import combine_transcription_chunks, split_audio_for_whisper
 from .genesis_whisper_server_globals import (
@@ -79,8 +79,7 @@ def create_api(app: FastAPI) -> FastAPI:
         filename = file.filename or "upload"
 
         try:
-            audio_bytes = await file.read()
-            audio_data = load_audio_bytes(audio_bytes, filename)
+            audio_data = await asyncio.to_thread(load_audio_file, file.file, filename)
         except HTTPException:
             raise
         except Exception as exc:
