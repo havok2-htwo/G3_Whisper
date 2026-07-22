@@ -10,7 +10,8 @@ It provides a simple upload API for audio and video files, features a protected 
 - Whisper models via Hugging Face `transformers`
 - `CohereLabs/cohere-transcribe-03-2026`
 
-Optionally, a voice vector can also be generated based on `pyannote/embedding`.
+Voice vectors are generated exclusively with the pinned, open-weight ReDimNet2-B6 LM
+`vb2+vox2+cnc2_v0` model and are always L2-normalized 192-dimensional vectors.
 For gated Hugging Face models, the runtime loader can use the saved admin-setting token or `HUGGINGFACE_TOKEN` / `HF_TOKEN`.
 
 This file acts as the central functional and technical reference for this repository. If the code and the README diverge, the following rule applies: The README must be updated in the same work step until it accurately reflects the current state again.
@@ -35,13 +36,15 @@ Active is a single local server that:
 - loads local ASR models
 - processes Whisper requests via an internal batch queue system
 - provides settings, queue status, history, and benchmarks in the admin area
-- optionally generates a voice vector
+- exposes the versioned multi-mode `POST /v2/audio/process` API
+- generates fixed ReDimNet2-B6 voice embeddings and, in `diarization` mode only, delegates speaker separation to G3_DIA
 
 Old Gradio, OpenAI, Voxtral, and side-server paths are no longer active. Such legacy code has largely been moved to [`marked_for_delete`](x:/dev/G3_WHISPER/marked_for_delete).
 
 ## Core Features
 
 - Transcription via `POST /transcribe/`
+- Versioned processing via `POST /v2/audio/process` with `embedding`, `transcript`, `transcript_embedding`, and `diarization` modes
 - OpenAI-compatible routes on `GET /v1/models` and `POST /v1/audio/transcriptions`
 - public landing page on `GET /` and admin SPA on `GET /admin`
 - OpenAPI docs on `GET /docs` and schema export on `GET /openapi.json`
@@ -58,6 +61,8 @@ Old Gradio, OpenAI, Voxtral, and side-server paths are no longer active. Such le
   - Peak VRAM
   - Transcript display
 - Optional voice vector generation
+- ReDimNet2 profile matching and return of unknown-speaker embeddings after DIA diarization
+- Conservative exact-pattern repetition filtering, enabled by default on every transcript-producing route and the admin benchmark
 - Pause/VAD-based segmentation for Whisper
 - Speech-only pre-filtering for the voice vector
 
@@ -75,9 +80,18 @@ Core backend files:
   - defines the lifespan startup/shutdown
   - serves the built frontend
 - [backend/genesis_whisper_server_api.py](x:/dev/G3_WHISPER/backend/genesis_whisper_server_api.py)
-  - unprotected upload API
+  - legacy upload API
   - dispatch to local ASR path
   - optional voice vector generation
+- [backend/genesis_whisper_server_v2.py](x:/dev/G3_WHISPER/backend/genesis_whisper_server_v2.py)
+  - versioned multi-mode processing API
+  - DIA orchestration, turn transcription, and unified responses
+- [backend/genesis_whisper_server_dia_client.py](x:/dev/G3_WHISPER/backend/genesis_whisper_server_dia_client.py)
+  - authenticated streaming client for the G3_DIA v2 API
+- [backend/genesis_whisper_server_speaker_matching.py](x:/dev/G3_WHISPER/backend/genesis_whisper_server_speaker_matching.py)
+  - clean speaker-window extraction, robust embedding clouds, and one-to-one profile matching
+- [backend/genesis_whisper_server_repetition.py](x:/dev/G3_WHISPER/backend/genesis_whisper_server_repetition.py)
+  - exact Unicode-token repetition filtering
 - [backend/genesis_whisper_server_admin.py](x:/dev/G3_WHISPER/backend/genesis_whisper_server_admin.py)
   - protected admin endpoints
   - settings, stats, queue, benchmark
@@ -92,7 +106,9 @@ Core backend files:
 - [backend/genesis_whisper_server_audio.py](x:/dev/G3_WHISPER/backend/genesis_whisper_server_audio.py)
   - reading and normalizing audio/video files
 - [backend/genesis_whisper_server_vid.py](x:/dev/G3_WHISPER/backend/genesis_whisper_server_vid.py)
-  - optional voice vector via `pyannote/embedding`
+  - the single pinned ReDimNet2-B6 embedding implementation
+- [backend/genesis_whisper_server_gpu.py](x:/dev/G3_WHISPER/backend/genesis_whisper_server_gpu.py)
+  - optional cross-process file lease for shared-GPU deployments
 - [backend/genesis_whisper_server_auth.py](x:/dev/G3_WHISPER/backend/genesis_whisper_server_auth.py)
   - admin key storage, rotation, and header-based authentication
 - [backend/genesis_whisper_server_storage.py](x:/dev/G3_WHISPER/backend/genesis_whisper_server_storage.py)
@@ -113,6 +129,41 @@ The build target is [`frontend/dist`](x:/dev/G3_WHISPER/frontend/dist). This dir
 
 ## Active Runtime Logic
 
+### Versioned v2 Processing
+
+`POST /v2/audio/process` accepts `multipart/form-data` with an audio/video `file` and a
+JSON string in the `request` part. The JSON always uses `schema_version: "2.0"` and one
+of four modes:
+
+- `embedding`: one L2-normalized ReDimNet2 192-D embedding, without ASR or DIA
+- `transcript`: one cleaned transcript, without DIA
+- `transcript_embedding`: the transcript plus one recording-level ReDimNet2 embedding, without DIA
+- `diarization`: G3_DIA speaker separation, ASR per exclusive speaker turn, ReDimNet2 profile matching, and unknown-speaker embeddings
+
+Only `diarization` contacts G3_DIA. The other three modes do not pay a DIA round trip and
+do not load or expose the DIA model. The DIA `community-1` pipeline still uses its own
+internal 256-D representation, but that representation is never serialized or used for
+identity matching. Public voice vectors use only ReDimNet2.
+
+In `diarization` mode, clients may provide an exact `expected_speakers` value from `1` to
+`64` and zero or more known profiles. Every profile has a unique application-level `id`
+and one or more 192-D ReDimNet2 vectors. Vectors must contain only finite values and have
+a non-zero norm; dimensions such as the former 512-D vectors or DIA-internal 256-D
+vectors are rejected with HTTP 422. If `expected_speakers` is omitted, DIA selects the
+speaker count automatically; supplied known profiles set only the lower bound. Known
+profiles are expected to represent speakers that are present in the recording.
+
+The result retains both the assigned application `speaker_id` and the original
+`diarization_speaker_id`, millisecond timecodes, speaker kind, text, and overlap flag.
+Unknown speakers return a robust prototype plus at most 63 diverse time-coded
+representatives, for a deterministic maximum of 64 vectors per speaker. Weak or
+ambiguous evidence is not forced into a known identity and is reported through
+unresolved profile IDs, assignment/quality information, and warnings.
+
+There is intentionally no embedding-model selector and no client-supplied
+`embedding_space_id`. API version 2 is permanently tied to this exact ReDimNet2 model
+space; changing the checkpoint later requires a new API/embedding version.
+
 ### Transcription
 
 The native upload path is `POST /transcribe/`.
@@ -131,6 +182,7 @@ Behavior:
 - If the active model is Cohere, the local ASR path currently processes the audio as a single item.
 - For gated Cohere loads, the runtime path now completes an incomplete Hugging Face snapshot first and only then loads the model from the finished local snapshot.
 - Only the native `POST /transcribe/` route can return a `voice_vector`.
+- The legacy response keys remain unchanged, but `voice_vector` now contains exactly 192 ReDimNet2 values instead of the former 512 values.
 
 ### OpenAI-Compatible Routes
 
@@ -152,11 +204,52 @@ The voice vector is optional.
 
 Important rules:
 
-- It is only generated if `voice_ident=true`.
-- Prior to embedding creation, only recognized speech segments are used whenever possible.
-- If no speech is reliably detected, the code falls back once to the original audio.
+- Legacy `POST /transcribe/` generates it only when `voice_ident=true`; v2 also exposes it through `embedding` and `transcript_embedding`.
+- VAD removes silence, the remaining speech is split into fixed three-second windows, windows are embedded in batches, and a quality-weighted mean is L2-normalized.
+- Invalid, silent, or heavily clipped windows are discarded. At least one second of usable input is required for a recording-level embedding.
+- Multi-speaker input outside `diarization` mode intentionally produces a mixed recording-level vector; no identity assignment is attempted.
+- The model is lazy-loaded once, warmed once, uses FP16 on CUDA and FP32 on CPU, and is deliberately not passed through `torch.compile`.
 
-Thus, the voice vector is now intentionally "speech-first" and not "silence-first".
+The single public model is ReDimNet2-B6 LM `vb2+vox2+cnc2_v0`, 192-D, from the
+[official MIT-licensed repository](https://github.com/PalabraAI/redimnet2). Runtime code pins release `v1.0.0`, source commit
+`2a8d15f65b1dfb5d73fede2f11ee42bcccca3035`, and checkpoint SHA-256
+`287365f6f485b19e65e5176554f8f7123bfa8d85185f3d2c040eab51acec9868`.
+The source pin is newer than the original release tag because this release asset uses the
+post-tag `agg_gnorm` configuration; the tag itself cannot instantiate this checkpoint.
+
+### Diarization and Profile Matching
+
+In `diarization` mode, Whisper streams the original upload to G3_DIA. DIA returns both
+standard and exclusive speaker turns plus overlap intervals. Exclusive turns drive ASR;
+standard turns/overlap intervals identify regions that are unsafe for embeddings.
+
+ReDimNet embeddings per detected DIA speaker are created only from clean speech:
+
+- a 200 ms safety margin is removed at speaker boundaries
+- overlap regions are excluded
+- clean regions need at least two seconds and target three-second windows
+- loudness, clipping, and invalid-sample checks reject unsafe material
+- all valid candidates participate; cosine components remove mixed clusters and near-duplicate/outlier filtering stabilizes the cloud
+- Hungarian matching enforces a global one-to-one relationship between known IDs and detected speaker clusters
+
+Initial matching thresholds are cosine `0.60`, support `0.60`, and stability margin
+`0.04`; speaker-cloud components start at cosine `0.45` and need a dominant component
+share of `0.60`. Quality states are `ready`, `low_support`, `mixed_cluster`, and
+`insufficient_clean_speech`.
+
+### Transcript Repetition Filter
+
+After chunk joining, transcript-producing paths collapse exact consecutive ASR loops to
+the first original occurrence. This applies by default to `POST /transcribe/`,
+`POST /v1/audio/transcriptions`, the transcript-producing v2 modes, and the admin
+benchmark. Diarization filters each speaker turn independently so it never removes text
+across speaker boundaries.
+
+Matching uses Unicode NFKC normalization and case-folding and ignores whitespace and
+terminal punctuation. A single word must repeat at least five times; a pattern of 2
+through 32 tokens must repeat at least three times. There are no fuzzy matches, markers,
+counters, or response-shape changes. Clients can disable the filter for a request with
+`X-G3-Repetition-Filter: off`.
 
 ### Whisper Chunking
 
@@ -200,7 +293,7 @@ Number display in the dashboard:
 
 ## Active Models
 
-The current model list is maintained centrally in [genesis_whisper_server_globals.py](x:/dev/G3_WHISPER/genesis_whisper_server_globals.py).
+The current ASR model list is maintained centrally in [backend/genesis_whisper_server_globals.py](x:/dev/G3_WHISPER/backend/genesis_whisper_server_globals.py).
 
 Currently available:
 
@@ -212,13 +305,16 @@ Currently available:
 - `openai/whisper-base`
 - `openai/whisper-tiny`
 
-The Cache Manager in the UI also additionally supports downloading and deleting the `pyannote/embedding` model for Voice Vectors.
+Voice embedding is not an admin-selectable ASR model. Every public embedding path uses
+the fixed ReDimNet2-B6 LM checkpoint described above; it is downloaded lazily into the
+configured model cache and verified against its pinned SHA-256 before use.
 
 Note:
 
 - The `openai/whisper-*` names are Hugging Face model IDs.
 - No OpenAI Cloud API is used anymore.
 - The `engine` value `openai` is no longer supported.
+- There is no public embedding-model selection and no `embedding_space_id` request field.
 
 ## Optimizations
 
@@ -234,6 +330,8 @@ The local ASR path already utilizes several optimizations:
 - Batch queue for Whisper
 - startup warmup of the configured ASR model with a sample clip (see "Startup Warmup" below)
 - idle CUDA-cache trimming so idle VRAM drops back to the model floor (see "Idle VRAM Trimming" below)
+- ReDimNet2 window batching with automatic CUDA-OOM batch-size reduction
+- serial DIA, ASR, and ReDim phases on the local GPU; an optional cross-process file lease coordinates Whisper and DIA when they share a physical GPU
 
 ### Startup Warmup
 
@@ -310,11 +408,20 @@ Principle:
 The most important environment variables:
 
 - `HUGGINGFACE_TOKEN`
-  - required for `pyannote/embedding`
   - required for gated Hugging Face models such as `CohereLabs/cohere-transcribe-03-2026` unless the token is saved in the admin UI
   - **Note:** Can now optionally be configured directly via the Admin Settings UI, which takes precedence over `.env`.
   - **Important:** A token entered only during a manual cache download is not sufficient for later runtime loading. The token must be persisted in Admin Settings or `.env`.
   - **Important:** The same saved token is now also used by the runtime loader itself when Cohere needs to complete missing snapshot files such as `tokenizer.model`.
+- `DIA_SERVER_BASE_URL`
+  - optional fallback for the DIA server URL; use `http://dia:7864` in the bundled Compose network
+  - a URL saved in the Whisper admin UI takes precedence
+- `DIA_SERVER_API_KEY`
+  - optional fallback for a DIA client key created in the G3_DIA admin UI
+  - the value is treated as write-only and a key saved in the Whisper admin UI takes precedence
+  - it is sent only to DIA as `X-API-Key` and is never returned or logged by Whisper
+- `GENESIS_GPU_LEASE_PATH`
+  - optional path to a file lock shared by Whisper and DIA, for example `/app/gpu-coordination/gpu.lock` in Compose
+  - when unset, each process keeps only its existing in-process GPU serialization
 
 ## Persistent Data and Logs
 
@@ -342,6 +449,8 @@ The active default values come from [backend/genesis_whisper_server_storage.py](
 - `batch_max_segments`: `32`
 - `batch_max_audio_seconds`: `300.0`
 - `huggingface_token`: empty string
+- `dia_server_base_url`: empty string (falls back to `DIA_SERVER_BASE_URL`)
+- `dia_api_key`: empty string (write-only; falls back to `DIA_SERVER_API_KEY`)
 
 ## Admin Endpoints
 
@@ -357,6 +466,8 @@ Active admin routes:
 - `DELETE /api/admin/api-keys/{key_id}`
 - `GET /api/admin/settings`
 - `PUT /api/admin/settings`
+- `DELETE /api/admin/settings/dia-api-key`
+- `POST /api/admin/dia/test`
 - `GET /api/admin/models`
 - `POST /api/admin/models/download`
 - `POST /api/admin/models/delete`
@@ -364,11 +475,19 @@ Active admin routes:
 - `GET /api/admin/queue`
 - `POST /api/admin/benchmark`
 
+Admin settings updates are partial merges: omitted fields retain their saved values, so
+older clients do not erase newer DIA settings. The DIA server URL and API key can be
+entered in the admin UI. The saved URL/key take precedence over their environment
+fallbacks. The key is write-only in responses, a blank update preserves it, and only
+`DELETE /api/admin/settings/dia-api-key` removes the saved value explicitly. The
+connection test calls the configured DIA `GET /v2/capabilities` endpoint.
+
 ## API Endpoints
 
 Active open routes:
 
 - `POST /transcribe/`
+- `POST /v2/audio/process`
 - `GET /v1/models`
 - `POST /v1/audio/transcriptions`
 - `GET /docs`
@@ -502,6 +621,7 @@ Notes:
 - For many video/container formats and some audio codecs, `ffmpeg` on `PATH` is required for the fallback decode path.
 - The `ffmpeg` fallback stages its input as a seekable temporary file. This also supports MP4/M4A/MOV files whose `moov` metadata is stored after the media payload instead of at the beginning.
 - Public uploads and admin benchmark uploads are decoded from the spooled upload stream in a worker thread, avoiding an additional full-file RAM copy and blocking work on the async request loop.
+- In v2 `diarization` mode, Whisper rewinds and streams that original spooled upload to DIA instead of materializing another complete in-memory copy.
 
 The admin benchmark also accepts audio or video and uses the same audio loading path.
 
@@ -509,7 +629,7 @@ The admin benchmark also accepts audio or video and uses the same audio loading 
 
 - `python-multipart` is required for FastAPI form uploads and is part of [requirements.txt](x:/dev/G3_WHISPER/requirements.txt).
 - `librosa` is required by parts of the local ASR stack and is therefore explicitly part of [requirements.txt](x:/dev/G3_WHISPER/requirements.txt).
-- `omegaconf` is explicitly part of [requirements.txt](x:/dev/G3_WHISPER/requirements.txt) because `pyannote/embedding` can otherwise fail at runtime even when `pyannote.audio` is already installed.
+- `httpx` provides the streamed DIA upstream client and `filelock` provides optional cross-process GPU coordination.
 - The server has been migrated to FastAPI Lifespan. Old event handler calls should not be reintroduced.
 - If a model cannot be loaded, the API and benchmark will bubble up the specific loader error instead of just a generic message.
 - For models wrapped with `torch.compile(...)`, do not use truthiness checks like `if not model`. Always explicitly check `is None` instead.
@@ -522,10 +642,9 @@ The admin benchmark also accepts audio or video and uses the same audio loading 
 - On Windows, if no `cl.exe` is available, Cohere continues to run without the optional internal compile path.
 - The Cohere ASR model hardcodes a `-1e9` attention-mask value that overflows fp16; a `masked_fill` fp16 guard now clamps it, so `int8_bnb` (max weight-VRAM save) works. `bf16` is still the most robust choice; experimental `fp8` needs the optional `kernels` package.
 - On Windows, Hugging Face may warn about degraded cache behavior without symlink support. Developer Mode or elevated execution improves this, but the cache still works without it.
-- `pyannote/embedding` is treated as cache-ready when its snapshot contains `config.yaml` and `pytorch_model.bin`; unlike Whisper models it does not rely on `preprocessor_config.json`.
-- The voice-vector loader prefers a complete local snapshot under the configured `local_model_cache_path` before falling back to the Hugging Face Hub cache.
+- Existing 512-D voice profiles are incompatible with the new 192-D model space and are not converted automatically. Recreate each profile from its reference audio before using it with v2.
+- Existing 512-D model/cache files are left on disk deliberately; removing them is an operator decision and not part of startup migration.
 - `__pycache__` might reappear locally. This is normal and not source code.
-- [backend/genesis_whisper_server_diarization_engine.py](x:/dev/G3_WHISPER/backend/genesis_whisper_server_diarization_engine.py) is in the repo but is not currently part of the active main path.
 
 ## Git & AI Agents: Saving Code (Push)
 

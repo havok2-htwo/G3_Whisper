@@ -17,18 +17,14 @@ def _normalize_audio_data(audio_data: np.ndarray) -> np.ndarray:
     if audio_data.size == 0:
         return audio_data
 
-    # Avoid np.abs(audio_data), which temporarily doubles memory usage for long
-    # recordings.  The returned array is also normalized in place for the same
-    # reason.
+    # Preserve the physical amplitude. ReDimNet quality gates need meaningful
+    # RMS and clipping ratios; peak-normalizing every upload would amplify quiet
+    # noise and make all recordings look equally loud. Integer PCM and ffmpeg's
+    # s16le output are already scaled to the conventional [-1, 1] range.
     min_val = float(np.min(audio_data))
     max_val = float(np.max(audio_data))
-    max_val = max(abs(min_val), abs(max_val))
-    if not np.isfinite(max_val):
+    if not np.isfinite(min_val) or not np.isfinite(max_val):
         raise HTTPException(status_code=400, detail="Audiodatei enthaelt ungueltige Sample-Werte.")
-    if max_val > 0.0:
-        if not audio_data.flags.writeable:
-            audio_data = audio_data.copy()
-        audio_data /= max_val
     return audio_data
 
 

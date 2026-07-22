@@ -13,6 +13,19 @@ export type AdminSettings = {
   batch_max_segments: number;
   batch_max_audio_seconds: number;
   huggingface_token: string;
+  dia_server_base_url: string;
+  dia_api_key: string;
+  dia_api_key_configured: boolean;
+  dia_api_key_source: "settings" | "environment" | "none";
+  dia_server_base_url_effective: string;
+  dia_server_base_url_source: "settings" | "environment" | "none";
+};
+
+export type DiaConnectionTestResponse = {
+  ok: boolean;
+  base_url: string;
+  status_code: number;
+  message: string;
 };
 
 export type ManagedModel = {
@@ -202,13 +215,42 @@ export async function getSettings() {
 }
 
 export async function saveSettings(settings: AdminSettings) {
+  const {
+    dia_api_key_configured: _diaApiKeyConfigured,
+    dia_api_key_source: _diaApiKeySource,
+    dia_server_base_url_effective: _diaServerBaseUrlEffective,
+    dia_server_base_url_source: _diaServerBaseUrlSource,
+    ...editableSettings
+  } = settings;
+  const payload: Record<string, unknown> = { ...editableSettings };
+  if (!settings.dia_api_key.trim()) {
+    delete payload.dia_api_key;
+  }
+
   return requestJson<SettingsResponse & { ok: boolean; model_reloaded: boolean; model_loaded: boolean | null }>(
     "/api/admin/settings",
     {
       method: "PUT",
-      body: JSON.stringify(settings),
+      body: JSON.stringify(payload),
     },
   );
+}
+
+export async function deleteDiaApiKey() {
+  return requestJson<SettingsResponse & { ok: boolean; removed: boolean; environment_fallback_active: boolean }>(
+    "/api/admin/settings/dia-api-key",
+    { method: "DELETE" },
+  );
+}
+
+export async function testDiaConnection(diaServerBaseUrl?: string, diaApiKey?: string) {
+  return requestJson<DiaConnectionTestResponse>("/api/admin/dia/test", {
+    method: "POST",
+    body: JSON.stringify({
+      dia_server_base_url: diaServerBaseUrl?.trim() || undefined,
+      dia_api_key: diaApiKey?.trim() || undefined,
+    }),
+  });
 }
 
 export async function getModels(storagePath?: string) {

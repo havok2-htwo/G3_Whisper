@@ -3,8 +3,8 @@
 # GENESIS Whisper Server — GPU transcription/diarization service.
 # Target host: Linux + NVIDIA driver + nvidia-container-toolkit (RTX 5090 / sm_120 OK).
 # The image ships NO models: they are downloaded from Hugging Face into the mounted
-# /app/models volume on first use (whisper-large-v3-turbo eagerly at warmup, the
-# diarization / Cohere models lazily on the first request that needs them).
+# /app/models volume on first use (whisper-large-v3-turbo eagerly at warmup;
+# Cohere and ReDimNet2 lazily on the first request that needs them).
 
 ############################  1) Frontend build  ############################
 FROM node:22-bookworm-slim AS frontend
@@ -25,13 +25,12 @@ FROM python:3.13-slim-bookworm AS runtime
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    # Send Hugging Face caches (incl. the diarization pipeline that ignores the
-    # explicit cache_dir) into the mounted models volume so they persist.
-    HF_HOME=/app/models/.hf
+    HF_HOME=/app/models/.hf \
+    TORCH_HOME=/app/models/.torch
 
 # System libraries:
 #   ffmpeg         -> decode mp3/m4a/video containers SoundFile cannot read; also brings the
-#                     libav* shared libs that pyannote.audio 4.x's torchcodec dependency needs
+#                     libav* shared libs used by the media decoder
 #   libsndfile1    -> soundfile / librosa
 #   libsamplerate0 -> the `samplerate` resampler
 #   build-essential-> g++/gcc toolchain torch.compile / Inductor uses to JIT-compile the CUDA
@@ -75,12 +74,12 @@ RUN chmod +x /usr/local/bin/entrypoint.sh
 # Run as non-root. Pre-create + own the volume mountpoints so the named volumes
 # inherit `app` ownership on first mount.
 RUN useradd --create-home --uid 1000 app \
-    && mkdir -p /app/models /app/logs /app/frontend \
+    && mkdir -p /app/models /app/logs /app/frontend /app/gpu-coordination \
     && chown -R app:app /app
 USER app
 
 EXPOSE 7861
-VOLUME ["/app/models", "/app/logs"]
+VOLUME ["/app/models", "/app/logs", "/app/gpu-coordination"]
 
 # First boot downloads the warmup model, so give startup a long grace period.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=1200s --retries=5 \

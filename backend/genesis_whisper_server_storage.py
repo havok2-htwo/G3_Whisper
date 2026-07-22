@@ -3,14 +3,20 @@ import os
 import sys
 from typing import Any, Dict, Optional
 
+from dotenv import load_dotenv
+
 from .genesis_whisper_server_globals import (
     LOCAL_ASR_MODEL_MAP,
     LOG_FILE,
     LOGS_DIR,
+    PROJECT_ROOT,
     SETTINGS_FILE,
     SUPPORTED_LANGUAGE_VALUES,
     SUPPORTED_MODEL_PRECISION_VALUES,
 )
+
+
+load_dotenv(os.path.join(PROJECT_ROOT, ".env"), override=False)
 
 
 DEFAULT_SETTINGS: Dict[str, Any] = {
@@ -23,7 +29,33 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "batch_max_segments": 32,
     "batch_max_audio_seconds": 300.0,
     "huggingface_token": "",
+    "dia_server_base_url": "",
+    "dia_api_key": "",
 }
+
+
+def resolve_dia_server_config(settings: Optional[Dict[str, Any]] = None) -> Dict[str, str]:
+    """Return the effective DIA connection without mutating or persisting env fallbacks.
+
+    Persisted admin settings take precedence. Keeping environment fallbacks out of the
+    normalized settings object prevents a legacy/full settings save from accidentally
+    copying a deployment secret from the process environment into the settings file.
+    """
+
+    source = settings or {}
+    configured_base_url = str(source.get("dia_server_base_url", "") or "").strip().rstrip("/")
+    configured_api_key = str(source.get("dia_api_key", "") or "").strip()
+    env_base_url = str(os.getenv("DIA_SERVER_BASE_URL", "") or "").strip().rstrip("/")
+    env_api_key = str(os.getenv("DIA_SERVER_API_KEY", "") or "").strip()
+
+    base_url = configured_base_url or env_base_url
+    api_key = configured_api_key or env_api_key
+    return {
+        "base_url": base_url,
+        "api_key": api_key,
+        "base_url_source": "settings" if configured_base_url else ("environment" if env_base_url else "none"),
+        "api_key_source": "settings" if configured_api_key else ("environment" if env_api_key else "none"),
+    }
 
 
 def normalize_settings(settings: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -44,6 +76,8 @@ def normalize_settings(settings: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         configured_language if configured_language in SUPPORTED_LANGUAGE_VALUES else DEFAULT_SETTINGS["transcription_language"]
     )
     normalized["huggingface_token"] = str(source.get("huggingface_token", "")).strip()
+    normalized["dia_server_base_url"] = str(source.get("dia_server_base_url", "") or "").strip().rstrip("/")
+    normalized["dia_api_key"] = str(source.get("dia_api_key", "") or "").strip()
 
     try:
         normalized["batch_wait_time_ms"] = max(0, int(source.get("batch_wait_time_ms", DEFAULT_SETTINGS["batch_wait_time_ms"])))

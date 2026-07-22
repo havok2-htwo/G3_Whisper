@@ -36,9 +36,13 @@ services:
     env_file:
       - path: .env
         required: false
+    environment:
+      DIA_SERVER_BASE_URL: ${DIA_SERVER_BASE_URL:-http://dia:7864}
+      GENESIS_GPU_LEASE_PATH: /app/gpu-coordination/gpu.lock
     volumes:
       - whisper_models:/app/models
       - whisper_logs:/app/logs
+      - gpu_coordination:/app/gpu-coordination
     deploy:
       resources:
         reservations:
@@ -101,9 +105,12 @@ services:
     env_file:
       - path: .env
         required: false
+    environment:
+      GENESIS_GPU_LEASE_PATH: /app/gpu-coordination/gpu.lock
     volumes:
       - dia_models:/app/models
       - dia_logs:/app/logs
+      - gpu_coordination:/app/gpu-coordination
     deploy:
       resources:
         reservations:
@@ -125,3 +132,4 @@ volumes:
   omnivoice_data:
   dia_models:
   dia_logs:
+  gpu_coordination:

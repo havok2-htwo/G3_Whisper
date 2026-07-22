@@ -16,6 +16,7 @@ from .genesis_whisper_server_api import create_api, process_local_asr_batch
 from .genesis_whisper_server_batching import WhisperBatchManager
 from .genesis_whisper_server_globals import current_settings
 from .genesis_whisper_server_storage import load_settings
+from .genesis_whisper_server_v2 import create_v2_api
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 FRONTEND_DIST_DIR = PROJECT_ROOT / "frontend" / "dist"
@@ -31,6 +32,7 @@ def _warmup_local_asr() -> None:
 
     try:
         from .genesis_whisper_server_audio import load_audio_bytes
+        from .genesis_whisper_server_gpu import shared_gpu_lease
         from .genesis_whisper_server_local_asr_engine import load_local_asr_model, transcribe_local_asr
 
         model_id = current_settings.get("local_model")
@@ -47,12 +49,13 @@ def _warmup_local_asr() -> None:
         language = current_settings.get("transcription_language") or "auto"
 
         print(f"[WARMUP] Lade Modell '{model_id}' (precision={precision}) und waerme mit {WARMUP_SAMPLE.name} ...", file=sys.stderr)
-        if not load_local_asr_model(model_id, device, cache, precision):
-            print("[WARMUP] Modell-Load fehlgeschlagen -> Warmup uebersprungen.", file=sys.stderr)
-            return
+        with shared_gpu_lease():
+            if not load_local_asr_model(model_id, device, cache, precision):
+                print("[WARMUP] Modell-Load fehlgeschlagen -> Warmup uebersprungen.", file=sys.stderr)
+                return
 
-        audio = load_audio_bytes(WARMUP_SAMPLE.read_bytes(), WARMUP_SAMPLE.name)
-        text = transcribe_local_asr(audio, language=language)
+            audio = load_audio_bytes(WARMUP_SAMPLE.read_bytes(), WARMUP_SAMPLE.name)
+            text = transcribe_local_asr(audio, language=language)
         print(f"[WARMUP] fertig. Beispiel-Transkript: {str(text)[:80]!r}", file=sys.stderr)
     except Exception as exc:
         print(f"[WARMUP] nicht-kritischer Warmup-Fehler ({type(exc).__name__}: {exc}).", file=sys.stderr)
@@ -112,6 +115,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="GENESIS Transcription Server API", lifespan=lifespan)
 app = create_api(app)
+app = create_v2_api(app)
 app = create_admin_api(app)
 
 

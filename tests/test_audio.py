@@ -64,7 +64,9 @@ class AudioDecoderTests(unittest.TestCase):
         self.assertEqual(decoded.ndim, 1)
         self.assertGreater(len(decoded), 3000)
         self.assertLess(len(decoded), 5000)
-        self.assertAlmostEqual(float(np.max(np.abs(decoded))), 1.0, places=5)
+        peak = float(np.max(np.abs(decoded)))
+        self.assertGreater(peak, 0.001)
+        self.assertLess(peak, 1.0)
 
     def test_ffmpeg_fallback_honors_target_sample_rate(self) -> None:
         decoded = audio.load_audio_bytes(self.m4a_bytes, "tail-moov.m4a", target_sample_rate=8000)

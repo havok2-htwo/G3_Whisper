@@ -173,17 +173,6 @@ def _supported_model_specs() -> dict[str, dict[str, Any]]:
     specs["CohereLabs/cohere-transcribe-03-2026"]["required_any_groups"] = (
         ("model.safetensors", "model.safetensors.index.json", "pytorch_model.bin", "pytorch_model.bin.index.json"),
     )
-    
-    # Add pyannote model explicitly here so it shows up in Cache Manager 
-    # but not in the ASR Model dropdown list
-    specs["pyannote/embedding"] = {
-        "label": "Pyannote Speaker Diarization",
-        "backend": "pyannote",
-        "approx_size_gb": 0.05,
-        "required_files": ("config.yaml", "pytorch_model.bin"),
-        "required_any_groups": (),
-    }
-    
     return specs
 
 

@@ -12,6 +12,7 @@ from typing import Any, Callable, Deque, Dict, List, Optional
 import numpy as np
 
 from .genesis_whisper_server_globals import batch_history, batch_runtime_state, batch_state_lock, current_settings, settings_lock
+from .genesis_whisper_server_gpu import run_blocking_gpu_phase
 
 
 @dataclass
@@ -228,7 +229,11 @@ class WhisperBatchManager:
 
         try:
             async with self._gpu_lock:
-                results = await asyncio.to_thread(self._process_batch_fn, audio_batch, batch_items[0].processing_key)
+                results = await run_blocking_gpu_phase(
+                    self._process_batch_fn,
+                    audio_batch,
+                    batch_items[0].processing_key,
+                )
 
             if len(results) != len(batch_items):
                 raise RuntimeError(f"Batch-Transkription lieferte {len(results)} Ergebnisse für {len(batch_items)} Segmente.")

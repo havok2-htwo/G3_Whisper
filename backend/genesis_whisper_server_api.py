@@ -20,14 +20,18 @@ from .genesis_whisper_server_globals import (
     uses_cohere_backend,
 )
 from .genesis_whisper_server_local_asr_engine import (
-    _is_authentication_error,
     get_last_local_asr_load_error,
     load_local_asr_model,
-    transcribe_local_asr,
     transcribe_local_asr_batch,
 )
 from .genesis_whisper_server_storage import log_transcription
 from .genesis_whisper_server_vid import generate_voice_vector
+from .genesis_whisper_server_gpu import run_blocking_gpu_phase, shared_gpu_lease
+from .genesis_whisper_server_repetition import (
+    REPETITION_FILTER_HEADER,
+    filter_repeated_patterns,
+    repetition_filter_enabled,
+)
 
 
 def _normalize_engine(engine: str) -> str:
@@ -49,19 +53,24 @@ def _get_local_processing_key() -> Tuple[str, str, str, str, str]:
 
 def process_local_asr_batch(audio_batch: List[np.ndarray], processing_key: Tuple[str, str, str, str, str]) -> List[str]:
     model_id, device, cache_path, language, precision = processing_key
-    if not load_local_asr_model(model_id, device, cache_path, precision):
-        load_error = get_last_local_asr_load_error()
-        detail = "Lokales ASR-Modell konnte nicht geladen werden."
-        if load_error:
-            detail = f"{detail} Ursache: {load_error}"
-        raise RuntimeError(detail)
-    with settings_lock:
-        batch_size = max(1, int(current_settings.get("batch_max_segments", len(audio_batch) or 1)))
-    return transcribe_local_asr_batch(audio_batch, language=language, batch_size=batch_size)
+    with shared_gpu_lease():
+        if not load_local_asr_model(model_id, device, cache_path, precision):
+            load_error = get_last_local_asr_load_error()
+            detail = "Lokales ASR-Modell konnte nicht geladen werden."
+            if load_error:
+                detail = f"{detail} Ursache: {load_error}"
+            raise RuntimeError(detail)
+        with settings_lock:
+            batch_size = max(1, int(current_settings.get("batch_max_segments", len(audio_batch) or 1)))
+        return transcribe_local_asr_batch(audio_batch, language=language, batch_size=batch_size)
 
 
 def _should_use_batch(voice_ident: bool) -> bool:
-    return not voice_ident
+    # Voice embeddings are a separate serial phase. ASR must always retain the
+    # normal chunk/batch path so long recordings are never truncated to a
+    # model's single ~30-second processor window.
+    _ = voice_ident
+    return True
 
 
 def create_api(app: FastAPI) -> FastAPI:
@@ -97,100 +106,70 @@ def create_api(app: FastAPI) -> FastAPI:
         model_id = local_processing_key[0]
         effective_language = get_effective_transcription_language(model_id, local_processing_key[3])
 
-        if _should_use_batch(voice_ident):
-            used_batching = True
-            batch_manager = request.app.state.whisper_batch_manager
-            request_id = uuid.uuid4().hex
-            batch_start = time.monotonic()
-            if uses_cohere_backend(model_id):
-                segment_count = 1
-                batch_result = await batch_manager.enqueue(
-                    audio_data=audio_data,
-                    request_id=request_id,
-                    segment_index=0,
-                    total_segments=1,
-                    processing_key=local_processing_key,
-                )
-                transcription_text = batch_result.text
-                batch_ids = [batch_result.batch_id]
-                transcription_duration_ms = round((time.monotonic() - batch_start) * 1000)
-            else:
-                segmented_audio = await asyncio.to_thread(split_audio_for_whisper, audio_data)
-                segment_count = len(segmented_audio)
-
-                if segment_count == 0:
-                    transcription_text = ""
-                    transcription_duration_ms = 0
-                else:
-                    batch_results = await asyncio.gather(
-                        *[
-                            batch_manager.enqueue(
-                                audio_data=segment,
-                                request_id=request_id,
-                                segment_index=index,
-                                total_segments=segment_count,
-                                processing_key=local_processing_key,
-                            )
-                            for index, segment in enumerate(segmented_audio)
-                        ]
-                    )
-                    transcription_text = combine_transcription_chunks([result.text for result in batch_results])
-                    batch_ids = sorted({result.batch_id for result in batch_results})
-                    transcription_duration_ms = round((time.monotonic() - batch_start) * 1000)
+        # ASR always uses the ordinary chunk/batch path.  Voice embeddings are
+        # generated afterwards in their own serialized GPU phase, so enabling
+        # ``voice_ident`` can never truncate a long recording to one model
+        # processor window.
+        used_batching = _should_use_batch(voice_ident)
+        batch_manager = request.app.state.whisper_batch_manager
+        request_id = uuid.uuid4().hex
+        batch_start = time.monotonic()
+        if uses_cohere_backend(model_id):
+            segment_count = 1
+            batch_result = await batch_manager.enqueue(
+                audio_data=audio_data,
+                request_id=request_id,
+                segment_index=0,
+                total_segments=1,
+                processing_key=local_processing_key,
+            )
+            transcription_text = batch_result.text
+            batch_ids = [batch_result.batch_id]
+            transcription_duration_ms = round((time.monotonic() - batch_start) * 1000)
         else:
+            segmented_audio = await asyncio.to_thread(split_audio_for_whisper, audio_data)
+            segment_count = len(segmented_audio)
+
+            if segment_count == 0:
+                transcription_text = ""
+                transcription_duration_ms = 0
+            else:
+                batch_results = await asyncio.gather(
+                    *[
+                        batch_manager.enqueue(
+                            audio_data=segment,
+                            request_id=request_id,
+                            segment_index=index,
+                            total_segments=segment_count,
+                            processing_key=local_processing_key,
+                        )
+                        for index, segment in enumerate(segmented_audio)
+                    ]
+                )
+                transcription_text = combine_transcription_chunks([result.text for result in batch_results])
+                batch_ids = sorted({result.batch_id for result in batch_results})
+                transcription_duration_ms = round((time.monotonic() - batch_start) * 1000)
+
+        if voice_ident and used_batching:
             local_gpu_lock = request.app.state.local_gpu_lock
-
-            def perform_tasks():
-                nonlocal transcription_text, voice_vector, transcription_duration_ms, voice_vector_duration_ms
-
-                t_start = time.monotonic()
-                local_model_id, device, cache, language, precision = local_processing_key
-                if not load_local_asr_model(local_model_id, device, cache, precision):
-                    load_error = get_last_local_asr_load_error()
-                    detail = "Lokales ASR-Modell konnte nicht geladen werden."
-                    if load_error:
-                        detail = f"{detail} Ursache: {load_error}"
-                    raise RuntimeError(detail)
-                transcription_text = transcribe_local_asr(audio_data, language=language)
-                transcription_duration_ms = round((time.monotonic() - t_start) * 1000)
-
-                if voice_ident:
-                    v_start = time.monotonic()
-                    try:
-                        print("[API-INFO] Generiere Stimm-Vektor...", file=sys.stderr)
-                        vector_np = generate_voice_vector(audio_data)
-                        voice_vector = vector_np.tolist()
-                        voice_vector_duration_ms = round((time.monotonic() - v_start) * 1000)
-                        print(f"[API-INFO] Stimm-Vektor erfolgreich generiert in {voice_vector_duration_ms}ms.", file=sys.stderr)
-                    except Exception as exc:
-                        error_detail = str(exc)
-                        if "omegaconf" in error_detail.lower():
-                            error_detail = (
-                                "Stimm-Vektor-Generierung fehlgeschlagen: Fehlende Python-Abhaengigkeit "
-                                "'omegaconf' auf dem Server. Bitte venv/requirements aktualisieren."
-                            )
-                        else:
-                            error_detail = f"Stimm-Vektor-Generierung fehlgeschlagen: {exc}"
-                        print(f"[API-FEHLER] {error_detail}", file=sys.stderr)
-                        voice_vector = None
-                        voice_vector_duration_ms = round((time.monotonic() - v_start) * 1000)
-
+            v_start = time.monotonic()
             try:
                 async with local_gpu_lock:
-                    print(f"[API] Lokaler GPU-Lock erworben (Engine: {engine}, Voice-ID: {voice_ident}).")
-                    await asyncio.to_thread(perform_tasks)
-                    print("[API] Lokaler GPU-Lock freigegeben.")
-            except HTTPException:
-                raise
+                    print("[API-INFO] Generiere ReDimNet2-Stimm-Vektor...", file=sys.stderr)
+                    vector_np = await run_blocking_gpu_phase(generate_voice_vector, audio_data)
+                voice_vector = vector_np.tolist()
+                voice_vector_duration_ms = round((time.monotonic() - v_start) * 1000)
+                print(
+                    f"[API-INFO] Stimm-Vektor erfolgreich generiert in {voice_vector_duration_ms}ms.",
+                    file=sys.stderr,
+                )
             except Exception as exc:
-                print(f"[API FEHLER] bei /transcribe/: {exc}", file=sys.stderr)
-                if not _is_authentication_error(exc):
-                    # Auth/Gated failures already carry a concise, actionable hint;
-                    # only dump a traceback for genuinely unexpected errors.
-                    import traceback
+                print(f"[API-FEHLER] Stimm-Vektor-Generierung fehlgeschlagen: {exc}", file=sys.stderr)
+                voice_vector = None
+                voice_vector_duration_ms = round((time.monotonic() - v_start) * 1000)
 
-                    traceback.print_exc()
-                raise HTTPException(status_code=500, detail=str(exc)) from exc
+        if repetition_filter_enabled(request.headers.get(REPETITION_FILTER_HEADER)):
+            transcription_text = filter_repeated_patterns(transcription_text)
 
         total_duration_ms = round((time.monotonic() - request_start_time) * 1000)
         log_entry: Dict[str, Any] = {
