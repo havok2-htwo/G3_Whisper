@@ -48,6 +48,7 @@ from .genesis_whisper_server_speaker_matching import (
 from .genesis_whisper_server_speaker_audio import build_unknown_speaker_audio_assets
 from .genesis_whisper_server_speaker_refinement import refine_speaker_turns
 from .genesis_whisper_server_storage import log_transcription
+from .genesis_whisper_server_turn_gate import finalize_segment_text, prefilter_turns
 from .genesis_whisper_server_vid import embedding_model_metadata, generate_voice_vector
 
 
@@ -428,6 +429,7 @@ async def _transcribe_turns(
     turns: Sequence[Mapping[str, Any]],
     overlaps: Sequence[Mapping[str, Any]],
     apply_repetition_filter: bool,
+    gate_enabled: bool = True,
 ) -> tuple[list[dict[str, Any]], int, str]:
     processing_key = _processing_key()
     model_id = processing_key[0]
@@ -454,25 +456,32 @@ async def _transcribe_turns(
         text = combine_transcription_chunks(chunk_texts)
         if apply_repetition_filter:
             text = filter_repeated_patterns(text)
+        disposition = None
+        if gate_enabled:
+            duration_ms = int(turn["end_ms"]) - int(turn["start_ms"])
+            text, disposition = finalize_segment_text(text, duration_ms)
+            if disposition == "drop":
+                continue
         if not text:
             continue
-        transcript_segments.append(
-            {
-                "index": turn_index,
-                "start_ms": int(turn["start_ms"]),
-                "end_ms": int(turn["end_ms"]),
-                "diarization_speaker_id": str(
-                    turn.get("original_speaker_id", turn["speaker_id"])
-                ),
-                **(
-                    {"refined_diarization_speaker_id": str(turn["speaker_id"])}
-                    if "original_speaker_id" in turn
-                    else {}
-                ),
-                "text": text,
-                "overlap": _segment_has_overlap(turn, overlaps),
-            }
-        )
+        segment = {
+            "index": turn_index,
+            "start_ms": int(turn["start_ms"]),
+            "end_ms": int(turn["end_ms"]),
+            "diarization_speaker_id": str(
+                turn.get("original_speaker_id", turn["speaker_id"])
+            ),
+            **(
+                {"refined_diarization_speaker_id": str(turn["speaker_id"])}
+                if "original_speaker_id" in turn
+                else {}
+            ),
+            "text": text,
+            "overlap": _segment_has_overlap(turn, overlaps),
+        }
+        if disposition == "asr_failure":
+            segment["asr_failure"] = True
+        transcript_segments.append(segment)
     return transcript_segments, round((time.monotonic() - started) * 1000), model_id
 
 
@@ -520,6 +529,7 @@ async def _process_diarization(
     audio: np.ndarray,
     configuration: Mapping[str, Any],
     apply_repetition_filter: bool,
+    gate_enabled: bool = True,
 ) -> tuple[dict[str, Any], dict[str, int], dict[str, Any], list[dict[str, Any]], str]:
     expected_speakers = configuration.get("expected_speakers")
     known_speakers = list(configuration.get("known_speakers") or [])
@@ -570,13 +580,18 @@ async def _process_diarization(
         speaker_clouds = refinement.speaker_clouds
         refinement_diagnostics = refinement.diagnostics
 
-    turns = _merge_exclusive_turns(effective_exclusive)
+    if gate_enabled:
+        turns, gate_diagnostics = prefilter_turns(effective_exclusive)
+    else:
+        turns = _merge_exclusive_turns(effective_exclusive)
+        gate_diagnostics = {"enabled": False}
     transcript_segments, transcription_ms, asr_model_id = await _transcribe_turns(
         http_request,
         audio,
         turns,
         overlaps,
         apply_repetition_filter,
+        gate_enabled,
     )
 
     try:
@@ -762,6 +777,7 @@ async def _process_diarization(
     }
     if refinement_diagnostics is not None:
         result["speaker_refinement"] = refinement_diagnostics
+    result["turn_gate"] = gate_diagnostics
     timings = {
         "diarization": dia_duration_ms,
         "transcription": transcription_ms,
@@ -828,6 +844,7 @@ def create_v2_api(app: FastAPI) -> FastAPI:
             decode_ms = round((time.monotonic() - decode_started) * 1000)
             audio_duration_ms = round(get_audio_duration_seconds(audio) * 1000)
             filter_enabled = repetition_filter_enabled(http_request.headers.get(REPETITION_FILTER_HEADER))
+            gate_enabled = http_request.headers.get("x-g3-turn-gate", "").strip().lower() not in ("off", "0", "false", "no")
             timings: dict[str, int] = {"decode": decode_ms}
             warnings: list[dict[str, Any]] = []
             result: dict[str, Any]
@@ -880,6 +897,7 @@ def create_v2_api(app: FastAPI) -> FastAPI:
                     audio,
                     parsed["diarization"],
                     filter_enabled,
+                    gate_enabled,
                 )
                 timings.update(mode_timings)
                 transcription_ms = mode_timings.get("transcription")
