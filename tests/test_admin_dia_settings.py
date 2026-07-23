@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest import mock
 
 from fastapi import FastAPI, HTTPException
+from fastapi.testclient import TestClient
 
 from backend import genesis_whisper_server_admin as admin
 from backend import genesis_whisper_server_storage as storage
@@ -121,6 +122,76 @@ class AdminDiaSettingsTests(unittest.TestCase):
         self.assertFalse(disabled["settings"]["cuda_memory_trim_after_batch"])
         persisted = json.loads(self.settings_file.read_text(encoding="utf-8"))
         self.assertFalse(persisted["cuda_memory_trim_after_batch"])
+
+    def test_debug_history_audio_setting_defaults_off_is_strict_and_survives_partial_updates(self) -> None:
+        endpoint = self._endpoint("/api/admin/settings", "PUT")
+        self.assertFalse(storage.DEFAULT_SETTINGS["debug_retain_history_audio"])
+        self.assertFalse(admin.current_settings["debug_retain_history_audio"])
+        self.assertFalse(
+            storage.normalize_settings(
+                {**storage.DEFAULT_SETTINGS, "debug_retain_history_audio": "true"}
+            )["debug_retain_history_audio"]
+        )
+        self.assertTrue(
+            storage.normalize_settings(
+                {**storage.DEFAULT_SETTINGS, "debug_retain_history_audio": True}
+            )["debug_retain_history_audio"]
+        )
+
+        enabled = asyncio.run(
+            endpoint(
+                admin.AdminSettingsPayload(debug_retain_history_audio=True),
+                {"username": "admin"},
+            )
+        )
+        self.assertTrue(enabled["settings"]["debug_retain_history_audio"])
+
+        partial = asyncio.run(
+            endpoint(
+                admin.AdminSettingsPayload(batch_wait_time_ms=7),
+                {"username": "admin"},
+            )
+        )
+        self.assertTrue(partial["settings"]["debug_retain_history_audio"])
+
+        disabled = asyncio.run(
+            endpoint(
+                admin.AdminSettingsPayload(debug_retain_history_audio=False),
+                {"username": "admin"},
+            )
+        )
+        self.assertFalse(disabled["settings"]["debug_retain_history_audio"])
+        persisted = json.loads(self.settings_file.read_text(encoding="utf-8"))
+        self.assertFalse(persisted["debug_retain_history_audio"])
+
+    def test_debug_history_audio_setting_rejects_non_boolean_json_values(self) -> None:
+        self.app.dependency_overrides[admin.require_admin] = lambda: {"username": "admin"}
+        try:
+            with TestClient(self.app) as client:
+                for invalid_value in ("true", "false", 1, 0):
+                    with self.subTest(invalid_value=invalid_value):
+                        response = client.put(
+                            "/api/admin/settings",
+                            json={"debug_retain_history_audio": invalid_value},
+                        )
+                        self.assertEqual(response.status_code, 422, response.text)
+        finally:
+            self.app.dependency_overrides.clear()
+
+    def test_disabling_debug_history_audio_immediately_updates_the_retention_store(self) -> None:
+        endpoint = self._endpoint("/api/admin/settings", "PUT")
+        admin.current_settings["debug_retain_history_audio"] = True
+
+        with mock.patch.object(admin, "set_history_audio_enabled") as set_enabled:
+            response = asyncio.run(
+                endpoint(
+                    admin.AdminSettingsPayload(debug_retain_history_audio=False),
+                    {"username": "admin"},
+                )
+            )
+
+        self.assertFalse(response["settings"]["debug_retain_history_audio"])
+        set_enabled.assert_called_once_with(False)
 
     def test_replacing_write_only_key_never_reflects_it_in_response(self) -> None:
         endpoint = self._endpoint("/api/admin/settings", "PUT")

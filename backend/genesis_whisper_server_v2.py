@@ -7,6 +7,7 @@ import datetime
 import inspect
 import json
 import math
+import sys
 import time
 import uuid
 from dataclasses import dataclass
@@ -27,11 +28,10 @@ from .genesis_whisper_server_dia_client import DiaClientError, diarize_v2
 from .genesis_whisper_server_globals import (
     current_settings,
     get_effective_transcription_language,
-    history_lock,
     settings_lock,
-    transcription_history,
     uses_cohere_backend,
 )
+from .genesis_whisper_server_history import append_history_entry, capture_history_audio
 from .genesis_whisper_server_gpu import run_blocking_gpu_phase
 from .genesis_whisper_server_local_asr_engine import get_last_local_asr_load_error, load_local_asr_model
 from .genesis_whisper_server_repetition import (
@@ -485,14 +485,19 @@ async def _generate_embedding(request: Request, audio: np.ndarray) -> tuple[list
 
 def _record_log(
     request: Request,
+    history_id: str,
     mode: str,
     model_id: str | None,
     total_duration_ms: int,
     transcription_duration_ms: int | None,
     embedding_duration_ms: int | None,
     transcript: str,
+    *,
+    retry_of: str | None = None,
+    existing_blob_id: str | None = None,
 ) -> None:
     entry = {
+        "history_id": history_id,
         "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "source_ip": request.client.host if request.client else "unknown",
         "engine": "v2",
@@ -502,9 +507,10 @@ def _record_log(
         "transcription_duration_ms": transcription_duration_ms,
         "voice_vector_duration_ms": embedding_duration_ms,
         "transcript": transcript,
+        "retry_of": retry_of,
+        "retry_mode": mode if mode in {"transcript", "transcript_embedding"} else None,
     }
-    with history_lock:
-        transcription_history.appendleft(entry)
+    append_history_entry(entry, existing_blob_id=existing_blob_id)
     log_transcription(entry)
 
 
@@ -886,6 +892,7 @@ def create_v2_api(app: FastAPI) -> FastAPI:
                 get_auth_store().record_api_key_usage(api_key_id, get_audio_duration_seconds(audio))
             _record_log(
                 http_request,
+                request_id,
                 mode,
                 asr_model_id,
                 total_ms,
@@ -893,6 +900,21 @@ def create_v2_api(app: FastAPI) -> FastAPI:
                 embedding_ms,
                 transcript_text,
             )
+            with settings_lock:
+                retain_history_audio = current_settings.get("debug_retain_history_audio", False) is True
+            if retain_history_audio:
+                try:
+                    await asyncio.to_thread(
+                        capture_history_audio,
+                        request_id,
+                        file.file,
+                        filename,
+                        file.content_type,
+                    )
+                except Exception as exc:
+                    # Retention is diagnostic-only and must never invalidate a
+                    # successful production request.
+                    print(f"[V2-WARNUNG] Debug-Audio konnte nicht gespeichert werden: {exc}", file=sys.stderr)
             return _success_response(
                 request_id,
                 {

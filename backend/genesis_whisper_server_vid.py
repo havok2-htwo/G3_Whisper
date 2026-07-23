@@ -9,6 +9,7 @@ import os
 import sys
 import tempfile
 import threading
+import time
 import urllib.request
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -53,6 +54,7 @@ REDIMNET_MIN_WINDOW_SAMPLES = int(REDIMNET_SAMPLE_RATE * REDIMNET_MIN_WINDOW_SEC
 # state throughput. OOM handling below still learns a smaller request-local
 # size for constrained cards.
 REDIMNET_DEFAULT_BATCH_SIZE = 16
+REDIMNET_MIN_CUDA_BATCH_SIZE = 2
 _ENERGY_VAD_FRAME_MS = 30
 _ENERGY_VAD_BATCH_FRAMES = 8192
 _ENERGY_VAD_MIN_RUN_MS = 150
@@ -87,6 +89,7 @@ _redimnet_components: Dict[str, Any] = {
     "device": None,
     "dtype": None,
     "cache_root": None,
+    "cuda_batch_size": None,
 }
 
 
@@ -177,6 +180,114 @@ def _resolve_device() -> torch.device:
     return torch.device("cpu")
 
 
+def _model_autocast(device: torch.device, dtype: torch.dtype):
+    return (
+        torch.autocast(device_type="cuda", dtype=dtype)
+        if device.type == "cuda"
+        else nullcontext()
+    )
+
+
+def _run_model_warmup(
+    model: Any,
+    device: torch.device,
+    dtype: torch.dtype,
+    batch_size: int,
+) -> None:
+    waveform = torch.zeros(
+        (batch_size, REDIMNET_WINDOW_SAMPLES),
+        dtype=torch.float32,
+        device=device,
+    )
+    embedding = None
+    try:
+        with torch.inference_mode(), _model_autocast(device, dtype):
+            embedding = model(waveform)
+        if embedding.ndim != 2 or embedding.shape != (
+            batch_size,
+            REDIMNET_EMBEDDING_DIMENSION,
+        ):
+            raise RuntimeError(
+                "ReDimNet2 lieferte beim Warmup eine unerwartete Batch-Form "
+                f"({tuple(embedding.shape)})."
+            )
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+    finally:
+        del waveform, embedding
+
+
+def _warm_model_shapes(
+    model: Any,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> int:
+    """Warm the only CUDA shapes used in production: one and the prepared max.
+
+    ReDimNet/PyTorch incurs roughly 2.5 seconds of one-time kernel preparation for
+    every previously unseen batch dimension on the target stack. Running arbitrary
+    tail sizes therefore caused later short requests to spike even though the model
+    itself was already resident. Production inference now uses batch 1 for the
+    common single-window microphone case and pads every larger batch to one prepared
+    maximum. That keeps the fast path to two stable CUDA shapes without compiling all
+    16 possible dimensions or retaining their individual workspaces.
+    """
+
+    _run_model_warmup(model, device, dtype, 1)
+    if device.type != "cuda" or REDIMNET_DEFAULT_BATCH_SIZE == 1:
+        return REDIMNET_DEFAULT_BATCH_SIZE
+
+    candidate = REDIMNET_DEFAULT_BATCH_SIZE
+    while candidate >= REDIMNET_MIN_CUDA_BATCH_SIZE:
+        try:
+            _run_model_warmup(model, device, dtype, candidate)
+            return candidate
+        except RuntimeError as exc:
+            if "out of memory" not in str(exc).lower():
+                raise
+            candidate //= 2
+            if torch.cuda.is_available():
+                # Emergency-only recovery. Normal operation deliberately keeps the
+                # prepared allocator state; an OOM cannot be retried while failed
+                # allocations are still retained by the process cache.
+                torch.cuda.empty_cache()
+            print(
+                "[WARNUNG-VID] ReDimNet2-Warmup hatte zu wenig CUDA-Speicher; "
+                f"reduziere vorbereitete Batchgroesse auf {candidate}.",
+                file=sys.stderr,
+            )
+
+    return 1
+
+
+def _inference_batch_size(current_size: int, device_type: str, prepared_cuda_batch_size: int) -> int:
+    """Return a stable model batch shape while preserving the one-window fast path."""
+
+    if current_size <= 0:
+        raise ValueError("current_size muss positiv sein.")
+    if device_type != "cuda" or current_size == 1:
+        return current_size
+    prepared = max(1, int(prepared_cuda_batch_size))
+    if current_size > prepared:
+        raise ValueError("current_size darf die vorbereitete CUDA-Batchgroesse nicht ueberschreiten.")
+    return prepared
+
+
+def _prepare_waveform_batch(
+    windows: Sequence[VoiceWindow],
+    inference_batch_size: int,
+) -> np.ndarray:
+    if not windows or inference_batch_size < len(windows):
+        raise ValueError("Ungueltige ReDimNet2-Inferenz-Batchgroesse.")
+    batch = np.zeros(
+        (inference_batch_size, REDIMNET_WINDOW_SAMPLES),
+        dtype=np.float32,
+    )
+    for index, window in enumerate(windows):
+        batch[index] = _fit_window(window.audio)
+    return batch
+
+
 def load_vid_model() -> bool:
     """Load the single pinned ReDimNet2 model once and verify its weights."""
 
@@ -192,6 +303,11 @@ def load_vid_model() -> bool:
             _ensure_verified_checkpoint(hub_dir)
 
             device = _resolve_device()
+            cuda_allocated_before = 0
+            cuda_reserved_before = 0
+            if device.type == "cuda":
+                cuda_allocated_before = int(torch.cuda.memory_allocated(device))
+                cuda_reserved_before = int(torch.cuda.memory_reserved(device))
             print(
                 f"[INFO-VID] Lade {REDIMNET_MODEL_NAME} ({REDIMNET_MODEL_VARIANT}) auf {device}...",
                 file=sys.stderr,
@@ -215,23 +331,9 @@ def load_vid_model() -> bool:
                 # FP32 while using CUDA autocast runs the neural backbone in
                 # FP16 without breaking the frontend's FP32 pre-emphasis buffer.
                 dtype = torch.float16 if device.type == "cuda" else torch.float32
-                warmup = torch.zeros(
-                    (1, REDIMNET_WINDOW_SAMPLES),
-                    dtype=torch.float32,
-                    device=device,
-                )
-                autocast = (
-                    torch.autocast(device_type="cuda", dtype=torch.float16)
-                    if device.type == "cuda"
-                    else nullcontext()
-                )
-                with torch.inference_mode(), autocast:
-                    warmup_embedding = model(warmup)
-                if warmup_embedding.shape[-1] != REDIMNET_EMBEDDING_DIMENSION:
-                    raise RuntimeError(
-                        "ReDimNet2 lieferte eine unerwartete Embedding-Dimension "
-                        f"({warmup_embedding.shape[-1]})."
-                    )
+                warmup_started = time.monotonic()
+                cuda_batch_size = _warm_model_shapes(model, device, dtype)
+                warmup_duration_ms = round((time.monotonic() - warmup_started) * 1000)
 
             _redimnet_components.update(
                 {
@@ -239,12 +341,33 @@ def load_vid_model() -> bool:
                     "device": device,
                     "dtype": dtype,
                     "cache_root": str(cache_root),
+                    "cuda_batch_size": cuda_batch_size,
                 }
             )
-            print("[INFO-VID] ReDimNet2 erfolgreich geladen und aufgewaermt.", file=sys.stderr)
+            memory_note = ""
+            if device.type == "cuda":
+                allocated_delta = max(0, int(torch.cuda.memory_allocated(device)) - cuda_allocated_before)
+                reserved_delta = max(0, int(torch.cuda.memory_reserved(device)) - cuda_reserved_before)
+                memory_note = (
+                    f" Zusatz-VRAM: {allocated_delta / (1024 ** 2):.0f} MiB allokiert, "
+                    f"{reserved_delta / (1024 ** 2):.0f} MiB reserviert."
+                )
+            print(
+                "[INFO-VID] ReDimNet2 erfolgreich fuer CUDA-Batchformen "
+                f"1 und {cuda_batch_size} aufgewaermt ({warmup_duration_ms} ms).{memory_note}",
+                file=sys.stderr,
+            )
             return True
         except Exception as exc:
-            _redimnet_components.update({"model": None, "device": None, "dtype": None, "cache_root": None})
+            _redimnet_components.update(
+                {
+                    "model": None,
+                    "device": None,
+                    "dtype": None,
+                    "cache_root": None,
+                    "cuda_batch_size": None,
+                }
+            )
             print(f"[FEHLER-VID] ReDimNet2 konnte nicht geladen werden: {exc}", file=sys.stderr)
             return False
 
@@ -459,29 +582,39 @@ def embed_voice_windows(
     model = _redimnet_components["model"]
     device: torch.device = _redimnet_components["device"]
     dtype: torch.dtype = _redimnet_components["dtype"]
+    prepared_cuda_batch_size = max(
+        1,
+        int(_redimnet_components.get("cuda_batch_size") or REDIMNET_DEFAULT_BATCH_SIZE),
+    )
+    effective_batch_size = min(effective_batch_size, prepared_cuda_batch_size)
     output: list[EmbeddedVoiceWindow] = []
 
     with shared_gpu_lease():
         while pending:
             current_size = min(effective_batch_size, len(pending))
             current = pending[:current_size]
-            batch_np = np.stack([_fit_window(window.audio) for window in current], axis=0)
+            model_batch_size = _inference_batch_size(
+                current_size,
+                device.type,
+                prepared_cuda_batch_size,
+            )
+            batch_np = _prepare_waveform_batch(current, model_batch_size)
             waveform = None
             embeddings = None
             retry_after_oom = False
             try:
                 waveform = torch.from_numpy(batch_np).to(device=device, dtype=torch.float32)
-                autocast = (
-                    torch.autocast(device_type="cuda", dtype=dtype)
-                    if device.type == "cuda"
-                    else nullcontext()
-                )
-                with torch.inference_mode(), autocast:
+                with torch.inference_mode(), _model_autocast(device, dtype):
                     embeddings = model(waveform)
                 embeddings_np = embeddings.detach().to(device="cpu", dtype=torch.float32).numpy()
             except RuntimeError as exc:
                 if "out of memory" in str(exc).lower() and current_size > 1:
-                    effective_batch_size = max(1, current_size // 2)
+                    prepared_cuda_batch_size = max(1, model_batch_size // 2)
+                    effective_batch_size = min(
+                        max(1, current_size // 2),
+                        prepared_cuda_batch_size,
+                    )
+                    _redimnet_components["cuda_batch_size"] = prepared_cuda_batch_size
                     retry_after_oom = True
                 else:
                     raise
@@ -497,10 +630,10 @@ def embed_voice_windows(
                     torch.cuda.empty_cache()
                 continue
 
-            if embeddings_np.ndim != 2 or embeddings_np.shape[0] != current_size:
+            if embeddings_np.ndim != 2 or embeddings_np.shape[0] != model_batch_size:
                 raise RuntimeError("ReDimNet2 lieferte eine unerwartete Batch-Form.")
 
-            for window, vector in zip(current, embeddings_np):
+            for window, vector in zip(current, embeddings_np[:current_size]):
                 vector = np.asarray(vector, dtype=np.float32).reshape(-1)
                 if len(vector) != REDIMNET_EMBEDDING_DIMENSION or not np.all(np.isfinite(vector)):
                     raise RuntimeError("ReDimNet2 lieferte einen ungueltigen Vektor.")

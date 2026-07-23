@@ -15,6 +15,8 @@ from .genesis_whisper_server_admin import create_admin_api
 from .genesis_whisper_server_api import create_api, process_local_asr_batch
 from .genesis_whisper_server_batching import WhisperBatchManager
 from .genesis_whisper_server_globals import current_settings
+from .genesis_whisper_server_history import reset_history_audio_store, shutdown_history_audio_store
+from .genesis_whisper_server_gpu import run_blocking_gpu_phase
 from .genesis_whisper_server_storage import load_settings
 from .genesis_whisper_server_v2 import create_v2_api
 
@@ -72,11 +74,32 @@ def _warmup_local_asr() -> None:
             pass
 
 
+def _warmup_redimnet() -> None:
+    """Eager-load both stable ReDimNet CUDA shapes after the ASR cache trim."""
+
+    try:
+        from .genesis_whisper_server_vid import load_vid_model
+
+        print("[WARMUP-VID] Lade und waerme ReDimNet2 fuer niedrige Tail-Latenz...", file=sys.stderr)
+        if not load_vid_model():
+            print("[WARMUP-VID] ReDimNet2-Warmup fehlgeschlagen; lazy Retry bleibt aktiv.", file=sys.stderr)
+            return
+        print("[WARMUP-VID] ReDimNet2 ist bereit.", file=sys.stderr)
+    except Exception as exc:
+        print(
+            f"[WARMUP-VID] nicht-kritischer Warmup-Fehler ({type(exc).__name__}: {exc}).",
+            file=sys.stderr,
+        )
+
+
 async def startup_server(app: FastAPI):
     print("--- GENESIS Transcription Server wird gestartet (FastAPI + React + lokales ASR-Batching) ---", file=sys.stderr)
 
     current_settings.clear()
     current_settings.update(load_settings())
+    reset_history_audio_store(
+        enabled=current_settings.get("debug_retain_history_audio", False) is True,
+    )
     print(
         f"Geladene Start-Konfiguration: "
         f"Lokales ASR-Modell='{current_settings['local_model']}', "
@@ -95,13 +118,17 @@ async def startup_server(app: FastAPI):
 
     # Eager-load + warm the ASR model on a sample clip so the first real request is fast,
     # then trim the CUDA cache. Best-effort: a warmup failure must not block startup.
-    await asyncio.to_thread(_warmup_local_asr)
+    await run_blocking_gpu_phase(_warmup_local_asr)
+    # ReDimNet is warmed after the ASR-only trim. Its two prepared CUDA shapes and
+    # allocator pool intentionally stay resident; normal queue cleanup never clears it.
+    await run_blocking_gpu_phase(_warmup_redimnet)
 
 
 async def shutdown_server(app: FastAPI):
     batch_manager = getattr(app.state, "whisper_batch_manager", None)
     if batch_manager is not None:
         await batch_manager.stop()
+    shutdown_history_audio_store()
 
 
 @asynccontextmanager

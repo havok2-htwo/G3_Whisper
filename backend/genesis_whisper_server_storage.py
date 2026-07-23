@@ -29,6 +29,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "batch_max_segments": 16,
     "batch_max_audio_seconds": 300.0,
     "cuda_memory_trim_after_batch": False,
+    "debug_retain_history_audio": False,
     "huggingface_token": "",
     "dia_server_base_url": "",
     "dia_api_key": "",
@@ -103,6 +104,16 @@ def normalize_settings(settings: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         configured_cuda_trim
         if isinstance(configured_cuda_trim, bool)
         else DEFAULT_SETTINGS["cuda_memory_trim_after_batch"]
+    )
+
+    configured_history_audio_debug = source.get(
+        "debug_retain_history_audio",
+        DEFAULT_SETTINGS["debug_retain_history_audio"],
+    )
+    normalized["debug_retain_history_audio"] = (
+        configured_history_audio_debug
+        if isinstance(configured_history_audio_debug, bool)
+        else DEFAULT_SETTINGS["debug_retain_history_audio"]
     )
 
     return normalized

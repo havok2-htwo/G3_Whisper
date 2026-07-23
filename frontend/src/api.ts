@@ -13,6 +13,7 @@ export type AdminSettings = {
   batch_max_segments: number;
   batch_max_audio_seconds: number;
   cuda_memory_trim_after_batch: boolean;
+  debug_retain_history_audio: boolean;
   huggingface_token: string;
   dia_server_base_url: string;
   dia_api_key: string;
@@ -20,6 +21,47 @@ export type AdminSettings = {
   dia_api_key_source: "settings" | "environment" | "none";
   dia_server_base_url_effective: string;
   dia_server_base_url_source: "settings" | "environment" | "none";
+};
+
+export type HistoryRetryMode = "transcript" | "transcript_embedding" | null;
+
+export type HistoryDebugAudio = {
+  status: "available" | "not_retained";
+  reason?: string | null;
+  filename?: string | null;
+  content_type?: string | null;
+  size_bytes?: number | null;
+  capture_duration_ms?: number | null;
+};
+
+export type HistoryEntry = {
+  history_id: string;
+  timestamp?: string;
+  source_ip?: string;
+  engine?: string;
+  model_id?: string;
+  transcription_language?: string;
+  mode?: string | null;
+  total_duration_ms: number | null;
+  transcription_duration_ms: number | null;
+  voice_vector_duration_ms: number | null;
+  transcript?: string;
+  batched?: boolean;
+  segment_count?: number;
+  retry_of: string | null;
+  retry_mode: HistoryRetryMode;
+  debug_audio: HistoryDebugAudio | null;
+};
+
+export type HistoryRetryResponse = {
+  ok: boolean;
+  history_id: string;
+  retry_of: string;
+  mode: Exclude<HistoryRetryMode, null>;
+  status: "completed" | "partial";
+  timings_ms: Record<string, number>;
+  transcript: string;
+  warnings: Array<{ code: string; message: string }>;
 };
 
 export type DiaConnectionTestResponse = {
@@ -61,7 +103,7 @@ export type StatsResponse = {
     avg_total_duration_ms: number | null;
     avg_transcription_duration_ms: number | null;
   };
-  history: Array<Record<string, unknown>>;
+  history: HistoryEntry[];
 };
 
 export type QueueResponse = {
@@ -402,6 +444,67 @@ export async function deleteModel(modelId: string, storagePath: string) {
 
 export async function getStats() {
   return requestJson<StatsResponse>("/api/admin/stats", { method: "GET" });
+}
+
+export async function retryHistoryAudio(historyId: string) {
+  return requestJson<HistoryRetryResponse>(
+    `/api/admin/history/${encodeURIComponent(historyId)}/retry`,
+    { method: "POST" },
+  );
+}
+
+function filenameFromContentDisposition(headerValue: string | null) {
+  if (!headerValue) {
+    return null;
+  }
+
+  const encodedMatch = headerValue.match(/filename\*=UTF-8''([^;]+)/i);
+  if (encodedMatch?.[1]) {
+    try {
+      return decodeURIComponent(encodedMatch[1].trim().replace(/^"|"$/g, ""));
+    } catch {
+      // Fall through to the plain filename form.
+    }
+  }
+
+  const plainMatch = headerValue.match(/filename="([^"]+)"|filename=([^;]+)/i);
+  return (plainMatch?.[1] ?? plainMatch?.[2] ?? "").trim() || null;
+}
+
+function safeDownloadFilename(value: string | null, fallback: string) {
+  const leafName = (value ?? "").split(/[\\/]/).pop()?.trim() ?? "";
+  const sanitized = leafName.replace(/[\u0000-\u001f<>:"/\\|?*]/g, "_");
+  return sanitized && sanitized !== "." && sanitized !== ".." ? sanitized : fallback;
+}
+
+export async function downloadHistoryAudio(historyId: string, fallbackFilename?: string | null) {
+  const response = await fetch(`/api/admin/history/${encodeURIComponent(historyId)}/audio`, {
+    method: "GET",
+    credentials: "include",
+  });
+
+  if (response.status === 401) {
+    throw new Error("unauthorized");
+  }
+  if (response.status === 403) {
+    const payload = (await response.json().catch(() => ({}))) as { detail?: string };
+    if (payload.detail === "password_change_required") {
+      throw new Error("password_change_required");
+    }
+    throw new Error(payload.detail ?? "Forbidden");
+  }
+  if (!response.ok) {
+    throw new Error(await readErrorDetail(response));
+  }
+
+  const fallback = safeDownloadFilename(fallbackFilename ?? null, `history-audio-${historyId}`);
+  return {
+    blob: await response.blob(),
+    filename: safeDownloadFilename(
+      filenameFromContentDisposition(response.headers.get("Content-Disposition")),
+      fallback,
+    ),
+  };
 }
 
 export async function getQueue() {
