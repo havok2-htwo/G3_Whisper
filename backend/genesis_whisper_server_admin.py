@@ -10,7 +10,8 @@ from urllib.parse import urlsplit
 import requests
 import torch
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, Response, UploadFile
-from pydantic import BaseModel
+from fastapi.responses import FileResponse
+from pydantic import BaseModel, StrictBool
 
 from .genesis_whisper_server_audio import get_audio_duration_seconds, load_audio_file
 from .genesis_whisper_server_auth import (
@@ -37,6 +38,15 @@ from .genesis_whisper_server_globals import (
     transcription_history,
     uses_cohere_backend,
 )
+from .genesis_whisper_server_history import (
+    HistoryAudioLease,
+    acquire_history_audio,
+    begin_history_retry,
+    end_history_retry,
+    get_history_entry,
+    get_history_snapshot,
+    set_history_audio_enabled,
+)
 from .genesis_whisper_server_local_asr_engine import get_last_local_asr_load_error, load_local_asr_model
 from .genesis_whisper_server_gpu import run_blocking_gpu_phase, shared_gpu_lease
 from .genesis_whisper_server_model_manager import (
@@ -62,9 +72,24 @@ class AdminSettingsPayload(BaseModel):
     batch_max_segments: int | None = None
     batch_max_audio_seconds: float | None = None
     cuda_memory_trim_after_batch: bool | None = None
+    debug_retain_history_audio: StrictBool | None = None
     huggingface_token: str | None = None
     dia_server_base_url: str | None = None
     dia_api_key: str | None = None
+
+
+class _HistoryAudioFileResponse(FileResponse):
+    """Release the pin even when Starlette exits before background tasks run."""
+
+    def __init__(self, *args, lease: HistoryAudioLease, **kwargs) -> None:
+        self._history_audio_lease = lease
+        super().__init__(*args, **kwargs)
+
+    async def __call__(self, scope, receive, send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            self._history_audio_lease.release()
 
 
 class DiaConnectionTestPayload(BaseModel):
@@ -414,6 +439,8 @@ def create_admin_api(app: FastAPI) -> FastAPI:
             current_settings.clear()
             current_settings.update(saved_settings)
 
+        set_history_audio_enabled(saved_settings.get("debug_retain_history_audio", False) is True)
+
         model_settings_changed = any(
             previous_settings.get(key) != saved_settings.get(key)
             for key in ("local_model", "local_gpu_device", "local_model_precision", "local_model_cache_path")
@@ -556,8 +583,7 @@ def create_admin_api(app: FastAPI) -> FastAPI:
     async def admin_stats(_: dict[str, str] = Depends(require_admin)):
         with history_lock:
             history_items = list(transcription_history)
-
-        recent_history = history_items[:25]
+        recent_history = get_history_snapshot(limit=25)
         total_requests = len(history_items)
         total_duration_values = [entry.get("total_duration_ms", 0) for entry in history_items if entry.get("total_duration_ms") is not None]
         transcription_values = [entry.get("transcription_duration_ms", 0) for entry in history_items if entry.get("transcription_duration_ms") is not None]
@@ -570,6 +596,116 @@ def create_admin_api(app: FastAPI) -> FastAPI:
             },
             "history": recent_history,
         }
+
+    @app.get("/api/admin/history/{history_id}/audio")
+    async def admin_history_audio(
+        history_id: str,
+        _: dict[str, str] = Depends(require_admin),
+    ):
+        lease = acquire_history_audio(history_id)
+        if lease is None:
+            raise HTTPException(status_code=404, detail="Debug audio is unavailable or has expired.")
+        try:
+            return _HistoryAudioFileResponse(
+                lease.path,
+                lease=lease,
+                media_type=lease.content_type,
+                filename=lease.filename,
+                headers={
+                    "Cache-Control": "private, no-store",
+                    "X-Content-Type-Options": "nosniff",
+                },
+            )
+        except Exception:
+            lease.release()
+            raise
+
+    @app.post("/api/admin/history/{history_id}/retry")
+    async def admin_retry_history_audio(
+        history_id: str,
+        request: Request,
+        _: dict[str, str] = Depends(require_admin),
+    ):
+        source_entry = get_history_entry(history_id)
+        retry_mode = str((source_entry or {}).get("retry_mode") or "")
+        if retry_mode not in {"transcript", "transcript_embedding"}:
+            if source_entry is None:
+                raise HTTPException(status_code=404, detail="History item was not found.")
+            raise HTTPException(status_code=422, detail="This history mode cannot be retried directly.")
+
+        lease = acquire_history_audio(history_id)
+        if lease is None:
+            raise HTTPException(status_code=404, detail="Debug audio is unavailable or has expired.")
+        if not begin_history_retry(history_id):
+            lease.release()
+            raise HTTPException(status_code=409, detail="A retry for this history item is already running.")
+
+        retry_id = uuid.uuid4().hex
+        request_started = time.monotonic()
+        try:
+            from .genesis_whisper_server_v2 import _generate_embedding, _record_log, _transcribe_audio
+
+            try:
+                with open(lease.path, "rb") as retained_file:
+                    decode_started = time.monotonic()
+                    audio = await asyncio.to_thread(load_audio_file, retained_file, lease.filename)
+                    decode_ms = round((time.monotonic() - decode_started) * 1000)
+            except HTTPException:
+                raise
+            except Exception as exc:
+                raise HTTPException(status_code=400, detail=f"Retained audio could not be decoded: {exc}") from exc
+
+            transcript, transcription_ms, _, model_id = await _transcribe_audio(request, audio)
+            transcript = filter_repeated_patterns(transcript)
+            embedding_ms: int | None = None
+            warnings: list[dict[str, str]] = []
+            if retry_mode == "transcript_embedding":
+                embedding_started = time.monotonic()
+                try:
+                    await _generate_embedding(request, audio)
+                except ValueError as exc:
+                    embedding_ms = round((time.monotonic() - embedding_started) * 1000)
+                    warnings.append({"code": "VOICE_EMBEDDING_UNAVAILABLE", "message": str(exc)})
+                else:
+                    embedding_ms = round((time.monotonic() - embedding_started) * 1000)
+
+            total_ms = round((time.monotonic() - request_started) * 1000)
+            _record_log(
+                request,
+                retry_id,
+                retry_mode,
+                model_id,
+                total_ms,
+                transcription_ms,
+                embedding_ms,
+                transcript,
+                retry_of=history_id,
+                existing_blob_id=lease.blob_id,
+            )
+            timings: dict[str, int] = {
+                "decode": decode_ms,
+                "transcription": transcription_ms,
+                "total": total_ms,
+            }
+            if embedding_ms is not None:
+                timings["embedding"] = embedding_ms
+            return {
+                "ok": True,
+                "history_id": retry_id,
+                "retry_of": history_id,
+                "mode": retry_mode,
+                "status": "partial" if warnings else "completed",
+                "timings_ms": timings,
+                "transcript": transcript,
+                "warnings": warnings,
+            }
+        except HTTPException:
+            raise
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        finally:
+            end_history_retry(history_id)
+            lease.release()
 
     @app.get("/api/admin/queue")
     async def admin_queue(request: Request, _: dict[str, str] = Depends(require_admin)):

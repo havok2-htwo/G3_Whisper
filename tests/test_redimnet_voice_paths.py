@@ -206,6 +206,30 @@ class RedimNetVoicePathTests(unittest.TestCase):
         self.assertEqual(calls[0], (4, 4))
         self.assertEqual([item.start_ms for item in embedded], [index * 3000 for index in range(10)])
 
+    def test_cuda_inference_uses_only_single_or_prepared_batch_shape(self) -> None:
+        self.assertEqual(vid._inference_batch_size(1, "cuda", 16), 1)
+        for current_size in range(2, 17):
+            with self.subTest(current_size=current_size):
+                self.assertEqual(vid._inference_batch_size(current_size, "cuda", 16), 16)
+        self.assertEqual(vid._inference_batch_size(3, "cpu", 16), 3)
+
+    def test_cuda_batch_padding_preserves_real_windows_and_zero_fills_tail(self) -> None:
+        windows = [
+            vid.VoiceWindow(
+                audio=np.full(vid.REDIMNET_WINDOW_SAMPLES, 0.01 * (index + 1), dtype=np.float32),
+                start_ms=index,
+                end_ms=index + 1,
+            )
+            for index in range(3)
+        ]
+
+        prepared = vid._prepare_waveform_batch(windows, 16)
+
+        self.assertEqual(prepared.shape, (16, vid.REDIMNET_WINDOW_SAMPLES))
+        np.testing.assert_array_equal(prepared[0], windows[0].audio)
+        np.testing.assert_array_equal(prepared[2], windows[2].audio)
+        self.assertTrue(np.all(prepared[3:] == 0.0))
+
     def test_embedding_oom_backoff_retries_in_order_and_keeps_smaller_batch(self) -> None:
         calls: list[int] = []
 

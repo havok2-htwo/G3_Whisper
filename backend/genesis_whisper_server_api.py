@@ -15,11 +15,10 @@ from .genesis_whisper_server_chunking import combine_transcription_chunks, split
 from .genesis_whisper_server_globals import (
     current_settings,
     get_effective_transcription_language,
-    history_lock,
     settings_lock,
-    transcription_history,
     uses_cohere_backend,
 )
+from .genesis_whisper_server_history import append_history_entry, capture_history_audio
 from .genesis_whisper_server_local_asr_engine import (
     get_last_local_asr_load_error,
     load_local_asr_model,
@@ -167,10 +166,13 @@ def create_api(app: FastAPI) -> FastAPI:
             transcription_text = filter_repeated_patterns(transcription_text)
 
         total_duration_ms = round((time.monotonic() - request_start_time) * 1000)
+        history_mode = "transcript_embedding" if voice_ident else "transcript"
         log_entry: Dict[str, Any] = {
+            "history_id": request_id,
             "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "source_ip": source_ip,
             "engine": engine,
+            "mode": history_mode,
             "model_id": model_id,
             "transcription_language": effective_language,
             "total_duration_ms": total_duration_ms,
@@ -181,11 +183,28 @@ def create_api(app: FastAPI) -> FastAPI:
             "batched": used_batching,
             "segment_count": segment_count,
             "batch_ids": batch_ids,
+            "retry_of": None,
+            "retry_mode": history_mode,
         }
 
-        with history_lock:
-            transcription_history.appendleft(log_entry)
+        append_history_entry(log_entry)
         log_transcription(log_entry)
+
+        with settings_lock:
+            retain_history_audio = current_settings.get("debug_retain_history_audio", False) is True
+        if retain_history_audio:
+            try:
+                await asyncio.to_thread(
+                    capture_history_audio,
+                    request_id,
+                    file.file,
+                    filename,
+                    file.content_type,
+                )
+            except Exception as exc:
+                # Debug retention must never turn an otherwise valid
+                # transcription into an API error.
+                print(f"[API-WARNUNG] Debug-Audio konnte nicht gespeichert werden: {exc}", file=sys.stderr)
 
         if api_key_id:
             get_auth_store().record_api_key_usage(api_key_id, get_audio_duration_seconds(audio_data))

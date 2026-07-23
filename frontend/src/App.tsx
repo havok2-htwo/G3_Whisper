@@ -9,6 +9,7 @@ import {
   ApiKeyInfo,
   BenchmarkResponse,
   CreatedApiKey,
+  HistoryEntry,
   ManagedModel,
   QueueResponse,
   SettingsResponse,
@@ -20,6 +21,7 @@ import {
   deleteApiKey,
   deleteDiaApiKey,
   deleteModel,
+  downloadHistoryAudio,
   downloadModel,
   getModels,
   getQueue,
@@ -29,24 +31,12 @@ import {
   login,
   logout,
   processAudioV2,
+  retryHistoryAudio,
   runBenchmark,
   saveSettings,
   testDiaConnection,
   whoami,
 } from "./api";
-
-type HistoryEntry = {
-  timestamp?: string;
-  source_ip?: string;
-  engine?: string;
-  model_id?: string;
-  transcription_language?: string;
-  total_duration_ms?: number;
-  transcription_duration_ms?: number;
-  transcript?: string;
-  batched?: boolean;
-  segment_count?: number;
-};
 
 type BatchEntry = {
   batch_id?: string;
@@ -68,6 +58,7 @@ type DashboardHistoryPoint = {
 };
 
 type AuthState = "loading" | "login" | "change" | "ready";
+type HistoryActionKind = "retry" | "download";
 
 const PIPELINE_MODES: Array<{ value: AudioProcessMode; label: string; description: string }> = [
   { value: "embedding", label: "Voice embedding", description: "One normalized 192-D ReDimNet2 voice vector." },
@@ -100,6 +91,7 @@ const emptySettings: AdminSettings = {
   batch_max_segments: 16,
   batch_max_audio_seconds: 60.0,
   cuda_memory_trim_after_batch: false,
+  debug_retain_history_audio: false,
   huggingface_token: "",
   dia_server_base_url: "",
   dia_api_key: "",
@@ -141,6 +133,35 @@ function formatVram(value: number | null | undefined) {
     minimumFractionDigits: 1,
     maximumFractionDigits: 1,
   }).format(value)} MB`;
+}
+
+function formatBytes(value: number | null | undefined) {
+  if (value === null || value === undefined || Number.isNaN(value)) {
+    return "n/a";
+  }
+  if (value >= 1024 * 1024) {
+    return `${formatFixed(value / (1024 * 1024), 1)} MiB`;
+  }
+  if (value >= 1024) {
+    return `${formatFixed(value / 1024, 1)} KiB`;
+  }
+  return `${formatValue(value)} B`;
+}
+
+function describeDebugAudioReason(reason?: string | null) {
+  if (reason === "file_too_large") {
+    return "Not retained: file exceeds the 256 MiB limit.";
+  }
+  if (reason === "storage_quota") {
+    return "Not retained: debug-audio storage quota reached.";
+  }
+  if (reason === "capture_failed") {
+    return "Not retained: capture failed.";
+  }
+  if (reason === "disabled") {
+    return "Audio retention was disabled.";
+  }
+  return reason ? `Not retained: ${reason.replace(/_/g, " ")}.` : "Audio was not retained.";
 }
 
 function formatDateTime(value?: string | null) {
@@ -525,6 +546,8 @@ export default function App() {
   const [pipelineJsonExpanded, setPipelineJsonExpanded] = useState(false);
   const [modelActionId, setModelActionId] = useState<string | null>(null);
   const [modelActionKind, setModelActionKind] = useState<"refresh" | "download" | "delete" | null>(null);
+  const [historyActions, setHistoryActions] = useState<Record<string, HistoryActionKind>>({});
+  const [historyActionErrors, setHistoryActionErrors] = useState<Record<string, string>>({});
   const hasDownloadingModels = managedModels.some((model) => model.status === "downloading");
   const isReady = authState === "ready";
 
@@ -560,6 +583,8 @@ export default function App() {
       setPipelineJsonExpanded(false);
       setModelActionId(null);
       setModelActionKind(null);
+      setHistoryActions({});
+      setHistoryActionErrors({});
       setActionMessage("");
       setGlobalError("");
     });
@@ -623,6 +648,71 @@ export default function App() {
       });
     } catch (error) {
       handleApiError(error, "Live polling failed.");
+    }
+  }
+
+  function beginHistoryAction(historyId: string, action: HistoryActionKind) {
+    setHistoryActions((current) => ({ ...current, [historyId]: action }));
+    setHistoryActionErrors((current) => {
+      const next = { ...current };
+      delete next[historyId];
+      return next;
+    });
+  }
+
+  function finishHistoryAction(historyId: string) {
+    setHistoryActions((current) => {
+      const next = { ...current };
+      delete next[historyId];
+      return next;
+    });
+  }
+
+  function reportHistoryActionError(historyId: string, error: unknown, fallback: string) {
+    const message = error instanceof Error ? error.message : fallback;
+    if (message === "unauthorized" || message === "password_change_required") {
+      handleApiError(error, fallback);
+      return;
+    }
+    setHistoryActionErrors((current) => ({ ...current, [historyId]: message }));
+  }
+
+  async function handleRetryHistoryEntry(entry: HistoryEntry) {
+    if (!entry.history_id || entry.debug_audio?.status !== "available" || !entry.retry_mode) {
+      return;
+    }
+
+    beginHistoryAction(entry.history_id, "retry");
+    try {
+      await retryHistoryAudio(entry.history_id);
+      await refreshOperationalData();
+    } catch (error) {
+      reportHistoryActionError(entry.history_id, error, "The retained audio could not be retried.");
+    } finally {
+      finishHistoryAction(entry.history_id);
+    }
+  }
+
+  async function handleDownloadHistoryEntry(entry: HistoryEntry) {
+    if (!entry.history_id || entry.debug_audio?.status !== "available") {
+      return;
+    }
+
+    beginHistoryAction(entry.history_id, "download");
+    try {
+      const download = await downloadHistoryAudio(entry.history_id, entry.debug_audio.filename);
+      const objectUrl = URL.createObjectURL(download.blob);
+      const link = document.createElement("a");
+      link.href = objectUrl;
+      link.download = download.filename;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.setTimeout(() => URL.revokeObjectURL(objectUrl), 0);
+    } catch (error) {
+      reportHistoryActionError(entry.history_id, error, "The retained audio could not be downloaded.");
+    } finally {
+      finishHistoryAction(entry.history_id);
     }
   }
 
@@ -1191,7 +1281,7 @@ export default function App() {
     );
   }
 
-  const history = (stats?.history ?? []) as HistoryEntry[];
+  const history = stats?.history ?? [];
   const recentBatches = (queue?.recent_batches ?? []) as BatchEntry[];
   const latestBatchRealtime = computeBatchRealtime(recentBatches[0]);
   const configuredDeviceLabel = resolveOptionLabel(settingsOptions.devices, settingsForm.local_gpu_device, "Auto");
@@ -2140,6 +2230,21 @@ export default function App() {
               </span>
             </label>
 
+            <label className="settings-checkbox sensitive-setting full-width">
+              <input
+                type="checkbox"
+                checked={settingsForm.debug_retain_history_audio}
+                onChange={(event) => updateSetting("debug_retain_history_audio", event.target.checked)}
+              />
+              <span>
+                Retain original audio for history debugging
+                <small>
+                  Sensitive audio data: keeps the byte-identical upload only while its item remains in the visible
+                  history. Disabling this setting deletes every retained debug recording immediately after saving.
+                </small>
+              </span>
+            </label>
+
             <div className="form-actions full-width">
               <button type="submit" disabled={saveBusy}>
                 {saveBusy ? "Saving..." : "Save Settings"}
@@ -2319,11 +2424,15 @@ export default function App() {
           <div>
             <span className="eyebrow">History</span>
             <h2>Latest Transcriptions</h2>
+            <p className="section-copy">
+              Transcription and embedding are wall-clock timings and include time spent waiting for the request queue
+              and the shared GPU lock.
+            </p>
           </div>
         </div>
 
         <div className="table-wrap">
-          <table>
+          <table className="history-table">
             <thead>
               <tr>
                 <th>Time</th>
@@ -2331,31 +2440,91 @@ export default function App() {
                 <th>Model</th>
                 <th>Language</th>
                 <th>Total</th>
-                <th>Transcription</th>
+                <th title="Wall time including request-queue and shared GPU-lock waits.">Transcription</th>
+                <th title="Wall time including request-queue and shared GPU-lock waits.">Embedding</th>
                 <th>Batch</th>
                 <th>Segments</th>
                 <th>Text</th>
+                <th>Audio / Actions</th>
               </tr>
             </thead>
             <tbody>
               {history.length === 0 && (
                 <tr>
-                  <td colSpan={9}>No transcription history recorded yet.</td>
+                  <td colSpan={11}>No transcription history recorded yet.</td>
                 </tr>
               )}
-              {history.map((entry, index) => (
-                <tr key={`${entry.timestamp ?? "row"}-${index}`}>
-                  <td>{entry.timestamp ?? "n/a"}</td>
-                  <td>{entry.source_ip ?? "n/a"}</td>
-                  <td>{entry.model_id ?? entry.engine ?? "n/a"}</td>
-                  <td>{entry.transcription_language ?? "n/a"}</td>
-                  <td>{formatValue(entry.total_duration_ms, " ms")}</td>
-                  <td>{formatValue(entry.transcription_duration_ms, " ms")}</td>
-                  <td>{entry.batched ? "yes" : "no"}</td>
-                  <td>{entry.segment_count ?? 1}</td>
-                  <td className="transcript-cell">{entry.transcript ?? ""}</td>
-                </tr>
-              ))}
+              {history.map((entry) => {
+                const action = historyActions[entry.history_id];
+                const audioAvailable = entry.debug_audio?.status === "available";
+                return (
+                  <tr key={entry.history_id}>
+                    <td>
+                      {entry.timestamp ?? "n/a"}
+                      {entry.retry_of && (
+                        <small className="history-retry-reference" title={entry.retry_of}>
+                          Retry of {entry.retry_of.slice(0, 8)}
+                        </small>
+                      )}
+                    </td>
+                    <td>{entry.source_ip ?? "n/a"}</td>
+                    <td>
+                      {entry.model_id ?? entry.engine ?? "n/a"}
+                      {entry.mode && <small className="history-mode">{entry.mode}</small>}
+                    </td>
+                    <td>{entry.transcription_language ?? "n/a"}</td>
+                    <td>{formatValue(entry.total_duration_ms, " ms")}</td>
+                    <td>{formatValue(entry.transcription_duration_ms, " ms")}</td>
+                    <td>{formatValue(entry.voice_vector_duration_ms, " ms")}</td>
+                    <td>{entry.batched ? "yes" : "no"}</td>
+                    <td>{entry.segment_count ?? 1}</td>
+                    <td className="transcript-cell">{entry.transcript ?? ""}</td>
+                    <td className="history-audio-cell">
+                      {audioAvailable ? (
+                        <>
+                          <div className="history-audio-meta">
+                            <strong>{entry.debug_audio?.filename || "Retained original audio"}</strong>
+                            <small>
+                              {formatBytes(entry.debug_audio?.size_bytes)}
+                              {entry.debug_audio?.capture_duration_ms !== null
+                                && entry.debug_audio?.capture_duration_ms !== undefined
+                                ? ` · captured in ${formatValue(entry.debug_audio.capture_duration_ms, " ms")}`
+                                : ""}
+                            </small>
+                          </div>
+                          <div className="table-actions history-actions">
+                            {entry.retry_mode && (
+                              <button
+                                type="button"
+                                className="secondary-button"
+                                disabled={Boolean(action)}
+                                onClick={() => void handleRetryHistoryEntry(entry)}
+                              >
+                                {action === "retry" ? "Retrying..." : "Retry"}
+                              </button>
+                            )}
+                            <button
+                              type="button"
+                              className="ghost-button"
+                              disabled={Boolean(action)}
+                              onClick={() => void handleDownloadHistoryEntry(entry)}
+                            >
+                              {action === "download" ? "Downloading..." : "Download"}
+                            </button>
+                          </div>
+                        </>
+                      ) : (
+                        <span className="muted">{describeDebugAudioReason(entry.debug_audio?.reason)}</span>
+                      )}
+                      {historyActionErrors[entry.history_id] && (
+                        <p className="history-action-error" role="alert">
+                          {historyActionErrors[entry.history_id]}
+                        </p>
+                      )}
+                    </td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         </div>

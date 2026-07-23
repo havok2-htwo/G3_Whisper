@@ -286,6 +286,19 @@ button:disabled {
   line-height: 1.45;
 }
 
+.settings-form label.settings-checkbox.sensitive-setting {
+  border-color: rgba(255, 193, 108, 0.3);
+  background: rgba(255, 193, 108, 0.08);
+}
+
+.settings-form label.settings-checkbox.sensitive-setting input {
+  accent-color: var(--accent);
+}
+
+.settings-form label.settings-checkbox.sensitive-setting small {
+  color: #e4cfb3;
+}
+
 .full-width {
   grid-column: 1 / -1;
 }
@@ -1226,6 +1239,63 @@ tbody tr:nth-child(even) {
 
 .transcript-cell {
   min-width: 360px;
+  white-space: normal;
+}
+
+.history-table {
+  min-width: 1540px;
+}
+
+.history-table th:nth-child(5),
+.history-table th:nth-child(6),
+.history-table th:nth-child(7),
+.history-table td:nth-child(5),
+.history-table td:nth-child(6),
+.history-table td:nth-child(7) {
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.history-mode,
+.history-retry-reference,
+.history-audio-meta small {
+  display: block;
+  margin-top: 0.35rem;
+  color: var(--text-dim);
+  font-size: 0.78rem;
+  line-height: 1.4;
+}
+
+.history-mode {
+  text-transform: capitalize;
+}
+
+.history-audio-cell {
+  min-width: 260px;
+  white-space: normal;
+}
+
+.history-audio-meta strong {
+  display: block;
+  max-width: 300px;
+  color: #fff7e9;
+  overflow-wrap: anywhere;
+}
+
+.history-actions {
+  margin-top: 0.75rem;
+}
+
+.history-actions button {
+  padding: 0.6rem 0.9rem;
+}
+
+.history-action-error {
+  max-width: 300px;
+  margin: 0.7rem 0 0;
+  color: var(--danger);
+  font-size: 0.82rem;
+  line-height: 1.4;
   white-space: normal;
 }
 

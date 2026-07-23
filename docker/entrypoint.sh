@@ -24,6 +24,7 @@ if [ ! -f "${SETTINGS_FILE}" ]; then
     "batch_max_segments": 16,
     "batch_max_audio_seconds": 300.0,
     "cuda_memory_trim_after_batch": false,
+    "debug_retain_history_audio": false,
     "huggingface_token": ""
 }
 JSON

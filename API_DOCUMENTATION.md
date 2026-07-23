@@ -828,6 +828,7 @@ Response shape:
     "batch_max_segments": 16,
     "batch_max_audio_seconds": 300.0,
     "cuda_memory_trim_after_batch": false,
+    "debug_retain_history_audio": false,
     "huggingface_token": "hf_xxx",
     "dia_server_base_url": "http://dia:7864",
     "dia_server_base_url_effective": "http://dia:7864",
@@ -895,6 +896,7 @@ Request body:
   "batch_max_segments": 16,
   "batch_max_audio_seconds": 300.0,
   "cuda_memory_trim_after_batch": false,
+  "debug_retain_history_audio": false,
   "huggingface_token": "hf_xxx",
   "dia_server_base_url": "http://dia:7864",
   "dia_api_key": "dia_xxx"
@@ -915,6 +917,7 @@ Notes:
 - `huggingface_token` can be stored via this route and is then reused by later manual cache downloads and runtime model loads.
 - `batch_max_segments` defaults to `16` for both the worker batch and its bounded enqueue window.
 - `cuda_memory_trim_after_batch` defaults to `false`. When enabled, Whisper may release unused process-wide CUDA allocator memory only after the ASR queue has drained; keeping it disabled preserves the warm Cohere/ReDimNet allocator state for low latency.
+- `debug_retain_history_audio` defaults to `false`. When enabled, successful public API requests may retain their byte-identical original upload for the 25-row admin history; disabling it blocks access immediately and purges retained audio after active readers finish.
 - updates are partial merges; omitted fields keep their saved value, so older admin clients cannot remove newer settings
 - `dia_server_base_url` configures the DIA service used by diarization requests
 - `dia_api_key` is write-only: a non-empty value replaces the saved key, while an omitted or empty value preserves it
@@ -1074,11 +1077,79 @@ History entry fields currently include:
 - `total_duration_ms`
 - `transcription_duration_ms`
 - `voice_vector_duration_ms`
+- `history_id`
+- `retry_of`
+- `retry_mode` (`transcript`, `transcript_embedding`, or `null`)
+- `debug_audio`
 - `transcript`
 - `voice_ident_requested`
 - `batched`
 - `segment_count`
 - `batch_ids`
+
+`transcription_duration_ms` and `voice_vector_duration_ms` are separate wall-clock phase
+measurements. They include queue and GPU-lock waiting, which makes the history useful for
+diagnosing occasional latency spikes. `debug_audio` is a sanitized object such as:
+
+```json
+{
+  "status": "available",
+  "filename": "recording.m4a",
+  "content_type": "audio/mp4",
+  "size_bytes": 203728759,
+  "capture_duration_ms": 91
+}
+```
+
+Non-retained rows use `status: "not_retained"` and may report `disabled`,
+`not_captured`, `capture_in_progress`, `file_too_large`, `storage_quota`, or
+`capture_failed` as the reason.
+Neither this response nor `logs/transcription_log.jsonl` contains audio bytes, Base64 data,
+temporary filenames, or internal filesystem paths.
+
+### `GET /api/admin/history/{history_id}/audio`
+
+Purpose:
+
+- downloads the byte-identical original upload retained for a visible history row
+- requires a completed admin session
+
+The response uses the original media type and a sanitized download filename. It includes
+`Cache-Control: private, no-store` and `X-Content-Type-Options: nosniff`. Missing, evicted,
+disabled, or otherwise unavailable audio returns HTTP 404. Each original is limited to
+256 MiB, the complete debug store is limited to 2 GiB, and retained files are purged when
+they leave the 25 visible rows. Disabling debug capture immediately blocks new downloads;
+an already active download completes before its underlying file is removed.
+
+### `POST /api/admin/history/{history_id}/retry`
+
+Purpose:
+
+- retranscribes retained audio on the server without a browser download and re-upload
+- uses current model/server settings and creates a new history entry with its own timings
+
+Supported retry modes are `transcript` and `transcript_embedding`. Legacy
+`voice_ident=true` maps to `transcript_embedding`; legacy/v1 requests without voice
+identification map to `transcript`; v2 transcript modes remain unchanged. Pure `embedding`
+and `diarization` entries expose `retry_mode: null` because DIA profiles and request metadata
+are not retained.
+
+A successful response identifies the new entry and its source:
+
+```json
+{
+  "ok": true,
+  "history_id": "new-history-id",
+  "retry_of": "source-history-id",
+  "mode": "transcript_embedding",
+  "status": "completed"
+}
+```
+
+Unavailable or evicted source audio returns HTTP 404. A second simultaneous retry of the
+same source returns HTTP 409, and a retained pure-embedding or diarization item returns HTTP
+422. Retry and download leases keep the source file alive until the active operation finishes,
+even if the source row is evicted or capture is disabled meanwhile.
 
 ### `GET /api/admin/queue`
 
@@ -1181,4 +1252,5 @@ Special case:
 - Cohere uses the active saved language, and when the server setting is `auto`, it falls back to `de`
 - For gated Cohere models, the runtime loader reuses the saved Hugging Face token and completes incomplete local snapshots before loading from the finished local snapshot.
 - admin benchmark and public transcription log into [`logs`](x:/dev/G3_WHISPER/logs)
+- optional history debug audio lives under `logs/debug-audio`, is never written into JSONL, and is purged on start, shutdown, or setting disable; capture time is reported separately and is excluded from pipeline phase timings
 - the optional `GENESIS_GPU_LEASE_PATH` file lock can serialize CUDA phases with a colocated DIA process; without it only each service's in-process locks apply

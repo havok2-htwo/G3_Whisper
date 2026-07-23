@@ -16,7 +16,7 @@ For gated Hugging Face models, the runtime loader can use the saved admin-settin
 
 This file acts as the central functional and technical reference for this repository. If the code and the README diverge, the following rule applies: The README must be updated in the same work step until it accurately reflects the current state again.
 
-Endpoint-level request/response details live in [API_DOCUMENTATION.md](x:/dev/G3_WHISPER/API_DOCUMENTATION.md). This README remains the central operational and architectural overview.
+Endpoint-level request/response details live in [API_DOCUMENTATION.md](x:/dev/G3_WHISPER/API_DOCUMENTATION.md). The handoff specification for updating applications from legacy 512-D profiles to the current API v2/ReDimNet2 192-D contract lives in [CLIENT_MIGRATION_192D.md](x:/dev/G3_WHISPER/CLIENT_MIGRATION_192D.md). This README remains the central operational and architectural overview.
 
 ## Maintenance Requirements
 
@@ -392,18 +392,38 @@ The local ASR path already utilizes several optimizations:
 - optional idle CUDA-cache trimming, disabled by default to preserve low tail latency (see "Idle VRAM Trimming" below)
 - ReDimNet2 window batching (default 16) with automatic CUDA-OOM batch-size reduction,
   one shared batch stream across DIA speakers, block-vectorized VAD, and lazy audio windows
-  that avoid full recording/speech copies
+  that avoid full recording/speech copies. CUDA eagerly prepares only batch shapes 1 and
+  16; partial multi-window batches are zero-padded to 16 and their padding outputs are
+  discarded. This prevents the roughly 2.5-second first-use compilation/autotuning spike
+  for every possible tail size while retaining the one-window microphone fast path. This
+  internal window batch is separate from the ASR queue setting `batch_max_segments` and is
+  deliberately fixed to the two prepared shapes rather than exposed as an arbitrary value.
 - serial DIA, ASR, and ReDim phases on the local GPU; an optional cross-process file lease coordinates Whisper and DIA when they share a physical GPU
+- one persistent host worker for every local CUDA phase, so cuDNN/cuBLAS handles and lazy
+  kernel state are reused instead of being rebuilt when `asyncio.to_thread` selects a
+  different worker
 
 ### Startup Warmup
 
 The configured ASR model is now eager-loaded at startup and warmed with `testaudio/Testaudio_02.wav`
 (previously the model was loaded lazily on the first request). After the warmup transcription the
-CUDA cache is trimmed, so the first real request is already warm without leaving an oversized
-reserved pool behind.
+ASR CUDA cache is trimmed. ReDimNet is then eager-loaded and warmed for its stable one-window and
+maximum-batch CUDA shapes. Its prepared allocator pool deliberately remains resident, so both the
+first embedding and later DIA tail batches avoid first-shape latency spikes.
 
-The warmup is best-effort: any warmup failure (for example an unsupported precision) is logged and
-never blocks server startup.
+Both warmups are best-effort: any warmup failure (for example an unsupported precision) is logged
+and never blocks server startup. ReDimNet batch 16 does not duplicate the model: model weights stay
+single-copy, while only temporary activations and the retained CUDA allocator pool scale with the
+prepared batch shape. If batch 16 cannot fit, warmup and runtime automatically halve it.
+
+On the current RTX 5090/PyTorch stack, the retained ReDimNet allocation measured about 52 MiB for
+the model and 5.6 GiB of reserved allocator/workspace capacity after preparing batch 16. The latter
+is reusable cache rather than 16 copies of the weights, but it is still real reserved VRAM and can
+vary with GPU, CUDA, and PyTorch versions.
+
+ASR warmup, ReDimNet warmup, queued ASR inference, and later embedding inference all execute on the
+same persistent host worker. CUDA work was already serialized by the application GPU lock; pinning
+it to one worker therefore removes thread-local cold starts without reducing supported throughput.
 
 ### Idle VRAM Trimming
 
@@ -500,6 +520,9 @@ Important files:
   - admin users, browser sessions, and client API key metadata
 - `logs/transcription_log.jsonl`
   - JSONL log of transcription requests
+- `logs/debug-audio/`
+  - temporary, byte-identical original uploads retained only while the opt-in history-audio debug setting is enabled
+  - purged when the setting is disabled and on every server start and shutdown; audio never enters the JSONL log
 
 ## Default Settings
 
@@ -514,6 +537,7 @@ The active default values come from [backend/genesis_whisper_server_storage.py](
 - `batch_max_segments`: `16`
 - `batch_max_audio_seconds`: `300.0`
 - `cuda_memory_trim_after_batch`: `false`
+- `debug_retain_history_audio`: `false`
 - `huggingface_token`: empty string
 - `dia_server_base_url`: empty string (falls back to `DIA_SERVER_BASE_URL`)
 - `dia_api_key`: empty string (write-only; falls back to `DIA_SERVER_API_KEY`)
@@ -538,6 +562,8 @@ Active admin routes:
 - `POST /api/admin/models/download`
 - `POST /api/admin/models/delete`
 - `GET /api/admin/stats`
+- `GET /api/admin/history/{history_id}/audio`
+- `POST /api/admin/history/{history_id}/retry`
 - `GET /api/admin/queue`
 - `POST /api/admin/benchmark`
 
@@ -547,6 +573,22 @@ entered in the admin UI. The saved URL/key take precedence over their environmen
 fallbacks. The key is write-only in responses, a blank update preserves it, and only
 `DELETE /api/admin/settings/dia-api-key` removes the saved value explicitly. The
 connection test calls the configured DIA `GET /v2/capabilities` endpoint.
+
+`debug_retain_history_audio` is a diagnostics-only, default-off setting for investigating
+sporadic latency and transcription differences. When enabled, successful requests through
+`/transcribe/`, `/v1/audio/transcriptions`, and every v2 mode retain the original upload for
+as long as their row remains among the 25 entries shown in the admin history. Failed requests
+and admin benchmarks are not retained. Each source file is limited to 256 MiB and the shared
+debug store to 2 GiB; capture failures never fail an otherwise successful transcription.
+
+Available history audio can be downloaded byte-for-byte or retried directly from its table
+row. Retries use the current server/model settings and preserve the original transcript mode:
+legacy voice identification maps to `transcript_embedding`, while legacy/v1 transcription and
+v2 `transcript` map to `transcript`. v2 `transcript_embedding` remains unchanged. Pure
+`embedding` and `diarization` entries can be downloaded for manual testing but cannot be
+retried directly because speaker profiles and DIA request metadata are intentionally not
+retained. Disabling the setting immediately blocks new access and safely removes all retained
+audio after active downloads or retries finish.
 
 ## API Endpoints
 

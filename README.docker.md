@@ -63,8 +63,8 @@ docker compose logs -f
 ```
 
 > **First start is slow.** No models are baked into the images; each service downloads
-> them into a named volume on first boot (Whisper `whisper-large-v3-turbo` ~1.6 GB at
-> warmup, ReDimNet2-B6 on first embedding, and Cohere lazily; OmniVoice
+> them into a named volume on first boot (Whisper `whisper-large-v3-turbo` ~1.6 GB and
+> ReDimNet2-B6 during startup warmup, and Cohere lazily; OmniVoice
 > `k2-fsa/OmniVoice` ~3 GB). The
 > server only accepts connections after warmup, which is why the healthchecks use a long
 > `start_period`.
