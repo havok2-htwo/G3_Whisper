@@ -26,6 +26,7 @@ from .genesis_whisper_server_batching import enqueue_audio_segments_bounded
 from .genesis_whisper_server_chunking import combine_transcription_chunks, split_audio_for_whisper
 from .genesis_whisper_server_dia_client import DiaClientError, diarize_v2
 from .genesis_whisper_server_globals import (
+    SUPPORTED_LANGUAGE_VALUES,
     current_settings,
     get_effective_transcription_language,
     settings_lock,
@@ -139,18 +140,33 @@ def _parse_request_json(raw_value: str | None) -> dict[str, Any]:
         raise V2ApiError(400, "INVALID_JSON", "Multipart-Feld 'request' enthaelt kein gueltiges JSON.") from exc
     if not isinstance(payload, dict):
         raise V2ApiError(422, "INVALID_REQUEST", "Request-JSON muss ein Objekt sein.")
-    _validate_object_keys(payload, {"schema_version", "mode", "diarization"}, "request")
+    _validate_object_keys(payload, {"schema_version", "mode", "diarization", "language"}, "request")
     if payload.get("schema_version") != V2_SCHEMA_VERSION:
         raise V2ApiError(422, "INVALID_REQUEST", "schema_version muss '2.0' sein.")
     mode = str(payload.get("mode") or "").strip()
     if mode not in V2_MODES:
         raise V2ApiError(422, "INVALID_REQUEST", f"Unbekannter Modus '{mode}'.")
 
+    language_value = payload.get("language")
+    normalized_language: str | None = None
+    if language_value is not None:
+        if not isinstance(language_value, str) or not language_value.strip():
+            raise V2ApiError(422, "INVALID_REQUEST", "language muss ein nicht-leerer String sein.")
+        if mode == "embedding":
+            raise V2ApiError(422, "INVALID_REQUEST", "language ist im Modus 'embedding' nicht erlaubt.")
+        normalized_language = language_value.strip().lower()
+        if normalized_language not in SUPPORTED_LANGUAGE_VALUES:
+            raise V2ApiError(
+                422,
+                "INVALID_REQUEST",
+                f"language '{normalized_language}' wird nicht unterstuetzt.",
+            )
+
     diarization = payload.get("diarization")
     if mode != "diarization":
         if diarization is not None:
             raise V2ApiError(422, "INVALID_REQUEST", "diarization ist nur im Modus 'diarization' erlaubt.")
-        return {"schema_version": V2_SCHEMA_VERSION, "mode": mode}
+        return {"schema_version": V2_SCHEMA_VERSION, "mode": mode, "language": normalized_language}
     if diarization is None:
         diarization = {}
     if not isinstance(diarization, dict):
@@ -208,6 +224,7 @@ def _parse_request_json(raw_value: str | None) -> dict[str, Any]:
     return {
         "schema_version": V2_SCHEMA_VERSION,
         "mode": mode,
+        "language": normalized_language,
         "diarization": {
             "expected_speakers": expected,
             "known_speakers": known,
@@ -362,8 +379,25 @@ def _ensure_asr_model(processing_key: tuple[str, str, str, str, str]) -> None:
     raise RuntimeError(detail)
 
 
-async def _transcribe_audio(request: Request, audio: np.ndarray) -> tuple[str, int, int, str]:
-    processing_key = _processing_key()
+def _request_processing_key(language_override: str | None) -> tuple[str, str, str, str, str]:
+    """Server settings key, with the per-request language override applied.
+
+    The batch worker groups requests by this key, so an overridden language
+    simply forms its own batch group and reaches the engine unchanged.
+    """
+
+    key = _processing_key()
+    if language_override:
+        return (key[0], key[1], key[2], language_override, key[4])
+    return key
+
+
+async def _transcribe_audio(
+    request: Request,
+    audio: np.ndarray,
+    language_override: str | None = None,
+) -> tuple[str, int, int, str]:
+    processing_key = _request_processing_key(language_override)
     model_id = processing_key[0]
     batch_manager = request.app.state.whisper_batch_manager
     request_token = uuid.uuid4().hex
@@ -440,8 +474,9 @@ async def _transcribe_turns(
     overlaps: Sequence[Mapping[str, Any]],
     apply_repetition_filter: bool,
     gate_enabled: bool = True,
+    language_override: str | None = None,
 ) -> tuple[list[dict[str, Any]], int, str]:
-    processing_key = _processing_key()
+    processing_key = _request_processing_key(language_override)
     model_id = processing_key[0]
     turn_chunk_counts: list[int] = []
     prepared_chunks: list[np.ndarray] = []
@@ -501,6 +536,7 @@ async def _wxc_transcribe_segments(
     gated_turns: Sequence[Mapping[str, Any]],
     overlaps: Sequence[Mapping[str, Any]],
     apply_repetition_filter: bool,
+    language_override: str | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, int], dict[str, Any], str]:
     """Transcribe-first WXC path: large Silero chunks -> ASR -> word alignment ->
     gated speaker skeleton -> sentence-level 192D verification.
@@ -509,7 +545,7 @@ async def _wxc_transcribe_segments(
     fall back to the legacy per-turn path instead of returning silence.
     """
 
-    processing_key = _processing_key()
+    processing_key = _request_processing_key(language_override)
     timings: dict[str, int] = {}
 
     vad_started = time.monotonic()
@@ -626,6 +662,7 @@ async def _process_diarization(
     apply_repetition_filter: bool,
     gate_enabled: bool = True,
     pipeline_mode: str = "wxc",
+    language_override: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, int], dict[str, Any], list[dict[str, Any]], str]:
     expected_speakers = configuration.get("expected_speakers")
     known_speakers = list(configuration.get("known_speakers") or [])
@@ -694,6 +731,7 @@ async def _process_diarization(
                     turns,
                     overlaps,
                     apply_repetition_filter,
+                    language_override,
                 )
             )
             transcription_ms = extra_timings.get("transcription", 0)
@@ -712,6 +750,7 @@ async def _process_diarization(
             overlaps,
             apply_repetition_filter,
             gate_enabled,
+            language_override,
         )
 
     try:
@@ -992,14 +1031,18 @@ def create_v2_api(app: FastAPI) -> FastAPI:
                 models["embedding"] = embedding_model_metadata()
                 result = {"embedding": {"vector": vector}}
             elif mode == "transcript":
-                transcript_text, transcription_ms, _, asr_model_id = await _transcribe_audio(http_request, audio)
+                transcript_text, transcription_ms, _, asr_model_id = await _transcribe_audio(
+                    http_request, audio, parsed.get("language")
+                )
                 if filter_enabled:
                     transcript_text = filter_repeated_patterns(transcript_text)
                 timings["transcription"] = transcription_ms
                 models["asr"] = {"id": asr_model_id}
                 result = {"transcript": {"text": transcript_text}}
             elif mode == "transcript_embedding":
-                transcript_text, transcription_ms, _, asr_model_id = await _transcribe_audio(http_request, audio)
+                transcript_text, transcription_ms, _, asr_model_id = await _transcribe_audio(
+                    http_request, audio, parsed.get("language")
+                )
                 if filter_enabled:
                     transcript_text = filter_repeated_patterns(transcript_text)
                 embedding_started = time.monotonic()
@@ -1031,12 +1074,18 @@ def create_v2_api(app: FastAPI) -> FastAPI:
                     filter_enabled,
                     gate_enabled,
                     pipeline_mode,
+                    parsed.get("language"),
                 )
                 timings.update(mode_timings)
                 transcription_ms = mode_timings.get("transcription")
                 embedding_ms = mode_timings.get("embedding")
                 asr_model_id = (models.get("asr") or {}).get("id")
 
+            if asr_model_id and isinstance(models.get("asr"), dict):
+                models["asr"]["language"] = get_effective_transcription_language(
+                    asr_model_id,
+                    parsed.get("language") or _processing_key()[3],
+                )
             total_ms = round((time.monotonic() - request_started) * 1000)
             timings["total"] = total_ms
             if api_key_id:

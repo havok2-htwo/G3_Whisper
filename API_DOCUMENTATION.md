@@ -59,7 +59,25 @@ The four modes are:
 - `embedding`: returns exactly one 192-D recording-level ReDimNet2 embedding; it does not run ASR or DIA
 - `transcript`: returns a cleaned transcript; it does not run DIA
 - `transcript_embedding`: returns a cleaned transcript and normally one 192-D recording-level embedding; it does not run DIA. If no suitable embedding window exists, the transcript is still returned as a partial success with `embedding: null` and a warning
-- `diarization`: runs G3_DIA, transcribes exclusive speaker turns, matches optional known ReDimNet2 profiles, and returns unknown/unresolved speaker vectors
+- `diarization`: runs G3_DIA and, by default, the WXC transcribe-first pipeline
+  (Silero speech regions -> ~25s superchunks -> ASR -> MMS_FA word timestamps ->
+  gated DIA speaker skeleton -> sentence-level 192D speaker verification), matches
+  optional known ReDimNet2 profiles, and returns unknown/unresolved speaker vectors.
+  The header `X-G3-Pipeline: turns` restores the legacy per-turn ASR path for one
+  request. Diarization responses additionally carry `result.chunking`,
+  `result.speaker_verification` (applied relabelings with `verified_from` on the
+  segment, plus flags), the timing keys `vad` / `alignment` / `verification`, and a
+  guaranteed unknown-speaker listening sample with `audio.quality_tier`
+  (`clean` | `relaxed` | `turns_fallback`).
+
+The request JSON accepts an optional top-level `language` (for example `"de"`,
+`"en"`, or `"auto"`; values match the admin language options). It overrides the
+saved server language for the ASR of this request in `transcript`,
+`transcript_embedding`, and `diarization` mode. In `embedding` mode the field is
+rejected with HTTP 422 because no ASR runs. `models.asr.language` in the response
+echoes the effective value (with `auto` resolving to `de` on the Cohere backend).
+The heavy diarization pipeline never runs in the other modes; their processing is
+unchanged apart from the optional language override.
 
 Only `diarization` contacts the configured DIA server. Recording-level embeddings in
 the other modes use VAD, fixed three-second windows, batched inference, quality
