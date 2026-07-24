@@ -848,6 +848,18 @@ async def _process_diarization(
                     **{key: value for key, value in assignment.items() if key != "speaker_id"},
                 }
             )
+            if cloud.status != "ready":
+                # The identity was accepted under the stricter imperfect-cluster bar;
+                # keep the audio-quality caveat visible instead of hiding it behind a
+                # confident "known" label.
+                warnings.append(
+                    {
+                        "code": "KNOWN_SPEAKER_IMPERFECT_CLUSTER",
+                        "speaker_id": assignment["speaker_id"],
+                        "diarization_speaker_id": dia_speaker_id,
+                        "status": cloud.status,
+                    }
+                )
             continue
         unresolved_match = unresolved_clusters.get(dia_speaker_id)
         speaker_kind = "unresolved" if unresolved_match else "unknown"

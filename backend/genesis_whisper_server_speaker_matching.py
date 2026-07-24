@@ -25,6 +25,13 @@ DOMINANT_WEIGHT_SHARE_MIN = 0.60
 DOMINANT_SECOND_RATIO_MIN = 1.50
 MATCH_COSINE_MIN = 0.60
 MATCH_SUPPORT_MIN = 0.60
+# Non-ready clusters (low_support / mixed_cluster) are not trusted for a borderline
+# identity, but an explicitly enrolled profile that matches one overwhelmingly is
+# almost certainly that person. They are identified under this stricter bar while the
+# cluster status stays in the response as the audio-quality caveat. Support is measured
+# per cluster window, so a genuine blend of two people cannot clear the support gate.
+MATCH_IMPERFECT_COSINE_MIN = 0.75
+MATCH_IMPERFECT_SUPPORT_MIN = 0.80
 MATCH_STABILITY_MARGIN_MIN = 0.04
 SAMPLE_SUPPORT_COSINE_MIN = 0.50
 MATCH_DUMMY_SCORE = 0.55
@@ -683,16 +690,22 @@ def match_known_speakers(
             score = float(profile_cloud.prototype @ cluster_cloud.prototype)
             cosine_scores[profile_index, cluster_index] = score
             inlier_matrix, weights = cluster_evidence[cluster_index]
-            supports[profile_index, cluster_index] = _profile_support(
+            support_value = _profile_support(
                 inlier_matrix,
                 weights,
                 profile_matrix,
             )
-            valid_edges[profile_index, cluster_index] = (
-                cluster_cloud.status == "ready"
-                and score >= MATCH_COSINE_MIN
-                and supports[profile_index, cluster_index] >= MATCH_SUPPORT_MIN
-            )
+            supports[profile_index, cluster_index] = support_value
+            if cluster_cloud.status == "ready":
+                valid_edges[profile_index, cluster_index] = (
+                    score >= MATCH_COSINE_MIN and support_value >= MATCH_SUPPORT_MIN
+                )
+            else:
+                # low_support / mixed_cluster: strong evidence only (see constants).
+                valid_edges[profile_index, cluster_index] = (
+                    score >= MATCH_IMPERFECT_COSINE_MIN
+                    and support_value >= MATCH_IMPERFECT_SUPPORT_MIN
+                )
 
     assignment_scores = np.full(
         (profile_count, cluster_count + profile_count),

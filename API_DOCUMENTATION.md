@@ -70,6 +70,14 @@ The four modes are:
   guaranteed unknown-speaker listening sample with `audio.quality_tier`
   (`clean` | `relaxed` | `turns_fallback`).
 
+Known-speaker matching: a `ready` cluster matches a profile under cosine `0.60` /
+support `0.60`. A cluster flagged `low_support` or `mixed_cluster` is only assigned
+to an explicitly enrolled profile under a stricter bar (cosine `>= 0.75` **and**
+support `>= 0.80`); weaker evidence stays `unresolved`. Such an assignment keeps the
+cluster's `embedding_status` and adds a `KNOWN_SPEAKER_IMPERFECT_CLUSTER` warning
+(with `speaker_id`, `diarization_speaker_id`, `status`) so the audio-quality caveat
+remains visible.
+
 The request JSON accepts an optional top-level `language`. Accepted values are
 `auto` plus the ISO 639-1 codes
 

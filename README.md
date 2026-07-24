@@ -280,6 +280,15 @@ Initial matching thresholds are cosine `0.60`, support `0.60`, and stability mar
 share of `0.60`. Quality states are `ready`, `low_support`, `mixed_cluster`, and
 `insufficient_clean_speech`.
 
+A `ready` detected cluster matches a known profile under those base thresholds. A
+detected cluster whose audio was flagged `low_support` or `mixed_cluster` is not
+trusted for a borderline identity, but an explicitly enrolled profile that matches
+it overwhelmingly (cosine `>= 0.75` **and** support `>= 0.80`) is still identified;
+weaker evidence stays `unresolved`. Because support is measured per cluster window,
+a genuine two-speaker blend cannot clear the support gate. The cluster keeps its
+quality state in `speaker_assignments[].embedding_status` and the response adds a
+`KNOWN_SPEAKER_IMPERFECT_CLUSTER` warning so the audio-quality caveat stays visible.
+
 Optional `speaker_refinement=shadow` evaluates suspicious original exclusive DIA turns
 without changing them. `conservative` can reassign a complete turn only when multiple
 quality, centrality, vote, and overlap gates agree. It uses frozen speaker seeds and no
