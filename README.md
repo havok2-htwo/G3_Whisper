@@ -16,7 +16,7 @@ For gated Hugging Face models, the runtime loader can use the saved admin-settin
 
 This file acts as the central functional and technical reference for this repository. If the code and the README diverge, the following rule applies: The README must be updated in the same work step until it accurately reflects the current state again.
 
-Endpoint-level request/response details live in [API_DOCUMENTATION.md](x:/dev/G3_WHISPER/API_DOCUMENTATION.md). The handoff specification for updating applications from legacy 512-D profiles to the current API v2/ReDimNet2 192-D contract lives in [CLIENT_MIGRATION_192D.md](x:/dev/G3_WHISPER/CLIENT_MIGRATION_192D.md). This README remains the central operational and architectural overview.
+Endpoint-level request/response details live in [API_DOCUMENTATION.md](x:/dev/G3_WHISPER/docs/API_DOCUMENTATION.md). The handoff specification for updating applications from legacy 512-D profiles to the current API v2/ReDimNet2 192-D contract lives in [CLIENT_MIGRATION_192D.md](x:/dev/G3_WHISPER/docs/CLIENT_MIGRATION_192D.md). This README remains the central operational and architectural overview.
 
 ## Maintenance Requirements
 
@@ -24,7 +24,7 @@ For any functional work on the project, the following applies:
 
 1. Change code, scripts, configuration, and UI.
 2. Then check whether `README.md` needs to be adapted or expanded.
-3. Then update `CHANGELOG.md`.
+3. Then update `docs/CHANGELOG.md`.
 
 This applies even if the change seems small. The README is deliberately the "source of truth" here for humans and AI agents.
 
@@ -823,7 +823,7 @@ Therefore, if an AI agent is tasked with managing code and pushing, the followin
 
 - Do not reactivate old OpenAI/Voxtral/Gradio paths unless explicitly requested.
 - Reconcile `README.md` against real code after every relevant change.
-- Update `CHANGELOG.md` after every relevant change.
+- Update `docs/CHANGELOG.md` after every relevant change.
 - New runtime paths, files, or endpoints must be documented in this README.
 - If something is only tentatively being removed, move it to [`marked_for_delete`](x:/dev/G3_WHISPER/marked_for_delete) first instead of deleting it immediately.
 
@@ -832,7 +832,7 @@ Therefore, if an AI agent is tasked with managing code and pushing, the followin
 If someone needs to understand the repo quickly, the most important entry points are:
 
 1. [README.md](x:/dev/G3_WHISPER/README.md)
-2. [API_DOCUMENTATION.md](x:/dev/G3_WHISPER/API_DOCUMENTATION.md)
+2. [API_DOCUMENTATION.md](x:/dev/G3_WHISPER/docs/API_DOCUMENTATION.md)
 3. [backend/genesis_whisper_server.py](x:/dev/G3_WHISPER/backend/genesis_whisper_server.py)
 4. [backend/genesis_whisper_server_api.py](x:/dev/G3_WHISPER/backend/genesis_whisper_server_api.py)
 5. [backend/genesis_whisper_server_admin.py](x:/dev/G3_WHISPER/backend/genesis_whisper_server_admin.py)
