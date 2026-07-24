@@ -70,14 +70,25 @@ The four modes are:
   guaranteed unknown-speaker listening sample with `audio.quality_tier`
   (`clean` | `relaxed` | `turns_fallback`).
 
-The request JSON accepts an optional top-level `language` (for example `"de"`,
-`"en"`, or `"auto"`; values match the admin language options). It overrides the
-saved server language for the ASR of this request in `transcript`,
-`transcript_embedding`, and `diarization` mode. In `embedding` mode the field is
-rejected with HTTP 422 because no ASR runs. `models.asr.language` in the response
-echoes the effective value (with `auto` resolving to `de` on the Cohere backend).
-The heavy diarization pipeline never runs in the other modes; their processing is
-unchanged apart from the optional language override.
+The request JSON accepts an optional top-level `language`. Accepted values are
+`auto` plus the ISO 639-1 codes
+
+`ar`, `de`, `el`, `en`, `es`, `fr`, `it`, `ja`, `ko`, `nl`, `pl`, `pt`, `vi`, `zh`
+
+which are exactly the 14 languages the Cohere Transcribe model supports (its
+remote code hard-validates this list and raises on anything else). Cohere has no
+automatic language detection, so `auto` resolves to `de` on the Cohere backend;
+on Whisper backends `auto` enables Whisper's own detection. Note that Cohere
+treats the language as a decoder prompt prior, not a hard constraint: clearly
+spoken passages in another supported language may still be transcribed in that
+language (relevant for code-switched meetings).
+
+The field overrides the saved server language for the ASR of this request in
+`transcript`, `transcript_embedding`, and `diarization` mode. In `embedding`
+mode it is rejected with HTTP 422 because no ASR runs. `models.asr.language` in
+the response echoes the effective value. The heavy diarization pipeline never
+runs in the other modes; their processing is unchanged apart from the optional
+language override.
 
 Only `diarization` contacts the configured DIA server. Recording-level embeddings in
 the other modes use VAD, fixed three-second windows, batched inference, quality
