@@ -68,6 +68,11 @@ Old Gradio, OpenAI, Voxtral, and side-server paths are no longer active. Such le
 - ReDimNet2 profile matching and return of unknown-speaker embeddings plus optional MP3
   reference samples after DIA diarization
 - Conservative exact-pattern repetition filtering, enabled by default on every transcript-producing route and the admin benchmark
+- WXC transcribe-first diarization path (default): Silero speech regions -> ~25s
+  superchunks (+-250ms padding) -> ASR with full context -> MMS_FA word timestamps ->
+  gated DIA speaker skeleton -> sentence-level 192D speaker verification
+- Guaranteed unknown-speaker listening samples with a `quality_tier` fallback cascade
+  (`clean` -> `relaxed` -> `turns_fallback`)
 - Pause/VAD-based segmentation for Whisper
 - Speech-only pre-filtering for the voice vector
 
@@ -93,6 +98,11 @@ Core backend files:
   - DIA orchestration, turn transcription, and unified responses
 - [backend/genesis_whisper_server_dia_client.py](x:/dev/G3_WHISPER/backend/genesis_whisper_server_dia_client.py)
   - authenticated streaming client for the G3_DIA v2 API
+- [backend/genesis_whisper_server_wxc.py](x:/dev/G3_WHISPER/backend/genesis_whisper_server_wxc.py)
+  - WXC transcribe-first path: batched Silero VAD, superchunk building,
+    MMS_FA word alignment, sentence regrouping, iterative 192D speaker verification
+- [backend/genesis_whisper_server_turn_gate.py](x:/dev/G3_WHISPER/backend/genesis_whisper_server_turn_gate.py)
+  - ghost-turn gating, same-speaker re-merge, and ASR-output hygiene (CJK/prefix strip)
 - [backend/genesis_whisper_server_speaker_matching.py](x:/dev/G3_WHISPER/backend/genesis_whisper_server_speaker_matching.py)
   - clean speaker-window extraction, robust embedding clouds, and one-to-one profile matching
 - [backend/genesis_whisper_server_repetition.py](x:/dev/G3_WHISPER/backend/genesis_whisper_server_repetition.py)
@@ -282,6 +292,42 @@ Optional `unknown_speaker_audio=true` selects only timed, non-stitched final inl
 quality at least `0.60`, ranks their contiguous source runs by prototype centrality, and
 encodes up to 30 seconds as 16 kHz mono MP3 at 64 kbit/s. Every selected source run is at
 least five seconds. The `audio.data` value is plain base64 without a data-URL prefix.
+
+### WXC Transcribe-First Path (default in diarization mode)
+
+Measured motivation: DIA's exclusive partition cuts audio into sub-word slivers
+that seq2seq ASR fills with subtitle hallucinations ("...", "Vielen Dank"),
+while ~25-second speech chunks transcribe clean. The default diarization flow is
+therefore transcribe-first:
+
+1. Silero VAD (batched parallel streams, one pass per file) finds speech regions.
+2. Regions merge into ~25s superchunks with a 250ms safety pad on both sides, so
+   no word is ever clipped at a chunk edge.
+3. The active ASR model transcribes those large chunks through the normal batch queue.
+4. torchaudio `MMS_FA` (lazy-loaded, ~1.2GB, German-capable) aligns every word to
+   absolute timestamps; pad overlaps are deduplicated by gap-midpoint ownership.
+5. Words are assigned to speakers against the PR1-gated DIA skeleton
+   (ghost turns below 150ms removed, same-speaker neighbours re-merged) and
+   regrouped into sentences at the ASR punctuation.
+6. An iterative ReDimNet stage verifies speakers per sentence (250ms core trim,
+   purified per-speaker cores, max 3 rounds). Only clear cases are relabeled
+   (`verified_from` on the segment); the rest is reported as flags.
+
+Response additions: `result.chunking` (regions/superchunks/word counts),
+`result.speaker_verification` (applied, flags, rounds, core_matrix) and
+`timings_ms.vad` / `alignment` / `verification`.
+
+Per-request opt-out: `X-G3-Pipeline: turns` restores the legacy per-turn ASR
+path. If Silero finds no speech or the WXC path fails, the server falls back to
+the legacy path automatically and reports `WXC_NO_SPEECH_FALLBACK` or
+`WXC_FALLBACK` in `warnings`.
+
+Unknown-speaker listening samples are guaranteed: when the strict clean-inlier
+selection finds nothing (typically `mixed_cluster` speakers), a relaxed
+selection and finally a raw exclusive-turn cut provide the sample. The response
+field `audio.quality_tier` (`clean` | `relaxed` | `turns_fallback`) states which
+tier produced it. `UNKNOWN_SPEAKER_AUDIO_UNAVAILABLE` now only appears when the
+speaker has no usable audio at all.
 
 ### Transcript Repetition Filter
 

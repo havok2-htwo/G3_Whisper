@@ -23,6 +23,15 @@ UNKNOWN_SPEAKER_AUDIO_FADE_MS = 10
 UNKNOWN_SPEAKER_AUDIO_CONTIGUOUS_TOLERANCE_MS = 1
 UNKNOWN_SPEAKER_AUDIO_FFMPEG_TIMEOUT_SECONDS = 60
 
+# A listening reference must always exist ("no unknown speaker without audio").
+# When the strict clean-inlier selection finds nothing (typically mixed_cluster
+# speakers), the relaxed tier lowers the bars, and as a last resort the sample
+# is cut straight from the speaker's exclusive DIA turns.
+UNKNOWN_SPEAKER_AUDIO_RELAXED_MIN_QUALITY = 0.35
+UNKNOWN_SPEAKER_AUDIO_RELAXED_MIN_SNIPPET_MS = 2_000
+UNKNOWN_SPEAKER_AUDIO_TURN_MIN_PIECE_MS = 700
+UNKNOWN_SPEAKER_AUDIO_TURN_MAX_DURATION_MS = 15_000
+
 
 @dataclass(frozen=True)
 class _ScoredWindow:
@@ -76,6 +85,7 @@ def _eligible_windows(
     cloud: SpeakerCloud,
     *,
     audio_duration_ms: int,
+    min_quality: float = UNKNOWN_SPEAKER_AUDIO_MIN_QUALITY,
 ) -> list[_ScoredWindow]:
     if cloud.prototype is None:
         return []
@@ -84,7 +94,7 @@ def _eligible_windows(
     for sample in cloud.inliers:
         if sample.stitched or sample.start_ms is None or sample.end_ms is None:
             continue
-        if not np.isfinite(sample.quality) or sample.quality < UNKNOWN_SPEAKER_AUDIO_MIN_QUALITY:
+        if not np.isfinite(sample.quality) or sample.quality < min_quality:
             continue
         start_ms = max(0, int(sample.start_ms))
         end_ms = min(audio_duration_ms, int(sample.end_ms))
@@ -113,7 +123,10 @@ def _eligible_windows(
     )
 
 
-def _contiguous_runs(windows: Sequence[_ScoredWindow]) -> list[_SourceRun]:
+def _contiguous_runs(
+    windows: Sequence[_ScoredWindow],
+    min_snippet_ms: int = UNKNOWN_SPEAKER_AUDIO_MIN_SNIPPET_MS,
+) -> list[_SourceRun]:
     runs: list[_SourceRun] = []
     current: list[_ScoredWindow] = []
     current_start = 0
@@ -128,13 +141,13 @@ def _contiguous_runs(windows: Sequence[_ScoredWindow]) -> list[_SourceRun]:
             current.append(window)
             current_end = max(current_end, window.end_ms)
             continue
-        if current_end - current_start >= UNKNOWN_SPEAKER_AUDIO_MIN_SNIPPET_MS:
+        if current_end - current_start >= min_snippet_ms:
             runs.append(_SourceRun(current_start, current_end, tuple(current)))
         current = [window]
         current_start = window.start_ms
         current_end = window.end_ms
 
-    if current and current_end - current_start >= UNKNOWN_SPEAKER_AUDIO_MIN_SNIPPET_MS:
+    if current and current_end - current_start >= min_snippet_ms:
         runs.append(_SourceRun(current_start, current_end, tuple(current)))
     return runs
 
@@ -187,19 +200,28 @@ def _best_slice(run: _SourceRun, duration_ms: int) -> _SelectedSnippet:
     )
 
 
-def _select_snippets(cloud: SpeakerCloud, audio_duration_ms: int) -> list[_SelectedSnippet]:
-    runs = _contiguous_runs(_eligible_windows(cloud, audio_duration_ms=audio_duration_ms))
+def _select_snippets(
+    cloud: SpeakerCloud,
+    audio_duration_ms: int,
+    *,
+    min_quality: float = UNKNOWN_SPEAKER_AUDIO_MIN_QUALITY,
+    min_snippet_ms: int = UNKNOWN_SPEAKER_AUDIO_MIN_SNIPPET_MS,
+) -> list[_SelectedSnippet]:
+    runs = _contiguous_runs(
+        _eligible_windows(cloud, audio_duration_ms=audio_duration_ms, min_quality=min_quality),
+        min_snippet_ms,
+    )
     remaining_ms = UNKNOWN_SPEAKER_AUDIO_MAX_DURATION_MS
     selected: list[_SelectedSnippet] = []
     remaining_runs = list(runs)
-    while remaining_ms >= UNKNOWN_SPEAKER_AUDIO_MIN_SNIPPET_MS and remaining_runs:
+    while remaining_ms >= min_snippet_ms and remaining_runs:
         candidates = [
             (
                 _best_slice(run, min(run.duration_ms, remaining_ms)),
                 run,
             )
             for run in remaining_runs
-            if min(run.duration_ms, remaining_ms) >= UNKNOWN_SPEAKER_AUDIO_MIN_SNIPPET_MS
+            if min(run.duration_ms, remaining_ms) >= min_snippet_ms
         ]
         if not candidates:
             break
@@ -297,15 +319,52 @@ def _encode_mp3(pcm: np.ndarray) -> bytes:
     return process.stdout
 
 
+def _turn_fallback_snippets(
+    exclusive_turns: Sequence[Mapping[str, Any]],
+    speaker_id: str,
+    audio_duration_ms: int,
+) -> list[_SelectedSnippet]:
+    """Last-resort sample straight from the speaker's exclusive DIA turns.
+
+    A mixed_cluster speaker has no clean embedding windows, but the human on the
+    other end still needs SOMETHING to listen to.  Longest turns first, small
+    pieces skipped, capped below the clean-tier length so the lower fidelity is
+    also visible in the duration.
+    """
+
+    pieces: list[_SelectedSnippet] = []
+    turns = [
+        turn
+        for turn in exclusive_turns
+        if str(turn.get("speaker_id", "")).strip() == speaker_id
+    ]
+    turns.sort(key=lambda t: int(t["end_ms"]) - int(t["start_ms"]), reverse=True)
+    remaining_ms = UNKNOWN_SPEAKER_AUDIO_TURN_MAX_DURATION_MS
+    for turn in turns:
+        start_ms = max(0, int(turn["start_ms"]))
+        end_ms = min(audio_duration_ms, int(turn["end_ms"]))
+        duration = end_ms - start_ms
+        if duration < UNKNOWN_SPEAKER_AUDIO_TURN_MIN_PIECE_MS:
+            continue
+        take = min(duration, remaining_ms)
+        pieces.append(_SelectedSnippet(start_ms, start_ms + take, 0.0, 0.0))
+        remaining_ms -= take
+        if remaining_ms < UNKNOWN_SPEAKER_AUDIO_TURN_MIN_PIECE_MS:
+            break
+    return sorted(pieces, key=lambda item: (item.start_ms, item.end_ms))
+
+
 def build_unknown_speaker_audio_assets(
     audio: np.ndarray,
     speaker_clouds: Mapping[str, SpeakerCloud],
     speaker_ids: Iterable[str],
+    exclusive_turns: Sequence[Mapping[str, Any]] | None = None,
 ) -> dict[str, dict[str, Any]]:
-    """Return base64 MP3 listening samples for eligible unknown speakers.
+    """Return base64 MP3 listening samples for unknown speakers.
 
-    Selection only uses timed, non-stitched final cloud inliers. Source audio is
-    sliced after selection, so no additional full-recording copy is created.
+    Three tiers guarantee "no unknown speaker without audio": the strict
+    clean-inlier selection, a relaxed variant for weak clouds, and finally raw
+    exclusive-turn audio.  ``quality_tier`` tells the client which one it got.
     """
 
     audio_samples = np.asarray(audio)
@@ -324,6 +383,18 @@ def build_unknown_speaker_audio_assets(
         if cloud is None:
             continue
         snippets = _select_snippets(cloud, audio_duration_ms)
+        quality_tier = "clean"
+        if not snippets:
+            snippets = _select_snippets(
+                cloud,
+                audio_duration_ms,
+                min_quality=UNKNOWN_SPEAKER_AUDIO_RELAXED_MIN_QUALITY,
+                min_snippet_ms=UNKNOWN_SPEAKER_AUDIO_RELAXED_MIN_SNIPPET_MS,
+            )
+            quality_tier = "relaxed"
+        if not snippets and exclusive_turns:
+            snippets = _turn_fallback_snippets(exclusive_turns, speaker_id, audio_duration_ms)
+            quality_tier = "turns_fallback"
         if not snippets:
             continue
         pcm = _pcm_for_snippets(audio_samples, snippets)
@@ -338,6 +409,7 @@ def build_unknown_speaker_audio_assets(
             "encoding": "base64",
             "data": base64.b64encode(mp3_bytes).decode("ascii"),
             "duration_ms": duration_ms,
+            "quality_tier": quality_tier,
             "snippets": [
                 {
                     "start_ms": snippet.start_ms,

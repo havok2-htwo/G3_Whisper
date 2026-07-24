@@ -49,6 +49,16 @@ from .genesis_whisper_server_speaker_audio import build_unknown_speaker_audio_as
 from .genesis_whisper_server_speaker_refinement import refine_speaker_turns
 from .genesis_whisper_server_storage import log_transcription
 from .genesis_whisper_server_turn_gate import finalize_segment_text, prefilter_turns
+from .genesis_whisper_server_wxc import (
+    align_chunk_words,
+    assign_words_to_turns,
+    build_superchunks,
+    padded_chunk_audio,
+    silero_frame_probs,
+    speech_regions_from_probs,
+    verify_sentences,
+    words_to_sentences,
+)
 from .genesis_whisper_server_vid import embedding_model_metadata, generate_voice_vector
 
 
@@ -485,6 +495,91 @@ async def _transcribe_turns(
     return transcript_segments, round((time.monotonic() - started) * 1000), model_id
 
 
+async def _wxc_transcribe_segments(
+    request: Request,
+    audio: np.ndarray,
+    gated_turns: Sequence[Mapping[str, Any]],
+    overlaps: Sequence[Mapping[str, Any]],
+    apply_repetition_filter: bool,
+) -> tuple[list[dict[str, Any]], dict[str, int], dict[str, Any], str]:
+    """Transcribe-first WXC path: large Silero chunks -> ASR -> word alignment ->
+    gated speaker skeleton -> sentence-level 192D verification.
+
+    Raises WxcNoSpeechError when Silero finds no usable speech so the caller can
+    fall back to the legacy per-turn path instead of returning silence.
+    """
+
+    processing_key = _processing_key()
+    timings: dict[str, int] = {}
+
+    vad_started = time.monotonic()
+    probs = await asyncio.to_thread(silero_frame_probs, audio)
+    regions = speech_regions_from_probs(probs)
+    timings["vad"] = round((time.monotonic() - vad_started) * 1000)
+    if not regions:
+        raise WxcNoSpeechError("Silero fand keine Sprachregionen.")
+
+    chunks = build_superchunks(regions)
+    chunk_audio = padded_chunk_audio(audio, chunks)
+
+    asr_started = time.monotonic()
+    batch_manager = request.app.state.whisper_batch_manager
+    results = await enqueue_audio_segments_bounded(
+        batch_manager,
+        chunk_audio,
+        uuid.uuid4().hex,
+        processing_key,
+    )
+    texts = [result.text for result in results]
+    timings["transcription"] = round((time.monotonic() - asr_started) * 1000)
+
+    align_started = time.monotonic()
+    async with request.app.state.local_gpu_lock:
+        words = await run_blocking_gpu_phase(align_chunk_words, audio, chunks, texts)
+    timings["alignment"] = round((time.monotonic() - align_started) * 1000)
+
+    assign_words_to_turns(words, gated_turns)
+    sentences = words_to_sentences(words, overlaps)
+
+    verify_started = time.monotonic()
+    async with request.app.state.local_gpu_lock:
+        verification = await run_blocking_gpu_phase(verify_sentences, audio, sentences)
+    timings["verification"] = round((time.monotonic() - verify_started) * 1000)
+
+    transcript_segments: list[dict[str, Any]] = []
+    for index, sentence in enumerate(sentences):
+        text = sentence["text"].strip()
+        if apply_repetition_filter:
+            text = filter_repeated_patterns(text)
+        if not text:
+            continue
+        segment = {
+            "index": index,
+            "start_ms": round(sentence["t0"] * 1000),
+            "end_ms": round(sentence["t1"] * 1000),
+            "diarization_speaker_id": str(sentence["speaker"]),
+            "text": text,
+            "overlap": bool(sentence["overlap"]),
+        }
+        if "verified_from" in sentence:
+            segment["verified_from"] = str(sentence["verified_from"])
+        transcript_segments.append(segment)
+
+    speech_seconds = sum(b - a for a, b in regions)
+    diagnostics = {
+        "speech_regions": len(regions),
+        "speech_seconds": round(speech_seconds, 1),
+        "superchunks": len(chunks),
+        "words_aligned": len(words),
+        "verification": verification,
+    }
+    return transcript_segments, timings, diagnostics, processing_key[0]
+
+
+class WxcNoSpeechError(RuntimeError):
+    """Raised when the WXC path cannot find speech and the caller should fall back."""
+
+
 async def _generate_embedding(request: Request, audio: np.ndarray) -> tuple[list[float], int]:
     started = time.monotonic()
     async with request.app.state.local_gpu_lock:
@@ -530,6 +625,7 @@ async def _process_diarization(
     configuration: Mapping[str, Any],
     apply_repetition_filter: bool,
     gate_enabled: bool = True,
+    pipeline_mode: str = "wxc",
 ) -> tuple[dict[str, Any], dict[str, int], dict[str, Any], list[dict[str, Any]], str]:
     expected_speakers = configuration.get("expected_speakers")
     known_speakers = list(configuration.get("known_speakers") or [])
@@ -585,14 +681,38 @@ async def _process_diarization(
     else:
         turns = _merge_exclusive_turns(effective_exclusive)
         gate_diagnostics = {"enabled": False}
-    transcript_segments, transcription_ms, asr_model_id = await _transcribe_turns(
-        http_request,
-        audio,
-        turns,
-        overlaps,
-        apply_repetition_filter,
-        gate_enabled,
-    )
+
+    wxc_diagnostics: dict[str, Any] | None = None
+    wxc_fallback_warning: dict[str, Any] | None = None
+    extra_timings: dict[str, int] = {}
+    if pipeline_mode == "wxc":
+        try:
+            transcript_segments, extra_timings, wxc_diagnostics, asr_model_id = (
+                await _wxc_transcribe_segments(
+                    http_request,
+                    audio,
+                    turns,
+                    overlaps,
+                    apply_repetition_filter,
+                )
+            )
+            transcription_ms = extra_timings.get("transcription", 0)
+        except WxcNoSpeechError:
+            wxc_fallback_warning = {"code": "WXC_NO_SPEECH_FALLBACK"}
+        except Exception as exc:
+            # The legacy per-turn path is the safety net: a WXC failure must
+            # degrade the result quality, never the request.
+            print(f"[WARNUNG-WXC] Pipeline fehlgeschlagen, Fallback auf Turn-Pfad: {exc}", file=sys.stderr)
+            wxc_fallback_warning = {"code": "WXC_FALLBACK", "message": str(exc)[:300]}
+    if pipeline_mode != "wxc" or wxc_fallback_warning is not None:
+        transcript_segments, transcription_ms, asr_model_id = await _transcribe_turns(
+            http_request,
+            audio,
+            turns,
+            overlaps,
+            apply_repetition_filter,
+            gate_enabled,
+        )
 
     try:
         assignments, unresolved_profile_ids, unresolved_clusters = match_known_speakers(
@@ -655,6 +775,8 @@ async def _process_diarization(
     unknown_speakers: list[dict[str, Any]] = []
     unresolved_speakers: list[dict[str, Any]] = []
     warnings: list[dict[str, Any]] = []
+    if wxc_fallback_warning is not None:
+        warnings.append(wxc_fallback_warning)
     unknown_audio_assets: dict[str, dict[str, Any]] = {}
     unknown_audio_ms: int | None = None
     unidentified_dia_ids = sorted(
@@ -668,6 +790,7 @@ async def _process_diarization(
                 audio,
                 speaker_clouds,
                 unidentified_dia_ids,
+                effective_exclusive,
             )
         except (RuntimeError, ValueError):
             warnings.append({"code": "UNKNOWN_SPEAKER_AUDIO_ENCODING_FAILED"})
@@ -778,10 +901,14 @@ async def _process_diarization(
     if refinement_diagnostics is not None:
         result["speaker_refinement"] = refinement_diagnostics
     result["turn_gate"] = gate_diagnostics
+    if wxc_diagnostics is not None:
+        result["speaker_verification"] = wxc_diagnostics.pop("verification", None)
+        result["chunking"] = wxc_diagnostics
     timings = {
         "diarization": dia_duration_ms,
         "transcription": transcription_ms,
         "embedding": embedding_ms,
+        **extra_timings,
     }
     if refinement_diagnostics is not None:
         timings["speaker_refinement"] = int(refinement_diagnostics["processing_ms"])
@@ -845,6 +972,11 @@ def create_v2_api(app: FastAPI) -> FastAPI:
             audio_duration_ms = round(get_audio_duration_seconds(audio) * 1000)
             filter_enabled = repetition_filter_enabled(http_request.headers.get(REPETITION_FILTER_HEADER))
             gate_enabled = http_request.headers.get("x-g3-turn-gate", "").strip().lower() not in ("off", "0", "false", "no")
+            pipeline_mode = (
+                "turns"
+                if http_request.headers.get("x-g3-pipeline", "").strip().lower() in ("turns", "legacy", "off")
+                else "wxc"
+            )
             timings: dict[str, int] = {"decode": decode_ms}
             warnings: list[dict[str, Any]] = []
             result: dict[str, Any]
@@ -898,6 +1030,7 @@ def create_v2_api(app: FastAPI) -> FastAPI:
                     parsed["diarization"],
                     filter_enabled,
                     gate_enabled,
+                    pipeline_mode,
                 )
                 timings.update(mode_timings)
                 transcription_ms = mode_timings.get("transcription")
