@@ -567,6 +567,12 @@ async def _wxc_transcribe_segments(
         processing_key,
     )
     texts = [result.text for result in results]
+    # Collapse ASR repetition loops on the full chunk text, BEFORE alignment
+    # splits it into words. Word-level alignment plus sentence splitting at "."
+    # would otherwise scatter a loop like "So. So. So." into single-word
+    # sentences, where the per-sentence filter can never see the repetition.
+    if apply_repetition_filter:
+        texts = [filter_repeated_patterns(text) for text in texts]
     timings["transcription"] = round((time.monotonic() - asr_started) * 1000)
 
     align_started = time.monotonic()
