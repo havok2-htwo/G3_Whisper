@@ -27,8 +27,11 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "transcription_language": "auto",
     "batch_wait_time_ms": 500,
     "batch_max_segments": 16,
-    "batch_max_audio_seconds": 300.0,
-    "cuda_memory_trim_after_batch": False,
+    "batch_max_audio_seconds": 100.0,
+    "scheduler_long_job_min_chunks": 5,
+    "scheduler_max_parallel_long_jobs": 2,
+    "scheduler_first_chunk_fast_path": True,
+    "cuda_memory_trim_after_batch": True,
     "debug_retain_history_audio": False,
     "huggingface_token": "",
     "dia_server_base_url": "",
@@ -95,6 +98,31 @@ def normalize_settings(settings: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         normalized["batch_max_audio_seconds"] = max(1.0, float(source.get("batch_max_audio_seconds", DEFAULT_SETTINGS["batch_max_audio_seconds"])))
     except (TypeError, ValueError):
         normalized["batch_max_audio_seconds"] = DEFAULT_SETTINGS["batch_max_audio_seconds"]
+
+    try:
+        normalized["scheduler_long_job_min_chunks"] = max(
+            1, int(source.get("scheduler_long_job_min_chunks", DEFAULT_SETTINGS["scheduler_long_job_min_chunks"]))
+        )
+    except (TypeError, ValueError):
+        normalized["scheduler_long_job_min_chunks"] = DEFAULT_SETTINGS["scheduler_long_job_min_chunks"]
+
+    # 0 means "no slot limit": every long job is scheduled immediately.
+    try:
+        normalized["scheduler_max_parallel_long_jobs"] = max(
+            0, int(source.get("scheduler_max_parallel_long_jobs", DEFAULT_SETTINGS["scheduler_max_parallel_long_jobs"]))
+        )
+    except (TypeError, ValueError):
+        normalized["scheduler_max_parallel_long_jobs"] = DEFAULT_SETTINGS["scheduler_max_parallel_long_jobs"]
+
+    configured_fast_path = source.get(
+        "scheduler_first_chunk_fast_path",
+        DEFAULT_SETTINGS["scheduler_first_chunk_fast_path"],
+    )
+    normalized["scheduler_first_chunk_fast_path"] = (
+        configured_fast_path
+        if isinstance(configured_fast_path, bool)
+        else DEFAULT_SETTINGS["scheduler_first_chunk_fast_path"]
+    )
 
     configured_cuda_trim = source.get(
         "cuda_memory_trim_after_batch",

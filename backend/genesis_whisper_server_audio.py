@@ -28,6 +28,34 @@ def _normalize_audio_data(audio_data: np.ndarray) -> np.ndarray:
     return audio_data
 
 
+# libsamplerate (pybind11) holds the GIL for the whole call: a one-shot resample
+# of a two-hour upload freezes the event loop and every live request for about a
+# minute, and even long chunks stall every other GIL acquisition until the chunk
+# ends. Uploads that need resampling therefore go through ffmpeg (own process,
+# no GIL); this streaming fallback with very short chunks only serves hosts
+# without ffmpeg and produces output bit-identical to the one-shot call.
+RESAMPLE_CHUNK_SECONDS = 0.2
+RESAMPLE_CONVERTER = "sinc_best"
+
+
+def _resample_in_chunks(audio_data: np.ndarray, source_rate: int, target_rate: int) -> np.ndarray:
+    import samplerate as src
+
+    ratio = target_rate / source_rate
+    samples = np.ascontiguousarray(audio_data, dtype=np.float32)
+    expected_length = int(round(len(samples) * ratio))
+    resampler = src.Resampler(RESAMPLE_CONVERTER, channels=1)
+    chunk_frames = max(1, int(RESAMPLE_CHUNK_SECONDS * source_rate))
+    parts = []
+    for start in range(0, len(samples), chunk_frames):
+        parts.append(resampler.process(samples[start : start + chunk_frames], ratio, end_of_input=False))
+    # The streaming API withholds the filter's tail; a short zero flush returns
+    # it so the result covers the recording exactly like the one-shot call.
+    parts.append(resampler.process(np.zeros(4096, dtype=np.float32), ratio, end_of_input=True))
+    resampled = np.concatenate(parts) if parts else np.zeros(0, dtype=np.float32)
+    return np.asarray(resampled[:expected_length], dtype=np.float32)
+
+
 def _safe_temp_suffix(filename: str) -> str:
     suffix = Path(filename).suffix.lower()
     if 1 < len(suffix) <= 11 and suffix[1:].isalnum():
@@ -142,8 +170,16 @@ def load_audio_file(audio_file: BinaryIO, filename: str, target_sample_rate: int
 
     try:
         audio_file.seek(0, os.SEEK_SET)
-        audio_data, samplerate = sf.read(audio_file, dtype="float32")
+        with sf.SoundFile(audio_file) as sound:
+            samplerate = sound.samplerate
+            # Resampling belongs in ffmpeg's own process (see RESAMPLE_CHUNK_SECONDS);
+            # it is also far faster than libsamplerate's sinc_best on long files.
+            resample_with_ffmpeg = samplerate != target_sample_rate and bool(shutil.which("ffmpeg"))
+            audio_data = None if resample_with_ffmpeg else sound.read(dtype="float32")
     except Exception:
+        return _decode_audio_with_ffmpeg(audio_file, filename, target_sample_rate)
+
+    if resample_with_ffmpeg:
         return _decode_audio_with_ffmpeg(audio_file, filename, target_sample_rate)
 
     if audio_data.ndim > 1:
@@ -151,10 +187,7 @@ def load_audio_file(audio_file: BinaryIO, filename: str, target_sample_rate: int
 
     if samplerate != target_sample_rate:
         try:
-            import samplerate as src
-
-            ratio = target_sample_rate / samplerate
-            audio_data = src.resample(audio_data, ratio, "sinc_best")
+            audio_data = _resample_in_chunks(audio_data, samplerate, target_sample_rate)
         except ImportError as exc:
             raise HTTPException(
                 status_code=400,

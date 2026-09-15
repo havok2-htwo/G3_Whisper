@@ -92,26 +92,10 @@ class AdminDiaSettingsTests(unittest.TestCase):
         persisted = json.loads(self.settings_file.read_text(encoding="utf-8"))
         self.assertEqual(persisted["dia_api_key"], "saved-secret")
 
-    def test_cuda_trim_setting_defaults_off_and_survives_partial_updates(self) -> None:
+    def test_cuda_trim_setting_defaults_on_and_survives_partial_updates(self) -> None:
         endpoint = self._endpoint("/api/admin/settings", "PUT")
-        self.assertFalse(storage.DEFAULT_SETTINGS["cuda_memory_trim_after_batch"])
-        self.assertFalse(admin.current_settings["cuda_memory_trim_after_batch"])
-
-        enabled = asyncio.run(
-            endpoint(
-                admin.AdminSettingsPayload(cuda_memory_trim_after_batch=True),
-                {"username": "admin"},
-            )
-        )
-        self.assertTrue(enabled["settings"]["cuda_memory_trim_after_batch"])
-
-        partial = asyncio.run(
-            endpoint(
-                admin.AdminSettingsPayload(batch_wait_time_ms=7),
-                {"username": "admin"},
-            )
-        )
-        self.assertTrue(partial["settings"]["cuda_memory_trim_after_batch"])
+        self.assertTrue(storage.DEFAULT_SETTINGS["cuda_memory_trim_after_batch"])
+        self.assertTrue(admin.current_settings["cuda_memory_trim_after_batch"])
 
         disabled = asyncio.run(
             endpoint(
@@ -120,8 +104,24 @@ class AdminDiaSettingsTests(unittest.TestCase):
             )
         )
         self.assertFalse(disabled["settings"]["cuda_memory_trim_after_batch"])
+
+        partial = asyncio.run(
+            endpoint(
+                admin.AdminSettingsPayload(batch_wait_time_ms=7),
+                {"username": "admin"},
+            )
+        )
+        self.assertFalse(partial["settings"]["cuda_memory_trim_after_batch"])
+
+        enabled = asyncio.run(
+            endpoint(
+                admin.AdminSettingsPayload(cuda_memory_trim_after_batch=True),
+                {"username": "admin"},
+            )
+        )
+        self.assertTrue(enabled["settings"]["cuda_memory_trim_after_batch"])
         persisted = json.loads(self.settings_file.read_text(encoding="utf-8"))
-        self.assertFalse(persisted["cuda_memory_trim_after_batch"])
+        self.assertTrue(persisted["cuda_memory_trim_after_batch"])
 
     def test_debug_history_audio_setting_defaults_off_is_strict_and_survives_partial_updates(self) -> None:
         endpoint = self._endpoint("/api/admin/settings", "PUT")

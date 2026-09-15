@@ -792,7 +792,7 @@ class V2DiarizationAssemblyTests(unittest.TestCase):
             diagnostics=diagnostics,
         )
         events: list[str] = []
-        extract_mock = mock.Mock(side_effect=lambda *_args: events.append("embedding") or clouds)
+        extract_mock = mock.AsyncMock(side_effect=lambda *_args: events.append("embedding") or clouds)
         refine_mock = mock.Mock(side_effect=lambda *_args, **_kwargs: events.append("refinement") or result_object)
 
         async def transcribe(_request, _audio, turns, _overlaps, _filter):
@@ -818,7 +818,7 @@ class V2DiarizationAssemblyTests(unittest.TestCase):
         audio = np.full(16000 * 18, 0.1, dtype=np.float32)
         with (
             mock.patch.object(v2, "diarize_v2", new=mock.AsyncMock(return_value=dia_response)),
-            mock.patch.object(v2, "extract_speaker_clouds", new=extract_mock),
+            mock.patch.object(v2, "_extract_speaker_clouds", new=extract_mock),
             mock.patch.object(
                 v2,
                 "generate_voice_vector",
@@ -982,21 +982,18 @@ class V2DiarizationAssemblyTests(unittest.TestCase):
             }
         ]
         app = _CapturingApp()
-        app.state.whisper_batch_manager = object()
+        batch_result = types.SimpleNamespace(text="Korrigierter Turn")
+        app.state.whisper_batch_manager = types.SimpleNamespace(
+            submit_job=mock.AsyncMock(return_value=[batch_result])
+        )
         request = _request(app)
         audio = np.full(16000 * 3, 0.1, dtype=np.float32)
-        batch_result = types.SimpleNamespace(text="Korrigierter Turn")
 
         with (
             mock.patch.object(
                 v2,
                 "_processing_key",
                 return_value=("asr", "cuda", "cache", "de", "fp16"),
-            ),
-            mock.patch.object(
-                v2,
-                "enqueue_audio_segments_bounded",
-                new=mock.AsyncMock(return_value=[batch_result]),
             ),
         ):
             segments, _duration_ms, _model_id = asyncio.run(
@@ -1070,7 +1067,7 @@ class V2DiarizationAssemblyTests(unittest.TestCase):
         with (
             mock.patch.object(v2, "diarize_v2", new=dia_mock),
             mock.patch.object(v2, "_transcribe_turns", new=transcribe_mock),
-            mock.patch.object(v2, "extract_speaker_clouds", return_value=clouds),
+            mock.patch.object(v2, "_extract_speaker_clouds", new=mock.AsyncMock(return_value=clouds)),
             mock.patch.object(v2, "build_unknown_speaker_audio_assets", new=build_audio_mock),
         ):
             result, timings, models, warnings, transcript = asyncio.run(
@@ -1173,7 +1170,7 @@ class V2DiarizationAssemblyTests(unittest.TestCase):
                 "_transcribe_turns",
                 new=mock.AsyncMock(return_value=(transcript_segments, 20, "asr-model")),
             ),
-            mock.patch.object(v2, "extract_speaker_clouds", return_value=clouds),
+            mock.patch.object(v2, "_extract_speaker_clouds", new=mock.AsyncMock(return_value=clouds)),
             mock.patch.object(v2, "match_known_speakers", return_value=matches),
             mock.patch.object(v2, "build_unknown_speaker_audio_assets", new=build_audio),
         ):
@@ -1242,7 +1239,7 @@ class V2DiarizationAssemblyTests(unittest.TestCase):
                 "_transcribe_turns",
                 new=mock.AsyncMock(return_value=(segments, 20, "asr-model")),
             ),
-            mock.patch.object(v2, "extract_speaker_clouds", return_value={speaker_id: cloud}),
+            mock.patch.object(v2, "_extract_speaker_clouds", new=mock.AsyncMock(return_value={speaker_id: cloud})),
             mock.patch.object(v2, "build_unknown_speaker_audio_assets", return_value={}),
         ):
             result, _timings, _models, warnings, _transcript = asyncio.run(

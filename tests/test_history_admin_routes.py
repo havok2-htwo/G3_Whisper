@@ -394,8 +394,8 @@ class AdminHistoryRouteTests(unittest.TestCase):
         ):
             with self.subTest(endpoint=endpoint):
                 batch_manager = mock.Mock()
-                batch_manager.enqueue = mock.AsyncMock(
-                    return_value=SimpleNamespace(text="Legacy transcript", batch_id="batch-1")
+                batch_manager.submit_job = mock.AsyncMock(
+                    return_value=[SimpleNamespace(text="Legacy transcript", batch_id="batch-1")]
                 )
                 self.app.state.whisper_batch_manager = batch_manager
                 with (

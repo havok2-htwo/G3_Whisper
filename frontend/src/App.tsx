@@ -45,6 +45,19 @@ type BatchEntry = {
   audio_seconds?: number;
   duration_ms?: number;
   status?: string;
+  unique_request_count?: number;
+  fast_path?: boolean;
+};
+
+type JobEntry = {
+  request_id?: string;
+  status?: string;
+  is_long?: boolean;
+  total_chunks?: number;
+  batch_count?: number;
+  queue_wait_ms?: number | null;
+  duration_ms?: number;
+  finished_at?: string;
 };
 
 type BenchmarkWorkflow = "whisper_chunk_queue" | "cohere_audio_batch" | string;
@@ -90,7 +103,10 @@ const emptySettings: AdminSettings = {
   batch_wait_time_ms: 1000,
   batch_max_segments: 16,
   batch_max_audio_seconds: 60.0,
-  cuda_memory_trim_after_batch: false,
+  scheduler_long_job_min_chunks: 5,
+  scheduler_max_parallel_long_jobs: 2,
+  scheduler_first_chunk_fast_path: true,
+  cuda_memory_trim_after_batch: true,
   debug_retain_history_audio: false,
   huggingface_token: "",
   dia_server_base_url: "",
@@ -1283,6 +1299,8 @@ export default function App() {
 
   const history = stats?.history ?? [];
   const recentBatches = (queue?.recent_batches ?? []) as BatchEntry[];
+  const recentJobs = (queue?.recent_jobs ?? []) as JobEntry[];
+  const queueJobs = queue?.jobs ?? [];
   const latestBatchRealtime = computeBatchRealtime(recentBatches[0]);
   const configuredDeviceLabel = resolveOptionLabel(settingsOptions.devices, settingsForm.local_gpu_device, "Auto");
   const configuredLanguageLabel = resolveOptionLabel(settingsOptions.languages, settingsForm.transcription_language, "Auto");
@@ -1333,16 +1351,23 @@ export default function App() {
           <h2>Live Queue</h2>
           <div className="metric-grid whisper-dashboard-metrics">
             <div className="metric-card">
-              <span>Queue</span>
+              <span>Active Jobs</span>
+              <strong>{queue?.active_jobs ?? 0}</strong>
+            </div>
+            <div className="metric-card">
+              <span>Waiting Long Jobs</span>
+              <strong>{queue?.waiting_jobs ?? 0}</strong>
+            </div>
+            <div className="metric-card">
+              <span>Pending Chunks</span>
               <strong>{queue?.queue_size ?? 0}</strong>
             </div>
             <div className="metric-card">
-              <span>Queued Segments</span>
-              <strong>{queue?.pending_buffer_size ?? 0}</strong>
-            </div>
-            <div className="metric-card">
               <span>Active Batch</span>
-              <strong>{queue?.active_batch_size ?? 0} / {settingsForm.batch_max_segments || "-"}</strong>
+              <strong>
+                {queue?.active_batch_size ?? 0} / {settingsForm.batch_max_segments || "-"}
+                {queue?.active_batch_fast_path ? " (fast path)" : ""}
+              </strong>
             </div>
             <div className="metric-card">
               <span>Mean Total</span>
@@ -2215,6 +2240,42 @@ export default function App() {
               />
             </label>
 
+            <label>
+              <span>Long Job Min Chunks</span>
+              <input
+                type="number"
+                min={1}
+                value={settingsForm.scheduler_long_job_min_chunks}
+                onChange={(event) => updateSetting("scheduler_long_job_min_chunks", Number(event.target.value))}
+              />
+            </label>
+
+            <label>
+              <span>Max Parallel Long Jobs (0 = unlimited)</span>
+              <input
+                type="number"
+                min={0}
+                value={settingsForm.scheduler_max_parallel_long_jobs}
+                onChange={(event) => updateSetting("scheduler_max_parallel_long_jobs", Number(event.target.value))}
+              />
+            </label>
+
+            <label className="settings-checkbox full-width">
+              <input
+                type="checkbox"
+                checked={settingsForm.scheduler_first_chunk_fast_path}
+                onChange={(event) => updateSetting("scheduler_first_chunk_fast_path", event.target.checked)}
+              />
+              <span>
+                First-chunk fast path
+                <small>
+                  A request that has not been served yet gets its first chunk into a small batch of its own instead
+                  of riding along in a full batch of a long recording. Batches are always shared round-robin between
+                  active requests; short requests (below "Long Job Min Chunks") never wait for a long-job slot.
+                </small>
+              </span>
+            </label>
+
             <label className="settings-checkbox full-width">
               <input
                 type="checkbox"
@@ -2224,8 +2285,9 @@ export default function App() {
               <span>
                 Auto VRAM trim after batch
                 <small>
-                  Disabled for low latency. Enabling it releases unused process-wide CUDA allocator memory after an
-                  ASR burst and can make the next Cohere or ReDimNet request slower.
+                  Releases the process-wide CUDA allocator pool once the ASR queue has been idle for 5 s, so the
+                  idle footprint stays near the model floor on a shared GPU. The next request re-reserves its pool
+                  (measured: about +80 ms once for a ReDimNet batch). Disable only on a GPU this server has to itself.
                 </small>
               </span>
             </label>
@@ -2289,6 +2351,44 @@ export default function App() {
             </div>
           </div>
 
+          <h3>Scheduled Jobs</h3>
+          <div className="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Request</th>
+                  <th>State</th>
+                  <th>Chunks</th>
+                  <th>Batches</th>
+                  <th>Queue Wait</th>
+                </tr>
+              </thead>
+              <tbody>
+                {queueJobs.length === 0 && (
+                  <tr>
+                    <td colSpan={5}>No request is currently scheduled.</td>
+                  </tr>
+                )}
+                {queueJobs.map((job) => (
+                  <tr key={job.request_id}>
+                    <td>{job.request_id}</td>
+                    <td>
+                      {job.state}
+                      {job.is_long ? " (long)" : ""}
+                    </td>
+                    <td>
+                      {job.completed_chunks} / {job.total_chunks}
+                      {job.inflight_chunks > 0 ? ` (+${job.inflight_chunks} in batch)` : ""}
+                    </td>
+                    <td>{job.batch_count}</td>
+                    <td>{formatValue(job.queue_wait_ms, " ms")}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+
+          <h3>Recent Batches</h3>
           <div className="table-wrap">
             <table>
               <thead>
@@ -2296,6 +2396,7 @@ export default function App() {
                   <th>Time</th>
                   <th>Batch</th>
                   <th>Segments</th>
+                  <th>Requests</th>
                   <th>Audio</th>
                   <th>Duration</th>
                   <th>Status</th>
@@ -2304,7 +2405,7 @@ export default function App() {
               <tbody>
                 {recentBatches.length === 0 && (
                   <tr>
-                    <td colSpan={6}>No batch history recorded yet.</td>
+                    <td colSpan={7}>No batch history recorded yet.</td>
                   </tr>
                 )}
                 {recentBatches.map((entry, index) => (
@@ -2312,7 +2413,49 @@ export default function App() {
                     <td>{entry.timestamp ?? "n/a"}</td>
                     <td>{entry.batch_id ?? "n/a"}</td>
                     <td>{entry.batch_size ?? 0}</td>
+                    <td>
+                      {entry.unique_request_count ?? "n/a"}
+                      {entry.fast_path ? " (fast path)" : ""}
+                    </td>
                     <td>{formatValue(entry.audio_seconds, " s")}</td>
+                    <td>{formatValue(entry.duration_ms, " ms")}</td>
+                    <td>{entry.status ?? "n/a"}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+
+          <h3>Recent Jobs</h3>
+          <div className="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Finished</th>
+                  <th>Request</th>
+                  <th>Chunks</th>
+                  <th>Batches</th>
+                  <th>Queue Wait</th>
+                  <th>Total</th>
+                  <th>Status</th>
+                </tr>
+              </thead>
+              <tbody>
+                {recentJobs.length === 0 && (
+                  <tr>
+                    <td colSpan={7}>No job history recorded yet.</td>
+                  </tr>
+                )}
+                {recentJobs.map((entry, index) => (
+                  <tr key={`${entry.request_id ?? "job"}-${index}`}>
+                    <td>{entry.finished_at ?? "n/a"}</td>
+                    <td>
+                      {entry.request_id ?? "n/a"}
+                      {entry.is_long ? " (long)" : ""}
+                    </td>
+                    <td>{entry.total_chunks ?? 0}</td>
+                    <td>{entry.batch_count ?? 0}</td>
+                    <td>{formatValue(entry.queue_wait_ms, " ms")}</td>
                     <td>{formatValue(entry.duration_ms, " ms")}</td>
                     <td>{entry.status ?? "n/a"}</td>
                   </tr>

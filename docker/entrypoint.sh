@@ -22,8 +22,11 @@ if [ ! -f "${SETTINGS_FILE}" ]; then
     "transcription_language": "auto",
     "batch_wait_time_ms": 500,
     "batch_max_segments": 16,
-    "batch_max_audio_seconds": 300.0,
-    "cuda_memory_trim_after_batch": false,
+    "batch_max_audio_seconds": 100.0,
+    "scheduler_long_job_min_chunks": 5,
+    "scheduler_max_parallel_long_jobs": 2,
+    "scheduler_first_chunk_fast_path": true,
+    "cuda_memory_trim_after_batch": true,
     "debug_retain_history_audio": false,
     "huggingface_token": ""
 }

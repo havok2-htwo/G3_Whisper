@@ -512,11 +512,27 @@ def _iter_speaker_windows(
         yield from _iter_stitched_windows(short_parts)
 
 
-def extract_speaker_clouds(
+@dataclass(frozen=True)
+class SpeakerWindowPlan:
+    """CPU-side result of window selection: every window and who owns it."""
+
+    speaker_ids: list[str]
+    owners: list[str]
+    windows: list[VoiceWindow]
+
+
+def plan_speaker_windows(
     audio: np.ndarray,
     exclusive_segments: Sequence[Mapping[str, Any]],
     overlaps: Sequence[Mapping[str, Any]],
-) -> dict[str, SpeakerCloud]:
+) -> SpeakerWindowPlan:
+    """Select the overlap-free enrollment windows of every DIA speaker.
+
+    Materialising the windows (views into the recording plus small stitched
+    copies) lets the request path embed them in lock-released slices instead
+    of one GPU hold spanning the whole recording.
+    """
+
     audio_samples = np.asarray(audio, dtype=np.float32).reshape(-1)
     duration_ms = round(len(audio_samples) * 1000 / REDIMNET_SAMPLE_RATE)
     overlap_intervals = _merge_intervals(
@@ -543,28 +559,45 @@ def extract_speaker_clouds(
         {str(item.get("speaker_id") or "") for item in exclusive_segments if item.get("speaker_id")}
     )
     owners: list[str] = []
+    windows: list[VoiceWindow] = []
+    for speaker_id in all_speaker_ids:
+        regions = sorted(regions_by_speaker.get(speaker_id, []))
+        for window in _iter_speaker_windows(audio_samples, regions):
+            owners.append(speaker_id)
+            windows.append(window)
+    return SpeakerWindowPlan(speaker_ids=all_speaker_ids, owners=owners, windows=windows)
 
-    def all_windows() -> Iterable[VoiceWindow]:
-        for speaker_id in all_speaker_ids:
-            regions = sorted(regions_by_speaker.get(speaker_id, []))
-            for window in _iter_speaker_windows(audio_samples, regions):
-                owners.append(speaker_id)
-                yield window
 
-    # One global call fills batches across speaker boundaries.  The previous
-    # per-speaker calls produced many tiny forwards in conversational audio.
-    embedded = embed_voice_windows(all_windows())
-    if len(embedded) != len(owners):
+def build_speaker_clouds(
+    plan: SpeakerWindowPlan,
+    embedded: Sequence[EmbeddedVoiceWindow],
+) -> dict[str, SpeakerCloud]:
+    """Group embedded windows by owner and build one robust cloud per speaker."""
+
+    if len(embedded) != len(plan.owners):
         raise RuntimeError("ReDimNet2 lieferte nicht fuer jedes Sprecherfenster einen Vektor.")
     by_speaker: dict[str, list[EmbeddedVoiceWindow]] = {
-        speaker_id: [] for speaker_id in all_speaker_ids
+        speaker_id: [] for speaker_id in plan.speaker_ids
     }
-    for speaker_id, item in zip(owners, embedded):
+    for speaker_id, item in zip(plan.owners, embedded):
         by_speaker[speaker_id].append(item)
     return {
         speaker_id: build_robust_cloud(speaker_id, by_speaker[speaker_id])
-        for speaker_id in all_speaker_ids
+        for speaker_id in plan.speaker_ids
     }
+
+
+def extract_speaker_clouds(
+    audio: np.ndarray,
+    exclusive_segments: Sequence[Mapping[str, Any]],
+    overlaps: Sequence[Mapping[str, Any]],
+) -> dict[str, SpeakerCloud]:
+    """Plan, embed and build in one call (tests, tools); the request path slices the embedding."""
+
+    plan = plan_speaker_windows(audio, exclusive_segments, overlaps)
+    # One global call fills batches across speaker boundaries.  The previous
+    # per-speaker calls produced many tiny forwards in conversational audio.
+    return build_speaker_clouds(plan, embed_voice_windows(plan.windows))
 
 
 def _profile_cloud(profile: Mapping[str, Any]) -> SpeakerCloud:

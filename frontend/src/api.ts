@@ -12,6 +12,9 @@ export type AdminSettings = {
   batch_wait_time_ms: number;
   batch_max_segments: number;
   batch_max_audio_seconds: number;
+  scheduler_long_job_min_chunks: number;
+  scheduler_max_parallel_long_jobs: number;
+  scheduler_first_chunk_fast_path: boolean;
   cuda_memory_trim_after_batch: boolean;
   debug_retain_history_audio: boolean;
   huggingface_token: string;
@@ -106,20 +109,37 @@ export type StatsResponse = {
   history: HistoryEntry[];
 };
 
+export type QueueJob = {
+  request_id: string;
+  state: "active" | "waiting";
+  is_long: boolean;
+  total_chunks: number;
+  completed_chunks: number;
+  pending_chunks: number;
+  inflight_chunks: number;
+  batch_count: number;
+  queue_wait_ms: number;
+};
+
 export type QueueResponse = {
   worker_running: boolean;
   queue_size: number;
   pending_buffer_size: number;
+  active_jobs: number;
+  waiting_jobs: number;
   active_batch_id: string | null;
   active_batch_size: number;
   active_batch_audio_seconds: number;
   active_batch_started_at: string | null;
+  active_batch_fast_path: boolean;
   last_batch_completed_at: string | null;
   last_batch_duration_ms: number | null;
   last_error: string | null;
   total_batches_processed: number;
   total_segments_processed: number;
   recent_batches: Array<Record<string, unknown>>;
+  recent_jobs: Array<Record<string, unknown>>;
+  jobs: QueueJob[];
 };
 
 export type BenchmarkResponse = {

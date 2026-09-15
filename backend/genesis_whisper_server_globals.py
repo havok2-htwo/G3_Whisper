@@ -17,6 +17,7 @@ SETTINGS_FILE = os.path.join(LOGS_DIR, "genesis_whisper_settings.json")
 LOG_FILE = os.path.join(LOGS_DIR, "transcription_log.jsonl")
 HISTORY_MAX_LEN = 100
 BATCH_HISTORY_MAX_LEN = 50
+JOB_HISTORY_MAX_LEN = 50
 COHERE_FALLBACK_LANGUAGE = "de"
 
 LOCAL_ASR_MODEL_SPECS: Dict[str, Dict[str, Any]] = {
@@ -157,14 +158,18 @@ local_model_components: Dict[str, Any] = {
 }
 transcription_history = deque(maxlen=HISTORY_MAX_LEN)
 batch_history = deque(maxlen=BATCH_HISTORY_MAX_LEN)
+job_history = deque(maxlen=JOB_HISTORY_MAX_LEN)
 batch_runtime_state: Dict[str, Any] = {
     "worker_running": False,
     "queue_size": 0,
     "pending_buffer_size": 0,
+    "active_jobs": 0,
+    "waiting_jobs": 0,
     "active_batch_id": None,
     "active_batch_size": 0,
     "active_batch_audio_seconds": 0.0,
     "active_batch_started_at": None,
+    "active_batch_fast_path": False,
     "last_batch_completed_at": None,
     "last_batch_duration_ms": None,
     "last_error": None,

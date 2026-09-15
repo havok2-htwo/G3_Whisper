@@ -93,5 +93,76 @@ class AudioDecoderTests(unittest.TestCase):
         self.assertNotIn("genesis-whisper-input-", raised.exception.detail)
 
 
+class ResamplingPathTests(unittest.TestCase):
+    @staticmethod
+    def _wav_bytes(samples: np.ndarray, source_rate: int) -> io.BytesIO:
+        import soundfile as sf
+
+        buffer = io.BytesIO()
+        sf.write(buffer, samples, source_rate, format="WAV", subtype="FLOAT")
+        buffer.seek(0)
+        return buffer
+
+    def test_native_rate_wav_stays_on_the_soundfile_path(self) -> None:
+        samples = np.random.default_rng(1).uniform(-0.3, 0.3, 16000 * 3).astype(np.float32)
+
+        with mock.patch.object(audio, "_decode_audio_with_ffmpeg", side_effect=AssertionError("ffmpeg must not run")):
+            decoded = audio.load_audio_file(self._wav_bytes(samples, 16000), "clip.wav")
+
+        self.assertEqual(len(decoded), len(samples))
+        self.assertLess(float(np.max(np.abs(decoded - samples))), 1e-6)
+
+    def test_wav_with_other_rate_is_resampled_by_ffmpeg_when_available(self) -> None:
+        samples = np.random.default_rng(2).uniform(-0.3, 0.3, 24000 * 3).astype(np.float32)
+        expected = np.zeros(16000 * 3, dtype=np.float32)
+
+        with (
+            mock.patch.object(audio.shutil, "which", return_value="ffmpeg"),
+            mock.patch.object(audio, "_decode_audio_with_ffmpeg", return_value=expected) as ffmpeg_decode,
+        ):
+            decoded = audio.load_audio_file(self._wav_bytes(samples, 24000), "clip.wav")
+
+        self.assertIs(decoded, expected)
+        ffmpeg_decode.assert_called_once()
+        self.assertEqual(ffmpeg_decode.call_args.args[2], 16000)
+
+    def test_chunked_resampling_fallback_matches_the_one_shot_converter_exactly(self) -> None:
+        import samplerate as src
+
+        source_rate = 24000
+        samples = np.random.default_rng(7).uniform(-0.3, 0.3, source_rate * 13 + 777).astype(np.float32)
+
+        with mock.patch.object(audio.shutil, "which", return_value=None):
+            decoded = audio.load_audio_file(self._wav_bytes(samples, source_rate), "clip.wav")
+
+        reference = src.resample(samples, 16000 / source_rate, audio.RESAMPLE_CONVERTER)
+        self.assertEqual(len(decoded), len(reference))
+        self.assertEqual(float(np.max(np.abs(decoded - reference))), 0.0)
+
+    def test_resampling_releases_the_gil_between_chunks(self) -> None:
+        import threading
+        import time
+
+        # 180 s -> 36 chunks; a one-shot call would give this thread ~1 tick.
+        samples = np.random.default_rng(3).uniform(-0.3, 0.3, 24000 * 180).astype(np.float32)
+        finished = threading.Event()
+
+        def work() -> None:
+            audio._resample_in_chunks(samples, 24000, 16000)
+            finished.set()
+
+        worker = threading.Thread(target=work)
+        worker.start()
+        ticks = 0
+        while not finished.is_set():
+            ticks += 1
+            time.sleep(0.002)
+        worker.join()
+
+        # A one-shot libsamplerate call would freeze this thread for the whole
+        # conversion; chunking must let it run between chunks.
+        self.assertGreater(ticks, 18)
+
+
 if __name__ == "__main__":
     unittest.main()

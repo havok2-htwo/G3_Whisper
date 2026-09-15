@@ -438,9 +438,12 @@ The local ASR path already utilizes several optimizations:
 - `sdpa` as the attention standard
 - `flash_attention_2` only if `flash_attn` is installed
 - Batch queue for Whisper
-- bounded enqueue windows (`2 * batch_max_segments`, minimum 2, maximum 256) on legacy,
-  v2, diarization, and benchmark paths; this keeps the GPU worker fed without retaining
-  thousands of request tasks for long recordings
+- fair job scheduler (see "Fair ASR Scheduling" below): every request is one job that
+  owns its chunk list; batches are composed round-robin across active jobs, so a live
+  one-sentence request is never queued behind the chunk backlog of a long recording
+- long Cohere recordings (> 60 s) are cut into Silero superchunks before queueing, so the
+  scheduler can interleave other requests between them instead of holding the GPU for one
+  whole-file call
 - real batched inference: Whisper uses one processor/model forward per worker batch;
   Cohere uses sub-batches of at most 16 audio items and performs its own long-audio chunking
 - startup warmup of the configured ASR model with a sample clip (see "Startup Warmup" below)
@@ -454,6 +457,46 @@ The local ASR path already utilizes several optimizations:
   internal window batch is separate from the ASR queue setting `batch_max_segments` and is
   deliberately fixed to the two prepared shapes rather than exposed as an arbitrary value.
 - serial DIA, ASR, and ReDim phases on the local GPU; an optional cross-process file lease coordinates Whisper and DIA when they share a physical GPU
+
+### Fair ASR Scheduling
+
+The batch worker follows the same rules as the OmniVoice TTS queue, adapted to the
+1000x size spread between a live microphone window and a two-hour recording:
+
+1. **Jobs, not items.** `submit_job(chunks, request_id, processing_key)` registers one
+   job per request. The job keeps its chunk views; nothing is fed through a window.
+2. **Round-robin batches.** A batch is planned over the active jobs that share the
+   anchor's processing key (model, device, language, precision): one chunk per job per
+   round until `batch_max_segments` or `batch_max_audio_seconds` is reached. A single
+   chunk request therefore lands in the very next batch.
+3. **First-chunk fast path** (`scheduler_first_chunk_fast_path`, default on). When a
+   request that has not been served yet is present next to jobs that already received
+   a batch, the next batch carries only the newcomers' first chunks. Fast-path and
+   regular batches alternate, so a long job keeps progressing under a steady stream of
+   live requests.
+4. **LRU rotation.** Jobs served by a batch move to the end of the active list; the next
+   anchor is the job that waited longest, also across processing keys.
+5. **Long-job slots.** Jobs with at least `scheduler_long_job_min_chunks` chunks (default
+   5) count against `scheduler_max_parallel_long_jobs` (default 2, `0` = unlimited);
+   further long jobs wait in FIFO order. Short jobs never wait for a slot.
+6. **Batch wait.** `batch_wait_time_ms` only delays a batch that is not full yet while a
+   fresh job is present, so simultaneous live requests share one batch; the chunks of
+   an already-served job are never waited for.
+
+`GET /api/admin/queue` exposes `jobs` (active/waiting jobs with progress and queue
+wait), `recent_jobs`, and per-batch `unique_request_count` / `fast_path`.
+
+The scheduler only covers ASR batches; a diarization job also runs ReDimNet speaker
+clouds, MMS_FA alignment and the 192D verification under the same GPU lock. Those
+phases are sliced (`run_sliced_gpu_phase`: 64 ReDimNet windows or 4 alignment chunks
+per lock hold, well under a second) and release the lock between slices, so a bulk
+diarization job never blocks a live request for longer than one slice either. Measured
+before slicing on a 47-minute meeting: alignment held the lock for 23 s and verification
+for minutes, and every live request queued behind it.
+Cancelling a request (client disconnect, timeout) withdraws every chunk that has not
+reached the GPU yet. `batch_max_audio_seconds` (default 100 s) is the lever for both the
+wait a live request pays for the running bulk batch (about 1 s per 100 s of audio) and the
+VRAM one Cohere batch needs; raise it only on a GPU that is not shared with other services.
 - one persistent host worker for every local CUDA phase, so cuDNN/cuBLAS handles and lazy
   kernel state are reused instead of being rebuilt when `asyncio.to_thread` selects a
   different worker
@@ -483,12 +526,16 @@ it to one worker therefore removes thread-local cold starts without reducing sup
 ### Idle VRAM Trimming
 
 The `cuda_memory_trim_after_batch` admin checkbox mirrors OmniVoice's "Auto VRAM trim after batch"
-setting and defaults to `false`. With the low-latency default, the Whisper batch worker does not call
-the process-wide `torch.cuda.empty_cache()` after the queue drains, preserving the warm allocator
-state used by both Cohere and ReDimNet. If an operator explicitly enables the option, cleanup waits
-until the queue has been empty for 250 ms, is serialized with the local GPU lock, and yields to newly
-queued ASR work. Explicit model unload/free-memory operations and emergency CUDA-OOM recovery remain
-separate from this automatic setting. The `start.bat` launcher additionally sets
+setting and defaults to `true`. Once the ASR queue has been empty for 5 s, the batch worker calls the
+process-wide `torch.cuda.empty_cache()` (serialized with the local GPU lock, yielding to newly queued
+ASR work), so the idle footprint drops to the model floor instead of keeping every pool a bulk job ever
+grew. The next request re-reserves its pool; measured on an RTX 4090 this costs about +80 ms once for
+a padded ReDimNet batch, and steady live traffic (requests every few seconds) never idles long enough
+to pay it. Without the trim, a 47-minute diarization job left the process at 17 GB reserved on a 24 GB
+card shared with DIA and OmniVoice, Windows paged part of it to system memory, and ReDimNet ran ~100x
+slower until the pressure was gone. Disable the option only on a GPU this server has to itself.
+Explicit model unload/free-memory operations and emergency CUDA-OOM recovery remain separate from
+this automatic setting. The `start.bat` launcher additionally sets
 `PYTORCH_CUDA_ALLOC_CONF=garbage_collection_threshold:0.8,max_split_size_mb:256` before launch to
 reduce reserved-pool fragmentation (note: `expandable_segments` is ignored on Windows).
 
@@ -590,8 +637,8 @@ The active default values come from [backend/genesis_whisper_server_storage.py](
 - `transcription_language`: `auto`
 - `batch_wait_time_ms`: `500`
 - `batch_max_segments`: `16`
-- `batch_max_audio_seconds`: `300.0`
-- `cuda_memory_trim_after_batch`: `false`
+- `batch_max_audio_seconds`: `100.0`
+- `cuda_memory_trim_after_batch`: `true`
 - `debug_retain_history_audio`: `false`
 - `huggingface_token`: empty string
 - `dia_server_base_url`: empty string (falls back to `DIA_SERVER_BASE_URL`)

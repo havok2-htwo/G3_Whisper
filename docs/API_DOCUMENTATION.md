@@ -629,8 +629,9 @@ Form fields:
 Runtime behavior:
 
 - `voice_ident=false` allows the request to use the internal batch queue
+- uploads whose sample rate differs from 16 kHz are decoded and resampled by ffmpeg in its own process (a libsamplerate fallback with short chunks is used only when ffmpeg is missing), so a long upload never stalls the server while it is being resampled
 - Whisper models split the audio into speech-based chunks before queueing
-- the Cohere model stays on a single whole-audio queue item
+- the Cohere model receives audio up to 60 s as a single queue item; longer recordings are cut into Silero superchunks so the scheduler can serve other requests between them
 - `voice_ident=true` bypasses batching and runs under the local GPU lock
 - only this native route can return `voice_vector`
 - legacy field names and response shape are unchanged, but `voice_vector` is now always a normalized 192-D ReDimNet2-B6 vector rather than a 512-D legacy vector
@@ -863,8 +864,8 @@ Response shape:
     "transcription_language": "auto",
     "batch_wait_time_ms": 500,
     "batch_max_segments": 16,
-    "batch_max_audio_seconds": 300.0,
-    "cuda_memory_trim_after_batch": false,
+    "batch_max_audio_seconds": 100.0,
+    "cuda_memory_trim_after_batch": true,
     "debug_retain_history_audio": false,
     "huggingface_token": "hf_xxx",
     "dia_server_base_url": "http://dia:7864",
@@ -931,8 +932,8 @@ Request body:
   "transcription_language": "auto",
   "batch_wait_time_ms": 500,
   "batch_max_segments": 16,
-  "batch_max_audio_seconds": 300.0,
-  "cuda_memory_trim_after_batch": false,
+  "batch_max_audio_seconds": 100.0,
+  "cuda_memory_trim_after_batch": true,
   "debug_retain_history_audio": false,
   "huggingface_token": "hf_xxx",
   "dia_server_base_url": "http://dia:7864",
@@ -952,8 +953,10 @@ Response fields:
 Notes:
 
 - `huggingface_token` can be stored via this route and is then reused by later manual cache downloads and runtime model loads.
-- `batch_max_segments` defaults to `16` for both the worker batch and its bounded enqueue window.
-- `cuda_memory_trim_after_batch` defaults to `false`. When enabled, Whisper may release unused process-wide CUDA allocator memory only after the ASR queue has drained; keeping it disabled preserves the warm Cohere/ReDimNet allocator state for low latency.
+- `batch_max_segments` defaults to `16` and `batch_max_audio_seconds` to `100`; together they cap one worker batch. The audio cap bounds both the VRAM a Cohere batch needs and the time a live request waits for the running bulk batch (about 1 s at 100 s of audio on an RTX 4090/5090).
+- `scheduler_long_job_min_chunks` (default `5`) marks a request with at least that many chunks as a long job; `scheduler_max_parallel_long_jobs` (default `2`, `0` = unlimited) caps how many long jobs are scheduled at once, further ones wait FIFO. Short requests never wait for a slot.
+- `scheduler_first_chunk_fast_path` (default `true`) gives a request that has not been served yet a small batch of its own instead of a seat in a full batch of a long recording; batches are always shared round-robin between active requests.
+- `cuda_memory_trim_after_batch` defaults to `true`: once the ASR queue has been idle for 5 s, Whisper releases the unused process-wide CUDA allocator pool so the idle footprint stays near the model floor on a shared GPU; the next request re-reserves its pool (about +80 ms once for a ReDimNet batch). Disable it only on a dedicated GPU.
 - `debug_retain_history_audio` defaults to `false`. When enabled, successful public API requests may retain their byte-identical original upload for the 25-row admin history; disabling it blocks access immediately and purges retained audio after active readers finish.
 - updates are partial merges; omitted fields keep their saved value, so older admin clients cannot remove newer settings
 - `dia_server_base_url` configures the DIA service used by diarization requests
@@ -1197,18 +1200,32 @@ Purpose:
 Response fields currently include:
 
 - `worker_running`
-- `queue_size`
-- `pending_buffer_size`
+- `queue_size` (chunks still pending across active jobs)
+- `pending_buffer_size` (chunks of long jobs waiting for a slot)
+- `active_jobs`
+- `waiting_jobs`
 - `active_batch_id`
 - `active_batch_size`
 - `active_batch_audio_seconds`
 - `active_batch_started_at`
+- `active_batch_fast_path`
 - `last_batch_completed_at`
 - `last_batch_duration_ms`
 - `last_error`
 - `total_batches_processed`
 - `total_segments_processed`
+- `jobs` (currently scheduled jobs)
 - `recent_batches`
+- `recent_jobs`
+
+Job entry fields (`jobs`) currently include:
+
+- `request_id`
+- `state` (`active` or `waiting`)
+- `is_long`
+- `total_chunks`, `completed_chunks`, `pending_chunks`, `inflight_chunks`
+- `batch_count`
+- `queue_wait_ms` (time until the first batch, or time waited so far)
 
 Recent batch entry fields currently include:
 
@@ -1218,8 +1235,22 @@ Recent batch entry fields currently include:
 - `audio_seconds`
 - `duration_ms`
 - `request_ids`
+- `unique_request_count`
+- `fast_path`
 - `status`
 - `error` (only on failed batches)
+
+Recent job entry fields (`recent_jobs`) currently include:
+
+- `request_id`
+- `status` (`ok`, `error`, `cancelled`, `stopped`)
+- `is_long`
+- `total_chunks`, `completed_chunks`
+- `batch_count`
+- `queue_wait_ms`
+- `duration_ms`
+- `finished_at`
+- `error` (only on failed jobs)
 
 ### `POST /api/admin/benchmark`
 

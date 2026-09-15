@@ -28,22 +28,29 @@ class _AsyncLock:
 
 
 class _BatchManager:
-    async def enqueue(self, **_kwargs):
-        return type("BatchResult", (), {"text": "Hallo Welt", "batch_id": "batch-test"})()
+    async def submit_job(self, audio_segments, request_id, processing_key):
+        return [
+            type("BatchResult", (), {"text": "Hallo Welt", "batch_id": "batch-test"})()
+            for _ in audio_segments
+        ]
 
 
 class _CountingBatchManager:
     def __init__(self) -> None:
         self.segments: list[int] = []
 
-    async def enqueue(self, **kwargs):
-        index = int(kwargs["segment_index"])
-        self.segments.append(index)
-        return type(
-            "BatchResult",
-            (),
-            {"text": f"Abschnitt {index + 1}.", "batch_id": "batch-long"},
-        )()
+    async def submit_job(self, audio_segments, request_id, processing_key):
+        results = []
+        for index, _segment in enumerate(audio_segments):
+            self.segments.append(index)
+            results.append(
+                type(
+                    "BatchResult",
+                    (),
+                    {"text": f"Abschnitt {index + 1}.", "batch_id": "batch-long"},
+                )()
+            )
+        return results
 
 
 class RedimNetVoicePathTests(unittest.TestCase):

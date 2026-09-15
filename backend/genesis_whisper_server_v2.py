@@ -22,7 +22,6 @@ from starlette.formparsers import MultiPartException, MultiPartParser
 
 from .genesis_whisper_server_audio import get_audio_duration_seconds, load_audio_file
 from .genesis_whisper_server_auth import authorize_api_key, get_auth_store, require_admin
-from .genesis_whisper_server_batching import enqueue_audio_segments_bounded
 from .genesis_whisper_server_chunking import combine_transcription_chunks, split_audio_for_whisper
 from .genesis_whisper_server_dia_client import DiaClientError, diarize_v2
 from .genesis_whisper_server_globals import (
@@ -33,7 +32,7 @@ from .genesis_whisper_server_globals import (
     uses_cohere_backend,
 )
 from .genesis_whisper_server_history import append_history_entry, capture_history_audio
-from .genesis_whisper_server_gpu import run_blocking_gpu_phase
+from .genesis_whisper_server_gpu import run_blocking_gpu_phase, run_sliced_gpu_phase
 from .genesis_whisper_server_local_asr_engine import get_last_local_asr_load_error, load_local_asr_model
 from .genesis_whisper_server_repetition import (
     REPETITION_FILTER_HEADER,
@@ -42,8 +41,9 @@ from .genesis_whisper_server_repetition import (
 )
 from .genesis_whisper_server_speaker_matching import (
     SpeakerProfileValidationError,
-    extract_speaker_clouds,
+    build_speaker_clouds,
     match_known_speakers,
+    plan_speaker_windows,
     validate_known_speakers,
 )
 from .genesis_whisper_server_speaker_audio import build_unknown_speaker_audio_assets
@@ -51,16 +51,19 @@ from .genesis_whisper_server_speaker_refinement import refine_speaker_turns
 from .genesis_whisper_server_storage import log_transcription
 from .genesis_whisper_server_turn_gate import finalize_segment_text, prefilter_turns
 from .genesis_whisper_server_wxc import (
-    align_chunk_words,
+    align_chunk_slice,
+    alignment_bounds,
     assign_words_to_turns,
     build_superchunks,
+    finish_verification,
     padded_chunk_audio,
+    plan_verification_windows,
     silero_frame_probs,
     speech_regions_from_probs,
-    verify_sentences,
+    split_audio_into_superchunks,
     words_to_sentences,
 )
-from .genesis_whisper_server_vid import embedding_model_metadata, generate_voice_vector
+from .genesis_whisper_server_vid import EmbeddedVoiceWindow, VoiceWindow, embed_voice_windows, embedding_model_metadata, generate_voice_vector
 
 
 V2_SCHEMA_VERSION = "2.0"
@@ -392,6 +395,60 @@ def _request_processing_key(language_override: str | None) -> tuple[str, str, st
     return key
 
 
+# One GPU-lock hold of a bulk job may not exceed roughly a live request's own
+# GPU time. 64 ReDimNet windows are four padded batches (~0.3 s); four MMS
+# alignment chunks of ~25 s are ~0.8 s on an RTX 4090.
+EMBED_SLICE_WINDOWS = 64
+ALIGN_SLICE_CHUNKS = 4
+
+
+async def _embed_windows_sliced(request: Request, windows: Sequence[VoiceWindow]) -> list[EmbeddedVoiceWindow]:
+    """Embed many windows without holding the GPU lock for the whole list."""
+
+    parts = await run_sliced_gpu_phase(
+        request.app.state.local_gpu_lock,
+        list(windows),
+        embed_voice_windows,
+        EMBED_SLICE_WINDOWS,
+    )
+    return [item for part in parts for item in part]
+
+
+async def _extract_speaker_clouds(
+    request: Request,
+    audio: np.ndarray,
+    standard: Sequence[Mapping[str, Any]],
+    overlaps: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Speaker clouds with the ReDimNet pass sliced under the GPU lock."""
+
+    window_plan = await asyncio.to_thread(plan_speaker_windows, audio, standard, overlaps)
+    embedded_windows = await _embed_windows_sliced(request, window_plan.windows)
+    return await asyncio.to_thread(build_speaker_clouds, window_plan, embedded_windows)
+
+
+async def _align_words_sliced(
+    request: Request,
+    audio: np.ndarray,
+    chunks: Sequence[tuple[float, float]],
+    texts: Sequence[str],
+) -> list[dict[str, Any]]:
+    """Forced alignment chunk-group by chunk-group, releasing the lock in between."""
+
+    bounds = alignment_bounds(chunks)
+    parts = await run_sliced_gpu_phase(
+        request.app.state.local_gpu_lock,
+        list(range(len(chunks))),
+        align_chunk_slice,
+        ALIGN_SLICE_CHUNKS,
+        audio,
+        chunks,
+        texts,
+        bounds,
+    )
+    return [word for part in parts for word in part]
+
+
 async def _transcribe_audio(
     request: Request,
     audio: np.ndarray,
@@ -403,17 +460,14 @@ async def _transcribe_audio(
     request_token = uuid.uuid4().hex
     started = time.monotonic()
     if uses_cohere_backend(model_id):
-        segments = [audio]
+        # Cohere accepts whole recordings, but a long one must still reach the
+        # scheduler as chunks so live requests can run between them.
+        segments = await asyncio.to_thread(split_audio_into_superchunks, audio)
     else:
         segments = await asyncio.to_thread(split_audio_for_whisper, audio)
     if not segments:
         return "", 0, 0, model_id
-    results = await enqueue_audio_segments_bounded(
-        batch_manager,
-        segments,
-        request_token,
-        processing_key,
-    )
+    results = await batch_manager.submit_job(segments, request_token, processing_key)
     text = combine_transcription_chunks([result.text for result in results])
     return text, round((time.monotonic() - started) * 1000), len(segments), model_id
 
@@ -487,12 +541,7 @@ async def _transcribe_turns(
     started = time.monotonic()
     request_token = uuid.uuid4().hex
     batch_manager = request.app.state.whisper_batch_manager
-    batch_results = await enqueue_audio_segments_bounded(
-        batch_manager,
-        prepared_chunks,
-        request_token,
-        processing_key,
-    )
+    batch_results = await batch_manager.submit_job(prepared_chunks, request_token, processing_key)
     result_index = 0
     transcript_segments: list[dict[str, Any]] = []
     for turn_index, (turn, chunk_count) in enumerate(zip(turns, turn_chunk_counts)):
@@ -560,12 +609,7 @@ async def _wxc_transcribe_segments(
 
     asr_started = time.monotonic()
     batch_manager = request.app.state.whisper_batch_manager
-    results = await enqueue_audio_segments_bounded(
-        batch_manager,
-        chunk_audio,
-        uuid.uuid4().hex,
-        processing_key,
-    )
+    results = await batch_manager.submit_job(chunk_audio, uuid.uuid4().hex, processing_key)
     texts = [result.text for result in results]
     # Collapse ASR repetition loops on the full chunk text, BEFORE alignment
     # splits it into words. Word-level alignment plus sentence splitting at "."
@@ -576,16 +620,16 @@ async def _wxc_transcribe_segments(
     timings["transcription"] = round((time.monotonic() - asr_started) * 1000)
 
     align_started = time.monotonic()
-    async with request.app.state.local_gpu_lock:
-        words = await run_blocking_gpu_phase(align_chunk_words, audio, chunks, texts)
+    words = await _align_words_sliced(request, audio, chunks, texts)
     timings["alignment"] = round((time.monotonic() - align_started) * 1000)
 
     assign_words_to_turns(words, gated_turns)
     sentences = words_to_sentences(words, overlaps)
 
     verify_started = time.monotonic()
-    async with request.app.state.local_gpu_lock:
-        verification = await run_blocking_gpu_phase(verify_sentences, audio, sentences)
+    verify_windows, verify_kept = await asyncio.to_thread(plan_verification_windows, audio, sentences)
+    verify_embedded = await _embed_windows_sliced(request, verify_windows) if verify_windows else []
+    verification = await asyncio.to_thread(finish_verification, verify_windows, verify_kept, verify_embedded)
     timings["verification"] = round((time.monotonic() - verify_started) * 1000)
 
     transcript_segments: list[dict[str, Any]] = []
@@ -697,11 +741,10 @@ async def _process_diarization(
     ]
 
     embedding_started = time.monotonic()
-    async with http_request.app.state.local_gpu_lock:
-        # Standard diarization preserves all speaker activity and therefore
-        # defines the safe, overlap-free enrollment regions. Exclusive turns
-        # remain reserved for ASR so overlapping speech is transcribed once.
-        speaker_clouds = await run_blocking_gpu_phase(extract_speaker_clouds, audio, standard, overlaps)
+    # Standard diarization preserves all speaker activity and therefore
+    # defines the safe, overlap-free enrollment regions. Exclusive turns
+    # remain reserved for ASR so overlapping speech is transcribed once.
+    speaker_clouds = await _extract_speaker_clouds(http_request, audio, standard, overlaps)
     embedding_ms = round((time.monotonic() - embedding_started) * 1000)
 
     refinement_diagnostics: dict[str, Any] | None = None

@@ -10,7 +10,6 @@ from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 
 from .genesis_whisper_server_audio import get_audio_duration_seconds, load_audio_file
 from .genesis_whisper_server_auth import authorize_api_key, get_auth_store
-from .genesis_whisper_server_batching import enqueue_audio_segments_bounded
 from .genesis_whisper_server_chunking import combine_transcription_chunks, split_audio_for_whisper
 from .genesis_whisper_server_globals import (
     current_settings,
@@ -26,6 +25,7 @@ from .genesis_whisper_server_local_asr_engine import (
 )
 from .genesis_whisper_server_storage import log_transcription
 from .genesis_whisper_server_vid import generate_voice_vector
+from .genesis_whisper_server_wxc import split_audio_into_superchunks
 from .genesis_whisper_server_gpu import run_blocking_gpu_phase, shared_gpu_lease
 from .genesis_whisper_server_repetition import (
     REPETITION_FILTER_HEADER,
@@ -115,34 +115,21 @@ def create_api(app: FastAPI) -> FastAPI:
         request_id = uuid.uuid4().hex
         batch_start = time.monotonic()
         if uses_cohere_backend(model_id):
-            segment_count = 1
-            batch_result = await batch_manager.enqueue(
-                audio_data=audio_data,
-                request_id=request_id,
-                segment_index=0,
-                total_segments=1,
-                processing_key=local_processing_key,
-            )
-            transcription_text = batch_result.text
-            batch_ids = [batch_result.batch_id]
-            transcription_duration_ms = round((time.monotonic() - batch_start) * 1000)
+            # Cohere accepts whole recordings, but a long one must still reach the
+            # scheduler as chunks so live requests can run between them.
+            segmented_audio = await asyncio.to_thread(split_audio_into_superchunks, audio_data)
         else:
             segmented_audio = await asyncio.to_thread(split_audio_for_whisper, audio_data)
-            segment_count = len(segmented_audio)
+        segment_count = len(segmented_audio)
 
-            if segment_count == 0:
-                transcription_text = ""
-                transcription_duration_ms = 0
-            else:
-                batch_results = await enqueue_audio_segments_bounded(
-                    batch_manager,
-                    segmented_audio,
-                    request_id,
-                    local_processing_key,
-                )
-                transcription_text = combine_transcription_chunks([result.text for result in batch_results])
-                batch_ids = sorted({result.batch_id for result in batch_results})
-                transcription_duration_ms = round((time.monotonic() - batch_start) * 1000)
+        if segment_count == 0:
+            transcription_text = ""
+            transcription_duration_ms = 0
+        else:
+            batch_results = await batch_manager.submit_job(segmented_audio, request_id, local_processing_key)
+            transcription_text = combine_transcription_chunks([result.text for result in batch_results])
+            batch_ids = sorted({result.batch_id for result in batch_results})
+            transcription_duration_ms = round((time.monotonic() - batch_start) * 1000)
 
         if voice_ident and used_batching:
             local_gpu_lock = request.app.state.local_gpu_lock

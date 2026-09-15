@@ -28,7 +28,7 @@ import numpy as np
 import torch
 
 from .genesis_whisper_server_turn_gate import clean_segment_text
-from .genesis_whisper_server_vid import VoiceWindow, embed_voice_windows
+from .genesis_whisper_server_vid import EmbeddedVoiceWindow, VoiceWindow, embed_voice_windows
 
 SAMPLE_RATE = 16000
 
@@ -43,6 +43,10 @@ SILERO_BRIDGE_MS = 300
 
 SUPERCHUNK_TARGET_S = 25.0
 CHUNK_PAD_S = 0.25                 # never clip a word at chunk edges
+# Audio up to this length stays one ASR item (no VAD pass, no seams); above it
+# the recording is cut into superchunks so the scheduler can interleave other
+# requests between them instead of holding the GPU for one monolithic call.
+WHOLE_AUDIO_MAX_S = 60.0
 
 # --- sentence-level 192D verification (validated: words <0.6s are noise,
 # sentences >=2s reach ~0.82 median cosine to their own speaker core) ---
@@ -170,6 +174,31 @@ def padded_chunk_audio(audio: np.ndarray, chunks: Sequence[tuple[float, float]])
     return out
 
 
+def split_audio_into_superchunks(
+    audio: np.ndarray,
+    *,
+    whole_audio_max_seconds: float = WHOLE_AUDIO_MAX_S,
+) -> list[np.ndarray]:
+    """Scheduler-visible chunks for backends that accept a whole recording.
+
+    Cohere chunks long audio internally, but the batch scheduler only sees the
+    items it is handed: a two-hour file as one item is one GPU-lock hold for
+    the entire transcription, during which no live request can be served.
+    Long recordings therefore take the WXC superchunk path (Silero regions
+    merged to ~25s, padded 250ms); short ones stay untouched.
+    """
+
+    samples = np.asarray(audio, dtype=np.float32).reshape(-1)
+    if len(samples) <= int(whole_audio_max_seconds * SAMPLE_RATE):
+        return [samples]
+    probs = silero_frame_probs(samples)
+    regions = speech_regions_from_probs(probs)
+    if not regions:
+        # Never drop audio silently: let the model decide what the file holds.
+        return [samples]
+    return padded_chunk_audio(samples, build_superchunks(regions))
+
+
 # ---------------------------------------------------------------------------
 # MMS_FA forced alignment
 # ---------------------------------------------------------------------------
@@ -219,6 +248,16 @@ def _normalize_word(word: str) -> str:
     return re.sub(r"[^a-z]", "", lowered)
 
 
+def alignment_bounds(chunks: Sequence[tuple[float, float]]) -> list[float]:
+    """Ownership boundaries at the midpoints of the inter-chunk gaps."""
+
+    bounds = [float("-inf")]
+    for i in range(len(chunks) - 1):
+        bounds.append((chunks[i][1] + chunks[i + 1][0]) / 2.0)
+    bounds.append(float("inf"))
+    return bounds
+
+
 def align_chunk_words(
     audio: np.ndarray,
     chunks: Sequence[tuple[float, float]],
@@ -231,18 +270,31 @@ def align_chunk_words(
     exactly once.
     """
 
+    return align_chunk_slice(list(range(len(chunks))), audio, chunks, texts, alignment_bounds(chunks))
+
+
+def align_chunk_slice(
+    indices: Sequence[int],
+    audio: np.ndarray,
+    chunks: Sequence[tuple[float, float]],
+    texts: Sequence[str],
+    bounds: Sequence[float],
+) -> list[dict[str, Any]]:
+    """Align only the chunks in ``indices``; the GPU unit of the sliced driver.
+
+    Seam ownership only needs the neighbouring chunk boundaries, so any subset
+    of chunks can be aligned independently and the per-slice word lists simply
+    concatenate in chunk order.
+    """
+
     components = _load_mms()
     model, tokenizer, aligner = components["model"], components["tokenizer"], components["aligner"]
     device = components["device"]
     total_s = len(audio) / SAMPLE_RATE
 
-    bounds = [float("-inf")]
-    for i in range(len(chunks) - 1):
-        bounds.append((chunks[i][1] + chunks[i + 1][0]) / 2.0)
-    bounds.append(float("inf"))
-
     words: list[dict[str, Any]] = []
-    for index, ((a, b), text) in enumerate(zip(chunks, texts)):
+    for index in indices:
+        (a, b), text = chunks[index], texts[index]
         cleaned = clean_segment_text(text)
         pairs = [(w, _normalize_word(w)) for w in cleaned.split()]
         pairs = [(orig, norm) for orig, norm in pairs if norm and _WORD_KEEP_RE.search(norm)]
@@ -390,17 +442,11 @@ def _build_cores(
     return cores
 
 
-def verify_sentences(
+def plan_verification_windows(
     audio: np.ndarray,
     sentences: Sequence[dict[str, Any]],
-) -> dict[str, Any]:
-    """Embed sentences (250ms core trim) and conservatively fix speaker labels.
-
-    Only clear cases are changed: non-overlap sentences >= VERIFY_MIN_SENT_S
-    whose embedding matches another purified speaker core by >= VERIFY_MARGIN.
-    Everything else that looks suspicious is reported as a flag so downstream
-    consumers can react without this stage guessing.
-    """
+) -> tuple[list[VoiceWindow], list[dict[str, Any]]]:
+    """CPU part of verification: one 250ms-core-trimmed window per usable sentence."""
 
     windows: list[VoiceWindow] = []
     kept: list[dict[str, Any]] = []
@@ -420,11 +466,40 @@ def verify_sentences(
             )
         )
         kept.append(sentence)
+    return windows, kept
+
+
+def verify_sentences(
+    audio: np.ndarray,
+    sentences: Sequence[dict[str, Any]],
+) -> dict[str, Any]:
+    """Embed sentences (250ms core trim) and conservatively fix speaker labels.
+
+    Only clear cases are changed: non-overlap sentences >= VERIFY_MIN_SENT_S
+    whose embedding matches another purified speaker core by >= VERIFY_MARGIN.
+    Everything else that looks suspicious is reported as a flag so downstream
+    consumers can react without this stage guessing.
+
+    The request path runs the same three steps with the embedding sliced under
+    the GPU lock (see ``plan_verification_windows`` / ``finish_verification``).
+    """
+
+    windows, kept = plan_verification_windows(audio, sentences)
+    if not windows:
+        return finish_verification(windows, kept, [])
+    return finish_verification(windows, kept, embed_voice_windows(windows, batch_size=16))
+
+
+def finish_verification(
+    windows: Sequence[VoiceWindow],
+    kept: Sequence[dict[str, Any]],
+    embedded: Sequence[EmbeddedVoiceWindow],
+) -> dict[str, Any]:
+    """CPU part of verification: purified cores, relabel rounds and flags."""
 
     if not windows:
         return {"applied": [], "flags": [], "rounds": 0, "sentence_count": 0}
 
-    embedded = embed_voice_windows(windows, batch_size=16)
     by_start = {item.start_ms: item.vector for item in embedded}
     items: list[tuple[dict[str, Any], np.ndarray]] = []
     for window, sentence in zip(windows, kept):

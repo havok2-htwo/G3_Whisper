@@ -9,7 +9,7 @@ from contextlib import contextmanager
 from functools import partial
 from pathlib import Path
 from typing import Iterator
-from typing import Any, Callable, TypeVar
+from typing import Any, Callable, List, Sequence, TypeVar
 
 
 T = TypeVar("T")
@@ -68,4 +68,31 @@ async def run_blocking_gpu_phase(function: Callable[..., T], *args: Any, **kwarg
         raise
 
 
-__all__ = ["run_blocking_gpu_phase", "shared_gpu_lease"]
+async def run_sliced_gpu_phase(
+    lock: asyncio.Lock,
+    items: Sequence[Any],
+    function: Callable[..., T],
+    slice_size: int,
+    *args: Any,
+) -> List[T]:
+    """Run ``function(items[i:i+slice_size], *args)`` per slice, each under the lock.
+
+    A long recording's alignment, speaker-cloud or verification phase used to be
+    one lock hold of up to minutes, during which no live request could reach
+    the GPU. Releasing the lock between slices lets the FIFO waiters (the ASR
+    batch worker, live embeddings) run in between, so a bulk job never blocks a
+    live request for longer than one slice. Results keep slice order.
+    """
+
+    slice_size = max(1, int(slice_size))
+    results: List[T] = []
+    for start in range(0, len(items), slice_size):
+        async with lock:
+            results.append(await run_blocking_gpu_phase(function, items[start : start + slice_size], *args))
+        # Yield once so a waiter woken by the release really acquires the lock
+        # before this phase queues up again behind it.
+        await asyncio.sleep(0)
+    return results
+
+
+__all__ = ["run_blocking_gpu_phase", "run_sliced_gpu_phase", "shared_gpu_lease"]
