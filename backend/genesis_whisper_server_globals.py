@@ -19,10 +19,13 @@ HISTORY_MAX_LEN = 100
 BATCH_HISTORY_MAX_LEN = 50
 JOB_HISTORY_MAX_LEN = 50
 COHERE_FALLBACK_LANGUAGE = "de"
+COHERE_MODEL_ID = "CohereLabs/cohere-transcribe-03-2026"
+# Gated repo: the license must be accepted here with the account whose token is configured.
+COHERE_MODEL_URL = f"https://huggingface.co/{COHERE_MODEL_ID}"
 
 LOCAL_ASR_MODEL_SPECS: Dict[str, Dict[str, Any]] = {
     "Cohere Transcribe 03/2026": {
-        "value": "CohereLabs/cohere-transcribe-03-2026",
+        "value": COHERE_MODEL_ID,
         "backend": "cohere_transcribe",
         "default_language": COHERE_FALLBACK_LANGUAGE,
         "approx_size_gb": None,

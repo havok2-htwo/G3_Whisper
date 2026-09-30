@@ -2128,8 +2128,12 @@ export default function App() {
               />
             </label>
             <p className="field-note full-width">
-              Used for gated ASR models such as Cohere Transcribe. Save the settings to persist it; the current typed
-              value is also sent with manual model downloads from the Cache Manager.
+              Used for gated ASR models such as Cohere Transcribe (the default model). Accept its license on{" "}
+              <a href="https://huggingface.co/CohereLabs/cohere-transcribe-03-2026" target="_blank" rel="noreferrer">
+                Hugging Face
+              </a>{" "}
+              with the account that owns this token. Save the settings to persist it; the current typed value is also
+              sent with manual model downloads from the Cache Manager.
             </p>
 
             <div className="dia-settings full-width">

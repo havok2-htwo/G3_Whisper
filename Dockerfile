@@ -3,8 +3,8 @@
 # GENESIS Whisper Server — GPU transcription/diarization service.
 # Target host: Linux + NVIDIA driver + nvidia-container-toolkit (RTX 5090 / sm_120 OK).
 # The image ships NO models: they are downloaded from Hugging Face into the mounted
-# /app/models volume on first use (whisper-large-v3-turbo eagerly at warmup;
-# Cohere and ReDimNet2 lazily on the first request that needs them).
+# /app/models volume on first use (the default Cohere Transcribe model eagerly at
+# warmup -- gated, needs HUGGINGFACE_TOKEN; ReDimNet2 at warmup as well).
 
 ############################  1) Frontend build  ############################
 FROM node:22-bookworm-slim AS frontend

@@ -77,11 +77,16 @@ docker compose up -d --build
 Saved admin settings live in the `*_logs` / `*_data` volumes and survive the rebuild.
 
 > **First start is slow.** No models are baked into the images; each service downloads
-> them into a named volume on first boot (Whisper `whisper-large-v3-turbo` ~1.6 GB and
-> ReDimNet2-B6 during startup warmup, and Cohere lazily; OmniVoice
+> them into a named volume on first boot (the default ASR model Cohere Transcribe and
+> ReDimNet2-B6 during startup warmup; OmniVoice
 > `k2-fsa/OmniVoice` ~3 GB). The
 > server only accepts connections after warmup, which is why the healthchecks use a long
 > `start_period`.
+>
+> Cohere Transcribe is gated: set `HUGGINGFACE_TOKEN` in `.env` (or in the admin settings)
+> and accept the license at <https://huggingface.co/CohereLabs/cohere-transcribe-03-2026>
+> with that account. Without it the warmup only logs a hint and the server still starts;
+> transcription works once the token is saved.
 
 ## Whisper to DIA configuration
 
@@ -143,11 +148,11 @@ docker compose down -v           # stop + delete volumes (re-download next start
 ## Notes
 
 - **torch.compile**: both images ship `build-essential`, so the Cohere transcribe path and
-  OmniVoice's optional `compile_model` can JIT their CUDA kernels. Expect a one-time
+  OmniVoice's `compile_model` (on by default) can JIT their CUDA kernels. Expect a one-time
   compile delay on the first request after a cold start.
 - **GPU sharing**: all services share the same GPU. Whisper serializes DIA, ASR, and
   ReDim phases, and Whisper/DIA additionally share the Compose file lease. OmniVoice
-  enforces a VRAM budget (`OMNIVOICE_TTS_VRAM_BUDGET_MB`, default 24000); lower it if
+  enforces a VRAM budget (`OMNIVOICE_TTS_VRAM_BUDGET_MB`, default 10000); lower it if
   you run other GPU workloads.
 - **`could not select device driver "nvidia"`** → NVIDIA Container Toolkit not installed or
   Docker not restarted after `nvidia-ctk runtime configure`.

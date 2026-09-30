@@ -6,6 +6,7 @@ from typing import Any, Dict, Optional
 from dotenv import load_dotenv
 
 from .genesis_whisper_server_globals import (
+    COHERE_MODEL_ID,
     LOCAL_ASR_MODEL_MAP,
     LOG_FILE,
     LOGS_DIR,
@@ -20,7 +21,7 @@ load_dotenv(os.path.join(PROJECT_ROOT, ".env"), override=False)
 
 
 DEFAULT_SETTINGS: Dict[str, Any] = {
-    "local_model": "openai/whisper-large-v3-turbo",
+    "local_model": COHERE_MODEL_ID,
     "local_gpu_device": "auto",
     "local_model_precision": "fp16",
     "local_model_cache_path": ".\\models",

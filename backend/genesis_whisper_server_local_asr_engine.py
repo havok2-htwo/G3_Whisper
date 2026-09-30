@@ -19,6 +19,7 @@ except ImportError:
     DYNAMO_AVAILABLE = False
 
 from .genesis_whisper_server_globals import (
+    COHERE_MODEL_URL,
     current_settings,
     get_effective_transcription_language,
     get_local_model_backend,
@@ -281,15 +282,16 @@ def _format_model_load_error(model_id: str, exc: Exception, token_present: bool)
     if not _is_authentication_error(exc):
         return message
 
+    license_hint = f" Accept the license at {COHERE_MODEL_URL}." if uses_cohere_backend(model_id) else ""
     if token_present:
         return (
             f"{message} The configured Hugging Face token may not have access to '{model_id}'. "
-            f"Make sure the same Hugging Face account accepted the model license, then retry."
+            f"Make sure the same Hugging Face account accepted the model license, then retry.{license_hint}"
         )
 
     return (
         f"{message} No Hugging Face token with access to '{model_id}' is currently configured. "
-        f"Save one in the admin settings or set HUGGINGFACE_TOKEN/HF_TOKEN, then retry."
+        f"Save one in the admin settings or set HUGGINGFACE_TOKEN/HF_TOKEN, then retry.{license_hint}"
     )
 
 

@@ -8,7 +8,9 @@
 It provides a simple upload API for audio and video files, features a protected admin dashboard, and currently supports two local ASR paths:
 
 - Whisper models via Hugging Face `transformers`
-- `CohereLabs/cohere-transcribe-03-2026`
+- `CohereLabs/cohere-transcribe-03-2026` (default on first start)
+
+Cohere Transcribe is a gated model: accept its license at [https://huggingface.co/CohereLabs/cohere-transcribe-03-2026](https://huggingface.co/CohereLabs/cohere-transcribe-03-2026) with the Hugging Face account whose token you configure, otherwise the download fails.
 
 Voice vectors are generated exclusively with the pinned, open-weight ReDimNet2-B6 LM
 `vb2+vox2+cnc2_v0` model and are always L2-normalized 192-dimensional vectors.
@@ -630,7 +632,7 @@ Important files:
 
 The active default values come from [backend/genesis_whisper_server_storage.py](x:/dev/G3_WHISPER/backend/genesis_whisper_server_storage.py):
 
-- `local_model`: `openai/whisper-large-v3-turbo`
+- `local_model`: `CohereLabs/cohere-transcribe-03-2026` (gated, see [license page](https://huggingface.co/CohereLabs/cohere-transcribe-03-2026))
 - `local_gpu_device`: `auto`
 - `local_model_precision`: `fp16`
 - `local_model_cache_path`: `.\models`

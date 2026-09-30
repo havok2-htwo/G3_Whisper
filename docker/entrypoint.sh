@@ -15,7 +15,7 @@ if [ ! -f "${SETTINGS_FILE}" ]; then
   echo "[entrypoint] Seeding ${SETTINGS_FILE} (cache -> /app/models)"
   cat > "${SETTINGS_FILE}" <<'JSON'
 {
-    "local_model": "openai/whisper-large-v3-turbo",
+    "local_model": "CohereLabs/cohere-transcribe-03-2026",
     "local_gpu_device": "auto",
     "local_model_precision": "fp16",
     "local_model_cache_path": "/app/models",
