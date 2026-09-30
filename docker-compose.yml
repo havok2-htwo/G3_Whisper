@@ -40,6 +40,10 @@ services:
     environment:
       DIA_SERVER_BASE_URL: ${DIA_SERVER_BASE_URL:-http://dia:7864}
       GENESIS_GPU_LEASE_PATH: /app/gpu-coordination/gpu.lock
+    # Lets Whisper reach a DIA that was started outside this stack via
+    # http://host.docker.internal:7864 (inside the container "localhost" is Whisper itself).
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - whisper_models:/app/models
       - whisper_logs:/app/logs

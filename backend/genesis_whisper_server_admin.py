@@ -58,6 +58,7 @@ from .genesis_whisper_server_repetition import (
     filter_repeated_patterns,
     repetition_filter_enabled,
 )
+from .genesis_whisper_server_dia_client import dia_unreachable_hint
 from .genesis_whisper_server_storage import normalize_settings, resolve_dia_server_config, save_settings
 
 
@@ -514,11 +515,17 @@ def create_admin_api(app: FastAPI) -> FastAPI:
                 allow_redirects=False,
             )
         except requests.Timeout:
-            raise HTTPException(status_code=504, detail="DIA server connection test timed out.") from None
+            raise HTTPException(
+                status_code=504,
+                detail=f"DIA server connection test timed out ({base_url}).{dia_unreachable_hint(base_url)}",
+            ) from None
         except requests.RequestException:
             # Do not retain/chain the requests exception: it owns the prepared request,
             # including its headers, and therefore may contain the write-only key.
-            raise HTTPException(status_code=502, detail="DIA server could not be reached.") from None
+            raise HTTPException(
+                status_code=502,
+                detail=f"DIA server could not be reached at {base_url}.{dia_unreachable_hint(base_url)}",
+            ) from None
 
         try:
             if response.status_code in {401, 403}:

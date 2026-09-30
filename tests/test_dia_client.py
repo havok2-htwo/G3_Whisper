@@ -55,5 +55,38 @@ class DiaClientErrorDetailTests(unittest.TestCase):
         self.assertNotIn("Invalid API key", exc.message)
 
 
+class DiaUnreachableHintTests(unittest.TestCase):
+    def test_localhost_inside_a_container_points_to_the_compose_name(self) -> None:
+        with mock.patch.object(dia_client, "_running_in_container", return_value=True):
+            hint = dia_client.dia_unreachable_hint("http://localhost:7864")
+            self.assertIn("http://dia:7864", hint)
+            self.assertIn("host.docker.internal", hint)
+            self.assertIn("http://dia:7864", dia_client.dia_unreachable_hint("http://127.0.0.1:7864", german=True))
+
+    def test_localhost_outside_a_container_needs_no_hint(self) -> None:
+        with mock.patch.object(dia_client, "_running_in_container", return_value=False):
+            self.assertEqual(dia_client.dia_unreachable_hint("http://localhost:7864"), "")
+
+    def test_compose_name_hint_and_other_hosts(self) -> None:
+        self.assertIn("Compose", dia_client.dia_unreachable_hint("http://dia:7864"))
+        self.assertEqual(dia_client.dia_unreachable_hint("http://10.0.0.5:7864"), "")
+
+    def test_unreachable_upstream_message_names_url_and_hint(self) -> None:
+        def refuse(_request):
+            raise httpx.ConnectError("connection refused")
+
+        transport = httpx.MockTransport(refuse)
+        real_client = httpx.AsyncClient
+        with (
+            mock.patch.object(dia_client, "_effective_config", return_value=("http://localhost:7864", "")),
+            mock.patch.object(dia_client.httpx, "AsyncClient", side_effect=lambda **kw: real_client(transport=transport, **kw)),
+            mock.patch.object(dia_client, "_running_in_container", return_value=True),
+        ):
+            with self.assertRaises(dia_client.DiaClientError) as caught:
+                asyncio.run(dia_client.diarize_v2(io.BytesIO(b"RIFF"), "a.wav", "audio/wav"))
+        self.assertIn("http://localhost:7864", caught.exception.message)
+        self.assertIn("http://dia:7864", caught.exception.message)
+
+
 if __name__ == "__main__":
     unittest.main()

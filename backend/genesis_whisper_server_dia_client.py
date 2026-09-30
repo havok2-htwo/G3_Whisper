@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, BinaryIO
 from urllib.parse import urljoin, urlsplit
 
@@ -31,6 +32,42 @@ def _invalid_response() -> DiaClientError:
         "DIA-Server unterstuetzt nicht den erwarteten v2-Vertrag.",
         False,
     )
+
+
+_LOOPBACK_HOSTS = {"localhost", "0.0.0.0", "::1"}
+
+
+def _running_in_container() -> bool:
+    return Path("/.dockerenv").exists() or Path("/run/.containerenv").exists()
+
+
+def dia_unreachable_hint(base_url: str, *, german: bool = False) -> str:
+    """Explain the usual container networking mistake behind an unreachable DIA URL."""
+
+    host = (urlsplit(base_url).hostname or "").lower()
+    if (host in _LOOPBACK_HOSTS or host.startswith("127.")) and _running_in_container():
+        if german:
+            return (
+                " 'localhost' ist im Whisper-Container der Container selbst, nicht der Server. Im gemeinsamen "
+                "Compose-Stack http://dia:7864 eintragen (oder das Feld leer lassen), fuer einen separat "
+                "gestarteten DIA auf demselben Host http://host.docker.internal:7864."
+            )
+        return (
+            " Inside the Whisper container 'localhost' is the container itself, not the server. In the shared "
+            "Compose stack use http://dia:7864 (or leave the field empty); for a DIA started separately on the "
+            "same host use http://host.docker.internal:7864."
+        )
+    if host == "dia":
+        if german:
+            return (
+                " Der Name 'dia' ist nur aufloesbar, wenn DIA im selben Compose-Stack wie Whisper laeuft; sonst "
+                "http://host.docker.internal:7864 oder die IP des Servers eintragen."
+            )
+        return (
+            " The name 'dia' only resolves when DIA runs in the same Compose stack as Whisper; otherwise use "
+            "http://host.docker.internal:7864 or the server's IP."
+        )
+    return ""
 
 
 def _upstream_detail(response: httpx.Response) -> str:
@@ -160,7 +197,12 @@ async def diarize_v2(
     except httpx.TimeoutException as exc:
         raise DiaClientError(504, "DIA_TIMEOUT", "Zeitueberschreitung beim DIA-Server.", True) from exc
     except httpx.HTTPError as exc:
-        raise DiaClientError(502, "DIA_UPSTREAM_ERROR", "DIA-Server ist nicht erreichbar.", True) from exc
+        raise DiaClientError(
+            502,
+            "DIA_UPSTREAM_ERROR",
+            f"DIA-Server ist nicht erreichbar ({base_url}).{dia_unreachable_hint(base_url, german=True)}",
+            True,
+        ) from exc
 
     if response.status_code in (401, 403):
         raise DiaClientError(
@@ -191,4 +233,4 @@ async def diarize_v2(
     return _validate_dia_payload(payload)
 
 
-__all__ = ["DiaClientError", "diarize_v2"]
+__all__ = ["DiaClientError", "dia_unreachable_hint", "diarize_v2"]
