@@ -27,6 +27,7 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 import torch
 
+from .genesis_whisper_server_gpu import shared_gpu_lease
 from .genesis_whisper_server_turn_gate import clean_segment_text
 from .genesis_whisper_server_vid import EmbeddedVoiceWindow, VoiceWindow, embed_voice_windows
 
@@ -284,41 +285,43 @@ def align_chunk_slice(
 
     Seam ownership only needs the neighbouring chunk boundaries, so any subset
     of chunks can be aligned independently and the per-slice word lists simply
-    concatenate in chunk order.
+    concatenate in chunk order. Holds the cross-container GPU lease like every
+    other CUDA phase, so a colocated DIA never runs pyannote next to MMS_FA.
     """
 
-    components = _load_mms()
-    model, tokenizer, aligner = components["model"], components["tokenizer"], components["aligner"]
-    device = components["device"]
     total_s = len(audio) / SAMPLE_RATE
-
     words: list[dict[str, Any]] = []
-    for index in indices:
-        (a, b), text = chunks[index], texts[index]
-        cleaned = clean_segment_text(text)
-        pairs = [(w, _normalize_word(w)) for w in cleaned.split()]
-        pairs = [(orig, norm) for orig, norm in pairs if norm and _WORD_KEEP_RE.search(norm)]
-        if not pairs:
-            continue
-        pa = max(0.0, a - CHUNK_PAD_S)
-        pb = min(total_s, b + CHUNK_PAD_S)
-        clip = torch.from_numpy(
-            np.ascontiguousarray(audio[int(pa * SAMPLE_RATE) : int(pb * SAMPLE_RATE)])
-        ).unsqueeze(0).to(device)
-        with torch.inference_mode():
-            emission, _ = model(clip)
-        try:
-            spans = aligner(emission[0], tokenizer([norm for _, norm in pairs]))
-        except Exception as exc:  # alignment must never kill the request
-            print(f"[WARNUNG-WXC] Alignment von Chunk {index} fehlgeschlagen: {exc}", file=sys.stderr)
-            continue
-        ratio = clip.size(1) / emission.size(1)
-        for (orig, _), span in zip(pairs, spans):
-            t0 = pa + span[0].start * ratio / SAMPLE_RATE
-            t1 = pa + span[-1].end * ratio / SAMPLE_RATE
-            mid = (t0 + t1) / 2.0
-            if bounds[index] < mid <= bounds[index + 1]:
-                words.append({"t0": t0, "t1": t1, "word": orig})
+    with shared_gpu_lease():
+        components = _load_mms()
+        model, tokenizer, aligner = components["model"], components["tokenizer"], components["aligner"]
+        device = components["device"]
+
+        for index in indices:
+            (a, b), text = chunks[index], texts[index]
+            cleaned = clean_segment_text(text)
+            pairs = [(w, _normalize_word(w)) for w in cleaned.split()]
+            pairs = [(orig, norm) for orig, norm in pairs if norm and _WORD_KEEP_RE.search(norm)]
+            if not pairs:
+                continue
+            pa = max(0.0, a - CHUNK_PAD_S)
+            pb = min(total_s, b + CHUNK_PAD_S)
+            clip = torch.from_numpy(
+                np.ascontiguousarray(audio[int(pa * SAMPLE_RATE) : int(pb * SAMPLE_RATE)])
+            ).unsqueeze(0).to(device)
+            with torch.inference_mode():
+                emission, _ = model(clip)
+            try:
+                spans = aligner(emission[0], tokenizer([norm for _, norm in pairs]))
+            except Exception as exc:  # alignment must never kill the request
+                print(f"[WARNUNG-WXC] Alignment von Chunk {index} fehlgeschlagen: {exc}", file=sys.stderr)
+                continue
+            ratio = clip.size(1) / emission.size(1)
+            for (orig, _), span in zip(pairs, spans):
+                t0 = pa + span[0].start * ratio / SAMPLE_RATE
+                t1 = pa + span[-1].end * ratio / SAMPLE_RATE
+                mid = (t0 + t1) / 2.0
+                if bounds[index] < mid <= bounds[index + 1]:
+                    words.append({"t0": t0, "t1": t1, "word": orig})
     return words
 
 

@@ -53,14 +53,28 @@ repos **next to** this one:
 ## First run
 
 ```bash
-git clone https://dev.it-breitenstein.de/ai-jointventure/g3_whisper.git
-git clone https://dev.it-breitenstein.de/ai-jointventure/g3_omnivoice.git
-git clone https://dev.it-breitenstein.de/ai-jointventure/g3_dia.git
+git clone -b main https://dev.it-breitenstein.de/ai-jointventure/g3_whisper.git
+git clone -b main https://dev.it-breitenstein.de/ai-jointventure/g3_omnivoice.git
+git clone -b main https://dev.it-breitenstein.de/ai-jointventure/g3_dia.git
 cp g3_whisper/.env.example g3_whisper/.env      # set HUGGINGFACE_TOKEN and optional DIA_SERVER_API_KEY
 cd g3_whisper
 docker compose up -d --build
 docker compose logs -f
 ```
+
+> **Always check out `main`.** Whisper's `diarization` mode calls DIA's
+> `POST /v2/diarize`, which only exists on the `main` branch of `g3_dia`. An older
+> branch builds and starts fine, but every diarization request then fails.
+
+## Updating
+
+```bash
+for r in g3_whisper g3_omnivoice g3_dia; do git -C "$r" checkout main && git -C "$r" pull --ff-only; done
+cd g3_whisper
+docker compose up -d --build
+```
+
+Saved admin settings live in the `*_logs` / `*_data` volumes and survive the rebuild.
 
 > **First start is slow.** No models are baked into the images; each service downloads
 > them into a named volume on first boot (Whisper `whisper-large-v3-turbo` ~1.6 GB and

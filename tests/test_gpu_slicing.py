@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import unittest
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest import mock
 
@@ -83,6 +84,30 @@ class AlignmentSliceTests(unittest.TestCase):
 
         self.assertEqual(seen, [[0, 1, 2]])
         self.assertEqual([word["word"] for word in words], texts)
+
+    def test_alignment_runs_inside_the_shared_gpu_lease(self) -> None:
+        events: list[str] = []
+
+        @contextmanager
+        def fake_lease():
+            events.append("lease:enter")
+            yield
+            events.append("lease:exit")
+
+        def fake_load():
+            events.append("load_mms")
+            return {"model": None, "tokenizer": None, "aligner": None, "device": "cpu"}
+
+        audio = np.zeros(16000 * 2, dtype=np.float32)
+        with (
+            mock.patch.object(wxc, "shared_gpu_lease", new=fake_lease),
+            mock.patch.object(wxc, "_load_mms", side_effect=fake_load),
+        ):
+            # Punctuation-only text has no alignable words, so no model call happens.
+            words = wxc.align_chunk_slice([0], audio, [(0.0, 2.0)], ["..."], [float("-inf"), float("inf")])
+
+        self.assertEqual(words, [])
+        self.assertEqual(events, ["lease:enter", "load_mms", "lease:exit"])
 
     def test_bounds_sit_at_gap_midpoints(self) -> None:
         self.assertEqual(wxc.alignment_bounds([(0.0, 10.0), (11.0, 20.0)]), [float("-inf"), 10.5, float("inf")])

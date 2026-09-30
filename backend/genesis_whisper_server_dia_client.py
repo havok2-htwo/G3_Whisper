@@ -33,6 +33,19 @@ def _invalid_response() -> DiaClientError:
     )
 
 
+def _upstream_detail(response: httpx.Response) -> str:
+    """DIA's FastAPI error reason (``{"detail": ...}``), shortened for the client."""
+
+    try:
+        detail = response.json().get("detail")
+    except (ValueError, AttributeError):
+        return ""
+    if not detail:
+        return ""
+    text = detail if isinstance(detail, str) else str(detail)
+    return f" Grund: {text[:300]}"
+
+
 def _valid_milliseconds(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
@@ -160,14 +173,14 @@ async def diarize_v2(
         raise DiaClientError(
             502,
             "DIA_UPSTREAM_ERROR",
-            f"DIA-Server meldete HTTP {response.status_code}.",
+            f"DIA-Server meldete HTTP {response.status_code}.{_upstream_detail(response)}",
             True,
         )
     if response.status_code != 200:
         raise DiaClientError(
             502,
             "DIA_UPSTREAM_ERROR",
-            f"DIA-Server lieferte eine unerwartete Antwort (HTTP {response.status_code}).",
+            f"DIA-Server lieferte eine unerwartete Antwort (HTTP {response.status_code}).{_upstream_detail(response)}",
             False,
         )
     try:

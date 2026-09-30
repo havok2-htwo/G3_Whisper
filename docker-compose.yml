@@ -10,9 +10,10 @@
 #   ├─ g3_omnivoice/    <- clone of the g3_omnivoice repo
 #   └─ g3_dia/          <- clone of the g3_dia repo
 #
-#   git clone https://dev.it-breitenstein.de/ai-jointventure/g3_whisper.git
-#   git clone https://dev.it-breitenstein.de/ai-jointventure/g3_omnivoice.git
-#   git clone https://dev.it-breitenstein.de/ai-jointventure/g3_dia.git
+#   git clone -b main https://dev.it-breitenstein.de/ai-jointventure/g3_whisper.git
+#   git clone -b main https://dev.it-breitenstein.de/ai-jointventure/g3_omnivoice.git
+#   git clone -b main https://dev.it-breitenstein.de/ai-jointventure/g3_dia.git
+#   (always -b main: Whisper's diarization needs DIA's /v2/diarize, which only main has)
 #   cp g3_whisper/.env.example g3_whisper/.env   # set HUGGINGFACE_TOKEN
 #   cd g3_whisper && docker compose up -d --build
 #
