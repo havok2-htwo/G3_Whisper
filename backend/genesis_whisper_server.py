@@ -89,7 +89,7 @@ def _warmup_local_asr() -> None:
 
 
 def _warmup_redimnet() -> None:
-    """Eager-load both stable ReDimNet CUDA shapes after the ASR cache trim."""
+    """Eager-load every ReDimNet CUDA batch bucket (1/2/4/8) after the ASR cache trim."""
 
     try:
         from .genesis_whisper_server_vid import load_vid_model

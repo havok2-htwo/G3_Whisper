@@ -109,6 +109,43 @@ class AlignmentSliceTests(unittest.TestCase):
         self.assertEqual(words, [])
         self.assertEqual(events, ["lease:enter", "load_mms", "lease:exit"])
 
+    def test_alignment_feeds_model_dtype_and_aligns_float32_emissions(self) -> None:
+        import torch
+
+        seen: dict[str, object] = {}
+
+        class HalfModel:
+            def __call__(self, clip):
+                seen["input_dtype"] = clip.dtype
+                return torch.zeros((1, 50, 4), dtype=torch.float16), None
+
+        def aligner(emission, _tokens):
+            seen["emission_dtype"] = emission.dtype
+            span = SimpleNamespace(start=10, end=20)
+            return [[span]]
+
+        components = {
+            "model": HalfModel(),
+            "tokenizer": lambda words: [[1] for _ in words],
+            "aligner": aligner,
+            "device": torch.device("cpu"),
+            "dtype": torch.float16,
+        }
+        audio = np.zeros(16000, dtype=np.float32)
+        with (
+            mock.patch.object(wxc, "shared_gpu_lease", new=contextmanager(lambda: (yield))),
+            mock.patch.object(wxc, "_load_mms", return_value=components),
+        ):
+            words = wxc.align_chunk_slice([0], audio, [(0.0, 1.0)], ["hallo"], [float("-inf"), float("inf")])
+
+        self.assertEqual(seen, {"input_dtype": torch.float16, "emission_dtype": torch.float32})
+        self.assertEqual([word["word"] for word in words], ["hallo"])
+
+    def test_mms_runs_fp16_on_cuda(self) -> None:
+        import torch
+
+        self.assertIs(wxc.MMS_CUDA_DTYPE, torch.float16)
+
     def test_bounds_sit_at_gap_midpoints(self) -> None:
         self.assertEqual(wxc.alignment_bounds([(0.0, 10.0), (11.0, 20.0)]), [float("-inf"), 10.5, float("inf")])
 

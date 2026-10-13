@@ -396,7 +396,7 @@ def _request_processing_key(language_override: str | None) -> tuple[str, str, st
 
 
 # One GPU-lock hold of a bulk job may not exceed roughly a live request's own
-# GPU time. 64 ReDimNet windows are four padded batches (~0.3 s); four MMS
+# GPU time. 64 ReDimNet windows are eight batches of 8 (~0.3 s); four MMS
 # alignment chunks of ~25 s are ~0.8 s on an RTX 4090.
 EMBED_SLICE_WINDOWS = 64
 ALIGN_SLICE_CHUNKS = 4

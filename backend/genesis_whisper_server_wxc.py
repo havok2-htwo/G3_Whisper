@@ -62,7 +62,13 @@ SENTENCE_GAP_S = 1.5
 _silero_lock = threading.Lock()
 _silero_model: Any | None = None
 _mms_lock = threading.Lock()
-_mms_components: dict[str, Any] = {"model": None, "tokenizer": None, "aligner": None, "device": None}
+_mms_components: dict[str, Any] = {"model": None, "tokenizer": None, "aligner": None, "device": None, "dtype": None}
+# MMS_FA weights on CUDA. FP16 halves the resident model (1.2 GB -> 0.6 GB) and
+# the per-chunk peak; on the 10-min reference meeting all 1297 words, their order,
+# speaker assignment and sentences were identical to FP32, mean deviation 0.06 ms,
+# max 20 ms (one emission frame, 5 words). Emissions are cast back to FP32 for
+# the CTC aligner.
+MMS_CUDA_DTYPE = torch.float16
 
 
 def _default_user_hub() -> Path:
@@ -219,7 +225,8 @@ def _load_mms():
             from torchaudio.pipelines import MMS_FA as bundle
 
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            model = bundle.get_model().to(device)
+            dtype = MMS_CUDA_DTYPE if device.type == "cuda" else torch.float32
+            model = bundle.get_model().to(device=device, dtype=dtype)
             model.eval()
             _mms_components.update(
                 {
@@ -227,9 +234,10 @@ def _load_mms():
                     "tokenizer": bundle.get_tokenizer(),
                     "aligner": bundle.get_aligner(),
                     "device": device,
+                    "dtype": dtype,
                 }
             )
-            print(f"[INFO-WXC] MMS_FA Alignment-Modell auf '{device}' geladen.", file=sys.stderr)
+            print(f"[INFO-WXC] MMS_FA Alignment-Modell auf '{device}' ({dtype}) geladen.", file=sys.stderr)
         finally:
             torch.hub.set_dir(previous_hub)
         return _mms_components
@@ -295,6 +303,7 @@ def align_chunk_slice(
         components = _load_mms()
         model, tokenizer, aligner = components["model"], components["tokenizer"], components["aligner"]
         device = components["device"]
+        dtype = components.get("dtype") or torch.float32
 
         for index in indices:
             (a, b), text = chunks[index], texts[index]
@@ -307,9 +316,10 @@ def align_chunk_slice(
             pb = min(total_s, b + CHUNK_PAD_S)
             clip = torch.from_numpy(
                 np.ascontiguousarray(audio[int(pa * SAMPLE_RATE) : int(pb * SAMPLE_RATE)])
-            ).unsqueeze(0).to(device)
+            ).unsqueeze(0).to(device=device, dtype=dtype)
             with torch.inference_mode():
                 emission, _ = model(clip)
+                emission = emission.float()
             try:
                 spans = aligner(emission[0], tokenizer([norm for _, norm in pairs]))
             except Exception as exc:  # alignment must never kill the request
@@ -490,7 +500,7 @@ def verify_sentences(
     windows, kept = plan_verification_windows(audio, sentences)
     if not windows:
         return finish_verification(windows, kept, [])
-    return finish_verification(windows, kept, embed_voice_windows(windows, batch_size=16))
+    return finish_verification(windows, kept, embed_voice_windows(windows))
 
 
 def finish_verification(

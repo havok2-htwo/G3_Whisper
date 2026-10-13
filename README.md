@@ -315,8 +315,10 @@ therefore transcribe-first:
 2. Regions merge into ~25s superchunks with a 250ms safety pad on both sides, so
    no word is ever clipped at a chunk edge.
 3. The active ASR model transcribes those large chunks through the normal batch queue.
-4. torchaudio `MMS_FA` (lazy-loaded, ~1.2GB, German-capable) aligns every word to
+4. torchaudio `MMS_FA` (lazy-loaded, FP16 on CUDA ~0.6GB, German-capable) aligns every word to
    absolute timestamps; pad overlaps are deduplicated by gap-midpoint ownership.
+   FP16 was checked against FP32 on the 10-minute reference meeting: identical words,
+   order, speaker assignment and sentences, mean deviation 0.06 ms, max 20 ms (one frame).
 5. Words are assigned to speakers against the PR1-gated DIA skeleton
    (ghost turns below 150ms removed, same-speaker neighbours re-merged) and
    regrouped into sentences at the ASR punctuation.
@@ -451,14 +453,14 @@ The local ASR path already utilizes several optimizations:
   Cohere uses sub-batches of at most 16 audio items and performs its own long-audio chunking
 - startup warmup of the configured ASR model with a sample clip (see "Startup Warmup" below)
 - optional idle CUDA-cache trimming, disabled by default to preserve low tail latency (see "Idle VRAM Trimming" below)
-- ReDimNet2 window batching (default 16) with automatic CUDA-OOM batch-size reduction,
-  one shared batch stream across DIA speakers, block-vectorized VAD, and lazy audio windows
-  that avoid full recording/speech copies. CUDA eagerly prepares only batch shapes 1 and
-  16; partial multi-window batches are zero-padded to 16 and their padding outputs are
-  discarded. This prevents the roughly 2.5-second first-use compilation/autotuning spike
-  for every possible tail size while retaining the one-window microphone fast path. This
+- ReDimNet2 window batching (`REDIMNET_MAX_BATCH_SIZE` = 8) with automatic CUDA-OOM
+  batch-size reduction, one shared batch stream across DIA speakers, block-vectorized VAD,
+  and lazy audio windows that avoid full recording/speech copies. CUDA batches are
+  zero-padded to the next power of two (1/2/4/8, padding outputs discarded); longer window
+  streams run in chunks of 8. All four buckets are prepared at startup, which prevents the
+  roughly 4-second first-use kernel preparation for every new batch dimension. This
   internal window batch is separate from the ASR queue setting `batch_max_segments` and is
-  deliberately fixed to the two prepared shapes rather than exposed as an arbitrary value.
+  deliberately a constant rather than an arbitrary setting.
 - serial DIA, ASR, and ReDim phases on the local GPU; an optional cross-process file lease coordinates Whisper and DIA when they share a physical GPU
 
 ### Fair ASR Scheduling
@@ -508,19 +510,21 @@ VRAM one Cohere batch needs; raise it only on a GPU that is not shared with othe
 
 The configured ASR model is now eager-loaded at startup and warmed with `testaudio/Testaudio_02.wav`
 (previously the model was loaded lazily on the first request). After the warmup transcription the
-ASR CUDA cache is trimmed. ReDimNet is then eager-loaded and warmed for its stable one-window and
-maximum-batch CUDA shapes. Its prepared allocator pool deliberately remains resident, so both the
-first embedding and later DIA tail batches avoid first-shape latency spikes.
+ASR CUDA cache is trimmed. ReDimNet is then eager-loaded and warmed for its four CUDA batch buckets
+(1/2/4/8, largest first, ~4 s each on an RTX 4090). Its prepared allocator pool deliberately remains
+resident, so both the first embedding and later DIA tail batches avoid first-shape latency spikes.
 
 Both warmups are best-effort: any warmup failure (for example an unsupported precision) is logged
-and never blocks server startup. ReDimNet batch 16 does not duplicate the model: model weights stay
+and never blocks server startup. Batching does not duplicate the model: model weights stay
 single-copy, while only temporary activations and the retained CUDA allocator pool scale with the
-prepared batch shape. If batch 16 cannot fit, warmup and runtime automatically halve it.
+largest prepared batch. If batch 8 cannot fit, warmup and runtime automatically halve it.
 
-On the current RTX 5090/PyTorch stack, the retained ReDimNet allocation measured about 52 MiB for
-the model and 5.6 GiB of reserved allocator/workspace capacity after preparing batch 16. The latter
-is reusable cache rather than 16 copies of the weights, but it is still real reserved VRAM and can
-vary with GPU, CUDA, and PyTorch versions.
+Measured on a shared RTX 4090: the model is about 59 MiB, the reserved allocator/workspace pool after
+preparing all buckets 2.8 GiB (previously 5.6 GiB with a single padded batch 16). Embeddings are
+unchanged (cosine 1.000000 against the batch-16 server for 1-, 5- and 20-window voice vectors; per
+window >= 0.999998 against batch 1). Medians in ms: 1 window 38, 2 windows 37, 5 windows 46, 16
+windows 78, 64 windows 343 (bulk throughput ~10 % below batch 16, short live calls no longer pay for 16
+padded windows).
 
 ASR warmup, ReDimNet warmup, queued ASR inference, and later embedding inference all execute on the
 same persistent host worker. CUDA work was already serialized by the application GPU lock; pinning

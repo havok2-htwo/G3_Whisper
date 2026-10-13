@@ -213,12 +213,107 @@ class RedimNetVoicePathTests(unittest.TestCase):
         self.assertEqual(calls[0], (4, 4))
         self.assertEqual([item.start_ms for item in embedded], [index * 3000 for index in range(10)])
 
-    def test_cuda_inference_uses_only_single_or_prepared_batch_shape(self) -> None:
-        self.assertEqual(vid._inference_batch_size(1, "cuda", 16), 1)
-        for current_size in range(2, 17):
+    def test_cuda_inference_pads_to_next_power_of_two_bucket(self) -> None:
+        expected = {1: 1, 2: 2, 3: 4, 4: 4, 5: 8, 7: 8, 8: 8}
+        for current_size, bucket in expected.items():
             with self.subTest(current_size=current_size):
-                self.assertEqual(vid._inference_batch_size(current_size, "cuda", 16), 16)
-        self.assertEqual(vid._inference_batch_size(3, "cpu", 16), 3)
+                self.assertEqual(vid._inference_batch_size(current_size, "cuda", 8), bucket)
+        # After an OOM backoff the prepared maximum caps the bucket.
+        self.assertEqual(vid._inference_batch_size(2, "cuda", 2), 2)
+        self.assertEqual(vid._inference_batch_size(3, "cpu", 8), 3)
+        with self.assertRaises(ValueError):
+            vid._inference_batch_size(9, "cuda", 8)
+
+    def test_batch_buckets_and_default_maximum(self) -> None:
+        self.assertEqual(vid.REDIMNET_MAX_BATCH_SIZE, 8)
+        self.assertEqual(vid.redimnet_batch_buckets(8), [1, 2, 4, 8])
+        self.assertEqual(vid.redimnet_batch_buckets(4), [1, 2, 4])
+        self.assertEqual(vid.redimnet_batch_buckets(1), [1])
+
+    def test_cuda_warmup_prepares_every_bucket_largest_first(self) -> None:
+        warmed: list[int] = []
+        with mock.patch.object(vid, "_run_model_warmup", side_effect=lambda m, d, t, b: warmed.append(b)):
+            prepared = vid._warm_model_shapes(object(), torch.device("cuda"), torch.float16)
+        self.assertEqual(prepared, 8)
+        self.assertEqual(warmed, [8, 4, 2, 1])
+
+    def test_cuda_warmup_oom_halves_maximum_and_warms_smaller_buckets(self) -> None:
+        warmed: list[int] = []
+
+        def warm(model, device, dtype, batch):
+            if batch > 4:
+                raise RuntimeError("CUDA out of memory")
+            warmed.append(batch)
+
+        with (
+            mock.patch.object(vid, "_run_model_warmup", side_effect=warm),
+            mock.patch.object(vid.torch.cuda, "is_available", return_value=False),
+        ):
+            prepared = vid._warm_model_shapes(object(), torch.device("cuda"), torch.float16)
+        self.assertEqual(prepared, 4)
+        self.assertEqual(warmed, [4, 2, 1])
+
+    def test_cuda_warmup_still_prepares_single_window_when_every_batch_ooms(self) -> None:
+        warmed: list[int] = []
+
+        def warm(model, device, dtype, batch):
+            if batch > 1:
+                raise RuntimeError("CUDA out of memory")
+            warmed.append(batch)
+
+        with (
+            mock.patch.object(vid, "_run_model_warmup", side_effect=warm),
+            mock.patch.object(vid.torch.cuda, "is_available", return_value=False),
+        ):
+            prepared = vid._warm_model_shapes(object(), torch.device("cuda"), torch.float16)
+        self.assertEqual(prepared, 1)
+        self.assertEqual(warmed, [1])
+
+    def test_long_stream_runs_in_chunks_of_eight_with_padded_tail(self) -> None:
+        calls: list[int] = []
+
+        class FakeModel:
+            def __call__(self, waveform):
+                calls.append(len(waveform))
+                result = torch.zeros((len(waveform), vid.REDIMNET_EMBEDDING_DIMENSION))
+                result[:, 2] = 1.0
+                return result
+
+        windows = [
+            vid.VoiceWindow(
+                audio=np.full(vid.REDIMNET_WINDOW_SAMPLES, 0.05, dtype=np.float32),
+                start_ms=index,
+                end_ms=index + 1,
+            )
+            for index in range(19)
+        ]
+        components = {
+            "model": FakeModel(),
+            "device": torch.device("cuda"),
+            "dtype": torch.float16,
+            "cache_root": None,
+            "cuda_batch_size": 8,
+        }
+        real_from_numpy = torch.from_numpy
+
+        class _HostTensor:
+            def __init__(self, array):
+                self._tensor = real_from_numpy(array)
+
+            def to(self, device=None, dtype=None):
+                return self._tensor.to(dtype=dtype)
+
+        with (
+            mock.patch.object(vid, "load_vid_model", return_value=True),
+            mock.patch.dict(vid._redimnet_components, components, clear=True),
+            mock.patch.object(vid, "shared_gpu_lease", return_value=nullcontext()),
+            mock.patch.object(vid, "_model_autocast", return_value=nullcontext()),
+            mock.patch.object(vid.torch, "from_numpy", side_effect=_HostTensor),
+        ):
+            embedded = vid.embed_voice_windows(windows)
+
+        self.assertEqual(calls, [8, 8, 4])
+        self.assertEqual([item.start_ms for item in embedded], list(range(19)))
 
     def test_cuda_batch_padding_preserves_real_windows_and_zero_fills_tail(self) -> None:
         windows = [
@@ -230,9 +325,9 @@ class RedimNetVoicePathTests(unittest.TestCase):
             for index in range(3)
         ]
 
-        prepared = vid._prepare_waveform_batch(windows, 16)
+        prepared = vid._prepare_waveform_batch(windows, 4)
 
-        self.assertEqual(prepared.shape, (16, vid.REDIMNET_WINDOW_SAMPLES))
+        self.assertEqual(prepared.shape, (4, vid.REDIMNET_WINDOW_SAMPLES))
         np.testing.assert_array_equal(prepared[0], windows[0].audio)
         np.testing.assert_array_equal(prepared[2], windows[2].audio)
         self.assertTrue(np.all(prepared[3:] == 0.0))

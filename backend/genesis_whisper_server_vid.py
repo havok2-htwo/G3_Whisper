@@ -49,11 +49,13 @@ REDIMNET_WINDOW_SECONDS = 3.0
 REDIMNET_WINDOW_SAMPLES = int(REDIMNET_SAMPLE_RATE * REDIMNET_WINDOW_SECONDS)
 REDIMNET_MIN_WINDOW_SECONDS = 0.5
 REDIMNET_MIN_WINDOW_SAMPLES = int(REDIMNET_SAMPLE_RATE * REDIMNET_MIN_WINDOW_SECONDS)
-# Batch 16 is the measured throughput/memory sweet spot for B6 on the target
-# GPU; larger batches consume substantially more VRAM without improving steady
-# state throughput. OOM handling below still learns a smaller request-local
-# size for constrained cards.
-REDIMNET_DEFAULT_BATCH_SIZE = 16
+# CUDA batches are padded to the next power of two up to this maximum (buckets
+# 1/2/4/8); longer window streams run in chunks of 8.  Measured on a shared RTX
+# 4090: the reserved pool is 2.8 GiB instead of 5.6 GiB for batch 16, bulk
+# throughput drops only ~10 % (B6 is already compute-bound at 8), and a short
+# 2-5 window call no longer pays for 16 padded windows.  OOM handling below
+# still halves the prepared maximum for constrained cards.
+REDIMNET_MAX_BATCH_SIZE = 8
 REDIMNET_MIN_CUDA_BATCH_SIZE = 2
 _ENERGY_VAD_FRAME_MS = 30
 _ENERGY_VAD_BATCH_FRAMES = 8192
@@ -217,31 +219,42 @@ def _run_model_warmup(
         del waveform, embedding
 
 
+def redimnet_batch_buckets(maximum: int) -> list[int]:
+    """Power-of-two CUDA batch shapes up to ``maximum`` (1, 2, 4, ...)."""
+
+    buckets = [1]
+    while buckets[-1] * 2 <= max(1, int(maximum)):
+        buckets.append(buckets[-1] * 2)
+    return buckets
+
+
 def _warm_model_shapes(
     model: Any,
     device: torch.device,
     dtype: torch.dtype,
 ) -> int:
-    """Warm the only CUDA shapes used in production: one and the prepared max.
+    """Warm every CUDA batch bucket used in production: 1, 2, 4 and 8.
 
-    ReDimNet/PyTorch incurs roughly 2.5 seconds of one-time kernel preparation for
+    ReDimNet/PyTorch incurs roughly 2.5-4 seconds of one-time kernel preparation for
     every previously unseen batch dimension on the target stack. Running arbitrary
     tail sizes therefore caused later short requests to spike even though the model
-    itself was already resident. Production inference now uses batch 1 for the
-    common single-window microphone case and pads every larger batch to one prepared
-    maximum. That keeps the fast path to two stable CUDA shapes without compiling all
-    16 possible dimensions or retaining their individual workspaces.
+    itself was already resident. Production inference pads every batch to the next
+    power of two up to the prepared maximum, so only these few shapes ever reach
+    the model. The largest bucket is prepared first so the allocator pool is sized
+    once and the smaller buckets reuse it.
     """
 
-    _run_model_warmup(model, device, dtype, 1)
-    if device.type != "cuda" or REDIMNET_DEFAULT_BATCH_SIZE == 1:
-        return REDIMNET_DEFAULT_BATCH_SIZE
+    if device.type != "cuda" or REDIMNET_MAX_BATCH_SIZE == 1:
+        _run_model_warmup(model, device, dtype, 1)
+        return REDIMNET_MAX_BATCH_SIZE
 
-    candidate = REDIMNET_DEFAULT_BATCH_SIZE
+    prepared = 1
+    candidate = REDIMNET_MAX_BATCH_SIZE
     while candidate >= REDIMNET_MIN_CUDA_BATCH_SIZE:
         try:
             _run_model_warmup(model, device, dtype, candidate)
-            return candidate
+            prepared = candidate
+            break
         except RuntimeError as exc:
             if "out of memory" not in str(exc).lower():
                 raise
@@ -257,20 +270,27 @@ def _warm_model_shapes(
                 file=sys.stderr,
             )
 
-    return 1
+    # ``prepared`` itself already ran above unless every candidate failed.
+    smaller = redimnet_batch_buckets(prepared)
+    for bucket in reversed(smaller if prepared == 1 else smaller[:-1]):
+        _run_model_warmup(model, device, dtype, bucket)
+    return prepared
 
 
 def _inference_batch_size(current_size: int, device_type: str, prepared_cuda_batch_size: int) -> int:
-    """Return a stable model batch shape while preserving the one-window fast path."""
+    """Return the power-of-two CUDA bucket for ``current_size`` real windows."""
 
     if current_size <= 0:
         raise ValueError("current_size muss positiv sein.")
-    if device_type != "cuda" or current_size == 1:
+    if device_type != "cuda":
         return current_size
     prepared = max(1, int(prepared_cuda_batch_size))
     if current_size > prepared:
         raise ValueError("current_size darf die vorbereitete CUDA-Batchgroesse nicht ueberschreiten.")
-    return prepared
+    bucket = 1
+    while bucket < current_size:
+        bucket *= 2
+    return min(bucket, prepared)
 
 
 def _prepare_waveform_batch(
@@ -354,7 +374,8 @@ def load_vid_model() -> bool:
                 )
             print(
                 "[INFO-VID] ReDimNet2 erfolgreich fuer CUDA-Batchformen "
-                f"1 und {cuda_batch_size} aufgewaermt ({warmup_duration_ms} ms).{memory_note}",
+                f"{'/'.join(str(b) for b in redimnet_batch_buckets(cuda_batch_size))} "
+                f"aufgewaermt ({warmup_duration_ms} ms).{memory_note}",
                 file=sys.stderr,
             )
             return True
@@ -569,7 +590,7 @@ def _iter_concatenated_segment_windows(
 def embed_voice_windows(
     windows: Iterable[VoiceWindow],
     *,
-    batch_size: int = REDIMNET_DEFAULT_BATCH_SIZE,
+    batch_size: int = REDIMNET_MAX_BATCH_SIZE,
 ) -> list[EmbeddedVoiceWindow]:
     effective_batch_size = max(1, int(batch_size))
     window_iterator = iter(windows)
@@ -584,7 +605,7 @@ def embed_voice_windows(
     dtype: torch.dtype = _redimnet_components["dtype"]
     prepared_cuda_batch_size = max(
         1,
-        int(_redimnet_components.get("cuda_batch_size") or REDIMNET_DEFAULT_BATCH_SIZE),
+        int(_redimnet_components.get("cuda_batch_size") or REDIMNET_MAX_BATCH_SIZE),
     )
     effective_batch_size = min(effective_batch_size, prepared_cuda_batch_size)
     output: list[EmbeddedVoiceWindow] = []
@@ -701,6 +722,7 @@ def generate_voice_vector(audio_data_np: np.ndarray) -> np.ndarray:
 __all__ = [
     "EmbeddedVoiceWindow",
     "REDIMNET_EMBEDDING_DIMENSION",
+    "REDIMNET_MAX_BATCH_SIZE",
     "REDIMNET_MIN_WINDOW_SAMPLES",
     "REDIMNET_SAMPLE_RATE",
     "REDIMNET_WINDOW_SAMPLES",
@@ -710,5 +732,6 @@ __all__ = [
     "generate_voice_vector",
     "iter_windows_from_audio",
     "load_vid_model",
+    "redimnet_batch_buckets",
     "windows_from_audio",
 ]
