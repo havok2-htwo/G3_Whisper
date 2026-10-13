@@ -18,6 +18,11 @@ try:
 except ImportError:
     DYNAMO_AVAILABLE = False
 
+from .genesis_whisper_server_cohere_cuda_graphs import (
+    cohere_cuda_graphs_supported,
+    install_cohere_cuda_graphs,
+    install_cohere_cudnn_free_encoder,
+)
 from .genesis_whisper_server_globals import (
     COHERE_MODEL_URL,
     current_settings,
@@ -32,6 +37,10 @@ from .genesis_whisper_server_globals import (
 
 COHERE_MAX_INFERENCE_BATCH_SIZE = 16
 LAST_LOCAL_ASR_LOAD_ERROR: Optional[str] = None
+# Installierter Cohere-Inferenz-Patch des geladenen Modells: CohereCudaGraphs (Graphen +
+# cuDNN-freier eager Encoder) oder CohereCudnnFreeEncoder (nur eager). None = kein Patch.
+_COHERE_INFERENCE_PATCH: Optional[Any] = None
+_LOGGED_COMPILE_SKIP_REASONS: set = set()
 
 
 def _install_fp16_masked_fill_guard() -> None:
@@ -418,7 +427,106 @@ def _configure_hf_dynamic_module_cache(cache_path: str) -> Optional[str]:
     return modules_cache_path
 
 
+def _uninstall_cohere_inference_patch() -> None:
+    """Graphen/Encoder-Patch entfernen; muss vor ``empty_cache`` laufen, sonst bleiben die
+    privaten Graph-Pools reserviert."""
+
+    global _COHERE_INFERENCE_PATCH
+    patch = _COHERE_INFERENCE_PATCH
+    _COHERE_INFERENCE_PATCH = None
+    if patch is None:
+        return
+    try:
+        patch.uninstall()
+    except Exception as exc:
+        print(f"[WARNUNG] Cohere CUDA-Graphs konnten nicht sauber deinstalliert werden: {exc}", file=sys.stderr)
+
+
+def cohere_cuda_graphs_active(model=None) -> bool:
+    patch = _COHERE_INFERENCE_PATCH
+    if patch is None or not getattr(patch, "installed", False) or not hasattr(patch, "warmup"):
+        return False
+    return model is None or getattr(patch, "model", None) is model
+
+
+def get_cohere_inference_patch_stats() -> Optional[Dict[str, Any]]:
+    patch = _COHERE_INFERENCE_PATCH
+    if patch is None:
+        return None
+    try:
+        return patch.stats()
+    except Exception:
+        return None
+
+
+def _cohere_cuda_graphs_enabled() -> bool:
+    with settings_lock:
+        return current_settings.get("cohere_cuda_graphs", True) is not False
+
+
+def _install_cohere_inference_patch(model, normalized_precision: str) -> None:
+    """CUDA-Graphen fuer Cohere installieren und aufwaermen, sonst cuDNN-freier eager Encoder.
+
+    Laeuft innerhalb von ``load_local_asr_model`` und damit im Server immer auf dem
+    GPU-Executor-Thread (Startup-Warmup, Admin-Reload und Lazy-Load im Batch-Worker gehen
+    alle ueber ``run_blocking_gpu_phase``). Dieser Thread wird Besitzer der Graphen; nur
+    dort darf spaeter lazy gecaptured werden. Jeder Fehler laesst das Modell eager laufen.
+    """
+
+    global _COHERE_INFERENCE_PATCH
+    _uninstall_cohere_inference_patch()
+    model_device, _ = _get_model_device_and_dtype(model)
+    if model_device.type != "cuda":
+        return
+
+    supported, reason = cohere_cuda_graphs_supported(model, normalized_precision)
+    if not _cohere_cuda_graphs_enabled():
+        print("[INFO] Cohere CUDA-Graphs per Einstellung deaktiviert -> eager (Encoder ohne cuDNN).", file=sys.stderr)
+    elif not supported:
+        print(f"[INFO] Cohere CUDA-Graphs nicht aktiv: {reason} -> eager (Encoder ohne cuDNN).", file=sys.stderr)
+    else:
+        graphs = None
+        try:
+            graphs = install_cohere_cuda_graphs(model)
+            stats = graphs.warmup()
+            _COHERE_INFERENCE_PATCH = graphs
+            if stats.get("capture_failures"):
+                print(
+                    f"[WARNUNG] Cohere CUDA-Graphs: {stats['capture_failures']} Capture(s) im Warmup fehlgeschlagen; "
+                    "betroffene Formen laufen eager.",
+                    file=sys.stderr,
+                )
+            print(
+                f"[INFO] Optimierung: Cohere CUDA-Graphs aktiv ({stats['graphs']} Graphen, "
+                f"{stats['graph_memory_mb']} MB, Warmup {stats['warmup_seconds']} s).",
+                file=sys.stderr,
+            )
+            return
+        except Exception as exc:
+            print(
+                f"[WARNUNG] Cohere CUDA-Graphs konnten nicht installiert werden ({type(exc).__name__}: {exc}). "
+                "Fahre eager fort.",
+                file=sys.stderr,
+            )
+            _COHERE_INFERENCE_PATCH = None
+            if graphs is not None:
+                try:
+                    graphs.uninstall()
+                except Exception:
+                    pass
+            graphs = None
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    try:
+        _COHERE_INFERENCE_PATCH = install_cohere_cudnn_free_encoder(model)
+    except Exception as exc:
+        print(f"[WARNUNG] cuDNN-freier Cohere-Encoder konnte nicht installiert werden: {exc}", file=sys.stderr)
+
+
 def _cleanup_previous_model():
+    _uninstall_cohere_inference_patch()
     if local_model_components.get("model") is None:
         return
 
@@ -610,6 +718,8 @@ def load_local_asr_model(model_id: str, device_selection: str, cache_path: str, 
             model_device, _ = _get_model_device_and_dtype(model)
             if not use_gpu and model_device.type != "cpu":
                 model.to("cpu")
+            if uses_cohere_backend(model_id):
+                _install_cohere_inference_patch(model, normalized_precision)
 
             _store_local_model_components(model, processor, target_identifier, model_backend)
             LAST_LOCAL_ASR_LOAD_ERROR = None
@@ -629,6 +739,7 @@ def load_local_asr_model(model_id: str, device_selection: str, cache_path: str, 
             else:
                 print(f"[FEHLER] Kritisches Problem beim Laden des Modells '{model_id}': {formatted_error}", file=sys.stderr)
                 traceback.print_exc()
+            _uninstall_cohere_inference_patch()
             _store_local_model_components(None, None, None, None)
             return False
 
@@ -688,28 +799,47 @@ def _cohere_transcribe_via_generate_api(processor, model, audio_batch: List[np.n
     return [str(text).strip() for text in texts]
 
 
+def _has_triton() -> bool:
+    try:
+        from torch.utils._triton import has_triton
+
+        return bool(has_triton())
+    except Exception:
+        return False
+
+
 def _cohere_transcribe_via_transcribe_api(processor, model, audio_batch: List[np.ndarray], language: str, batch_size: int) -> List[str]:
     if not hasattr(model, "transcribe"):
         raise AttributeError("Das geladene Cohere-Modell bietet keine transcribe()-Methode an.")
 
     model_device, _ = _get_model_device_and_dtype(model)
     enable_compile = model_device.type == "cuda"
-    if enable_compile:
+    if enable_compile and cohere_cuda_graphs_active(model):
+        # CUDA-Graphen ersetzen Encoder und Decoder bereits; torch.compile der Encoder-Layer
+        # wuerde Dynamo in die Graph-Captures ziehen.
+        enable_compile = False
+    elif enable_compile:
         # torch.compile / Inductor JIT-compiles the kernel wrappers with a host C++ compiler
         # on the first inference. Skip compile (run eager) when none is available so a
         # compiler-less environment degrades gracefully instead of raising
         # "InductorError: No working C++ compiler": MSVC 'cl' on Windows, g++/clang++/c++
         # elsewhere (the Linux container image ships build-essential, so g++ is present).
+        # Inductor also needs Triton for the CUDA kernels; without it the first call raises
+        # TritonMissing (a Windows venv usually has no triton).
         if os.name == "nt":
             has_cxx = shutil.which("cl") is not None
         else:
             has_cxx = any(shutil.which(cxx) for cxx in ("g++", "clang++", "c++"))
+        skip_reason = None
         if not has_cxx:
+            skip_reason = "kein C++-Compiler (cl/g++) gefunden"
+        elif not _has_triton():
+            skip_reason = "Triton nicht installiert"
+        if skip_reason is not None:
             enable_compile = False
-            print(
-                "[INFO] Cohere transcribe()-Compile deaktiviert: kein C++-Compiler (cl/g++) gefunden.",
-                file=sys.stderr,
-            )
+            if skip_reason not in _LOGGED_COMPILE_SKIP_REASONS:
+                _LOGGED_COMPILE_SKIP_REASONS.add(skip_reason)
+                print(f"[INFO] Cohere transcribe()-Compile deaktiviert: {skip_reason}.", file=sys.stderr)
 
     transcribe_kwargs = {
         "processor": processor,

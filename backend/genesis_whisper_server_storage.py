@@ -33,6 +33,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "scheduler_max_parallel_long_jobs": 2,
     "scheduler_first_chunk_fast_path": True,
     "cuda_memory_trim_after_batch": True,
+    "cohere_cuda_graphs": True,
     "debug_retain_history_audio": False,
     "huggingface_token": "",
     "dia_server_base_url": "",
@@ -133,6 +134,17 @@ def normalize_settings(settings: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         configured_cuda_trim
         if isinstance(configured_cuda_trim, bool)
         else DEFAULT_SETTINGS["cuda_memory_trim_after_batch"]
+    )
+
+    # Wirkt erst beim naechsten Modell-(Neu-)Laden; die Graphen werden beim Laden installiert.
+    configured_cuda_graphs = source.get(
+        "cohere_cuda_graphs",
+        DEFAULT_SETTINGS["cohere_cuda_graphs"],
+    )
+    normalized["cohere_cuda_graphs"] = (
+        configured_cuda_graphs
+        if isinstance(configured_cuda_graphs, bool)
+        else DEFAULT_SETTINGS["cohere_cuda_graphs"]
     )
 
     configured_history_audio_debug = source.get(

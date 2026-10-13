@@ -436,7 +436,8 @@ The local ASR path already utilizes several optimizations:
   - `bf16` is the recommended precision.
   - `fp8` is experimental (see "Experimental fp8 Precision" below).
 - optional 8-bit Transformers loading through `bitsandbytes` for lower model VRAM usage
-- `torch.compile(...)`, if available and sensible
+- `torch.compile(...)`, if available and sensible (Cohere: only without CUDA graphs and only when a C++ compiler and Triton exist)
+- Cohere CUDA graphs for encoder and greedy decoder plus a cuDNN-free eager encoder (see "Cohere CUDA Graphs" below)
 - `sdpa` as the attention standard
 - `flash_attention_2` only if `flash_attn` is installed
 - Batch queue for Whisper
@@ -541,6 +542,62 @@ this automatic setting. The `start.bat` launcher additionally sets
 `PYTORCH_CUDA_ALLOC_CONF=garbage_collection_threshold:0.8,max_split_size_mb:256` before launch to
 reduce reserved-pool fragmentation (note: `expandable_segments` is ignored on Windows).
 
+### Cohere CUDA Graphs
+
+For `CohereLabs/cohere-transcribe-03-2026` on CUDA with `fp16` or `bf16`, the model's encoder and
+greedy decoder are replayed as captured CUDA graphs
+([backend/genesis_whisper_server_cohere_cuda_graphs.py](x:/dev/G3_WHISPER/backend/genesis_whisper_server_cohere_cuda_graphs.py)).
+The eager path is almost pure kernel-launch overhead for short clips: HF `generate` pays Python
+overhead for every token, and cuDNN builds a new convolution plan the first time each encoder
+length appears (+400-550 ms per new length). No `torch.compile`, Triton or C++ compiler is needed.
+
+- **Decoder:** `model.generate` is replaced on the instance. Cross-attention K/V are computed once
+  per request into static buffers padded to 448 encoder frames (35 s of audio), the ~9-token prompt
+  runs eagerly, and every following one-token step is one graph replay per batch bucket
+  (1/2/4/8/16, self-KV length 320). EOS tracking stays inside the graph. The KV buffers are sized
+  for 16 rows once and shared by all batch buckets.
+- **Encoder:** `model.encoder.forward` is replaced. Features are zero-padded to 128-frame buckets
+  (28 buckets up to 3584 frames = 35 s) and batch buckets 1/2/4 (larger batches are split); the output
+  is sliced back to the eager shape. Padding is a mathematical no-op for the valid frames (length
+  masks, masked attention keys, zeroed conv pad frames, eval BatchNorm).
+- **Fallbacks:** sampling, beams, unknown `generate` kwargs, a non-uniform prompt mask, more than
+  16 rows, more than 35 s, CPU tensors and every shape that is not captured route to the original
+  eager code. The eager encoder always runs with cuDNN disabled (also when graphs are off), which
+  removes the per-length plan penalty; this is safe because all CUDA phases of the process are
+  serialized on one host thread.
+- **Thread rule:** graphs are installed and captured inside `load_local_asr_model`, which the server
+  only calls through `run_blocking_gpu_phase` (startup warmup, admin reload, lazy load in the batch
+  worker). That GPU executor thread owns the graphs; only it may capture new shapes later. Any
+  other thread replays existing graphs and runs missing shapes eagerly, because a capture breaks
+  when another thread synchronizes, empties the cache or allocates concurrently.
+- **Warmup:** decoder batches 1/2/4 plus encoder batch 1 for all 28 frame buckets (largest first)
+  are captured at load time: ~5 s extra and ~550 MB of graph memory (static buffers + private graph
+  pools). Decoder 8/16 and encoder 2/4 are captured lazily on first use (~0.3-0.5 s once each; the
+  first batch-2/4 encoder capture also captures that bucket's largest shape first so later shapes
+  reuse its pool blocks instead of growing it).
+- **VRAM ceiling:** only the buckets above can be captured (89 graphs at most) and graph memory has a
+  hard budget of 1536 MB; beyond it a shape simply stays eager. Measured worst case on the RTX 4090
+  with every allowed bucket captured in production-like order: 1.32 GB graph memory (+1.55 GB
+  reserved over the model floor). Graph memory survives the idle CUDA trim by design and is
+  released on model unload/reload.
+- **Not used for** `int8_bnb`, `fp8` (quantized kernels) or `fp32` (unverified); those keep the eager
+  path with the cuDNN-free encoder. When graphs are active, the `transcribe(compile=True)` path is
+  disabled; without graphs it is used only when a C++ compiler and Triton are both present.
+
+Measured through the real engine (`process_local_asr_batch` on the GPU executor thread, RTX 4090
+shared with other services, fp16), transcripts byte-identical in every case:
+
+| Workload | eager (before) | eager, cuDNN off | CUDA graphs |
+| --- | --- | --- | --- |
+| 2 s clip (warm median) | 269 ms | 257 ms | 30 ms |
+| 14.4 s file (warm median) | 905 ms | 920 ms | 116 ms |
+| mixed batch of 3 (2 s / 7 s / 14.4 s) | 915 ms | 948 ms | 170 ms |
+| 20 random 1-20 s clips, warm (total) | 16.9-23.8 s | 17.3-17.8 s | 2.2 s |
+| 20 random 1-20 s clips, first time per length (total / max) | 28.7 s / 8.4 s | 13.3 s / 1.2 s | 1.9 s / 0.17 s |
+
+The setting `cohere_cuda_graphs` (default `true`, admin checkbox "Cohere CUDA graphs") takes effect
+on the next model (re)load: restart the server or change model, device, precision or cache path.
+
 ### Experimental fp8 Precision
 
 The precision setting accepts an experimental `fp8` value that loads the model with
@@ -641,6 +698,7 @@ The active default values come from [backend/genesis_whisper_server_storage.py](
 - `batch_max_segments`: `16`
 - `batch_max_audio_seconds`: `100.0`
 - `cuda_memory_trim_after_batch`: `true`
+- `cohere_cuda_graphs`: `true` (applies on the next model load)
 - `debug_retain_history_audio`: `false`
 - `huggingface_token`: empty string
 - `dia_server_base_url`: empty string (falls back to `DIA_SERVER_BASE_URL`)

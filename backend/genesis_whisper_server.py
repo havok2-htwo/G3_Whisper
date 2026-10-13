@@ -35,7 +35,11 @@ def _warmup_local_asr() -> None:
     try:
         from .genesis_whisper_server_audio import load_audio_bytes
         from .genesis_whisper_server_gpu import shared_gpu_lease
-        from .genesis_whisper_server_local_asr_engine import load_local_asr_model, transcribe_local_asr
+        from .genesis_whisper_server_local_asr_engine import (
+            get_cohere_inference_patch_stats,
+            load_local_asr_model,
+            transcribe_local_asr,
+        )
 
         model_id = current_settings.get("local_model")
         if not model_id:
@@ -59,6 +63,16 @@ def _warmup_local_asr() -> None:
             audio = load_audio_bytes(WARMUP_SAMPLE.read_bytes(), WARMUP_SAMPLE.name)
             text = transcribe_local_asr(audio, language=language)
         print(f"[WARMUP] fertig. Beispiel-Transkript: {str(text)[:80]!r}", file=sys.stderr)
+        # Die CUDA-Graphen (Decoder B=1/2/4, Encoder B=1 alle Frame-Buckets) werden bereits in
+        # load_local_asr_model auf diesem GPU-Thread gecaptured; hier nur der Status.
+        graph_stats = get_cohere_inference_patch_stats()
+        if graph_stats and graph_stats.get("graphs"):
+            print(
+                f"[WARMUP] Cohere CUDA-Graphs: {graph_stats['graphs']} Graphen, "
+                f"{graph_stats['graph_memory_mb']} MB, Replays Encoder/Decoder "
+                f"{graph_stats['encoder_graph']}/{graph_stats['decoder_graph']}.",
+                file=sys.stderr,
+            )
     except Exception as exc:
         print(f"[WARMUP] nicht-kritischer Warmup-Fehler ({type(exc).__name__}: {exc}).", file=sys.stderr)
     finally:

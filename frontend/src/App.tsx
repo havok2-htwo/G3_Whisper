@@ -107,6 +107,7 @@ const emptySettings: AdminSettings = {
   scheduler_max_parallel_long_jobs: 2,
   scheduler_first_chunk_fast_path: true,
   cuda_memory_trim_after_batch: true,
+  cohere_cuda_graphs: true,
   debug_retain_history_audio: false,
   huggingface_token: "",
   dia_server_base_url: "",
@@ -2292,6 +2293,23 @@ export default function App() {
                   Releases the process-wide CUDA allocator pool once the ASR queue has been idle for 5 s, so the
                   idle footprint stays near the model floor on a shared GPU. The next request re-reserves its pool
                   (measured: about +80 ms once for a ReDimNet batch). Disable only on a GPU this server has to itself.
+                </small>
+              </span>
+            </label>
+
+            <label className="settings-checkbox full-width">
+              <input
+                type="checkbox"
+                checked={settingsForm.cohere_cuda_graphs}
+                onChange={(event) => updateSetting("cohere_cuda_graphs", event.target.checked)}
+              />
+              <span>
+                Cohere CUDA graphs
+                <small>
+                  Replays the Cohere encoder and greedy decoder as captured CUDA graphs (measured on an RTX 4090:
+                  2 s clip 270 to 30 ms, 14 s file 0.9 to 0.12 s, identical transcripts) for about +0.55 GB VRAM
+                  (hard cap 1.5 GB) and about 5 s of extra warmup. fp16/bf16 on CUDA only. Takes effect on the next
+                  model (re)load: restart the server or change model, device, precision or cache path.
                 </small>
               </span>
             </label>

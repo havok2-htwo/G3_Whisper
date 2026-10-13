@@ -123,6 +123,40 @@ class AdminDiaSettingsTests(unittest.TestCase):
         persisted = json.loads(self.settings_file.read_text(encoding="utf-8"))
         self.assertTrue(persisted["cuda_memory_trim_after_batch"])
 
+    def test_cohere_cuda_graphs_setting_round_trips_without_model_reload(self) -> None:
+        endpoint = self._endpoint("/api/admin/settings", "PUT")
+        self.assertTrue(storage.DEFAULT_SETTINGS["cohere_cuda_graphs"])
+        self.assertTrue(admin.current_settings["cohere_cuda_graphs"])
+
+        disabled = asyncio.run(
+            endpoint(
+                admin.AdminSettingsPayload(cohere_cuda_graphs=False),
+                {"username": "admin"},
+            )
+        )
+        self.assertFalse(disabled["settings"]["cohere_cuda_graphs"])
+        # Takes effect on the next model (re)load; toggling alone never reloads the model.
+        self.assertFalse(disabled["model_reloaded"])
+        self.assertIsNone(disabled["model_loaded"])
+
+        partial = asyncio.run(
+            endpoint(
+                admin.AdminSettingsPayload(batch_wait_time_ms=7),
+                {"username": "admin"},
+            )
+        )
+        self.assertFalse(partial["settings"]["cohere_cuda_graphs"])
+
+        enabled = asyncio.run(
+            endpoint(
+                admin.AdminSettingsPayload(cohere_cuda_graphs=True),
+                {"username": "admin"},
+            )
+        )
+        self.assertTrue(enabled["settings"]["cohere_cuda_graphs"])
+        persisted = json.loads(self.settings_file.read_text(encoding="utf-8"))
+        self.assertTrue(persisted["cohere_cuda_graphs"])
+
     def test_debug_history_audio_setting_defaults_off_is_strict_and_survives_partial_updates(self) -> None:
         endpoint = self._endpoint("/api/admin/settings", "PUT")
         self.assertFalse(storage.DEFAULT_SETTINGS["debug_retain_history_audio"])

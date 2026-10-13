@@ -866,6 +866,7 @@ Response shape:
     "batch_max_segments": 16,
     "batch_max_audio_seconds": 100.0,
     "cuda_memory_trim_after_batch": true,
+    "cohere_cuda_graphs": true,
     "debug_retain_history_audio": false,
     "huggingface_token": "hf_xxx",
     "dia_server_base_url": "http://dia:7864",
@@ -934,6 +935,7 @@ Request body:
   "batch_max_segments": 16,
   "batch_max_audio_seconds": 100.0,
   "cuda_memory_trim_after_batch": true,
+  "cohere_cuda_graphs": true,
   "debug_retain_history_audio": false,
   "huggingface_token": "hf_xxx",
   "dia_server_base_url": "http://dia:7864",
@@ -957,6 +959,7 @@ Notes:
 - `scheduler_long_job_min_chunks` (default `5`) marks a request with at least that many chunks as a long job; `scheduler_max_parallel_long_jobs` (default `2`, `0` = unlimited) caps how many long jobs are scheduled at once, further ones wait FIFO. Short requests never wait for a slot.
 - `scheduler_first_chunk_fast_path` (default `true`) gives a request that has not been served yet a small batch of its own instead of a seat in a full batch of a long recording; batches are always shared round-robin between active requests.
 - `cuda_memory_trim_after_batch` defaults to `true`: once the ASR queue has been idle for 5 s, Whisper releases the unused process-wide CUDA allocator pool so the idle footprint stays near the model floor on a shared GPU; the next request re-reserves its pool (about +80 ms once for a ReDimNet batch). Disable it only on a dedicated GPU.
+- `cohere_cuda_graphs` defaults to `true`: for the Cohere model on CUDA in `fp16`/`bf16`, encoder and greedy decoder run as captured CUDA graphs (2 s clip ~270 -> 30 ms, 14 s file ~0.9 -> 0.12 s on an RTX 4090, identical transcripts) for ~0.55 GB of graph memory after warmup and a hard cap of 1.5 GB. Changing it does not reload the model (`model_reloaded` stays `false`); it applies on the next model load (server restart or a change of model, device, precision or cache path). Other precisions and Whisper models ignore it.
 - `debug_retain_history_audio` defaults to `false`. When enabled, successful public API requests may retain their byte-identical original upload for the 25-row admin history; disabling it blocks access immediately and purges retained audio after active readers finish.
 - updates are partial merges; omitted fields keep their saved value, so older admin clients cannot remove newer settings
 - `dia_server_base_url` configures the DIA service used by diarization requests

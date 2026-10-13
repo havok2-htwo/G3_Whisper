@@ -75,6 +75,7 @@ class AdminSettingsPayload(BaseModel):
     scheduler_max_parallel_long_jobs: int | None = None
     scheduler_first_chunk_fast_path: bool | None = None
     cuda_memory_trim_after_batch: bool | None = None
+    cohere_cuda_graphs: bool | None = None
     debug_retain_history_audio: StrictBool | None = None
     huggingface_token: str | None = None
     dia_server_base_url: str | None = None

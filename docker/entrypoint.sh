@@ -27,6 +27,7 @@ if [ ! -f "${SETTINGS_FILE}" ]; then
     "scheduler_max_parallel_long_jobs": 2,
     "scheduler_first_chunk_fast_path": true,
     "cuda_memory_trim_after_batch": true,
+    "cohere_cuda_graphs": true,
     "debug_retain_history_audio": false,
     "huggingface_token": ""
 }
