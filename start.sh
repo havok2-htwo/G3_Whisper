@@ -21,4 +21,7 @@ fi
 # Admin access is username/password (default admin/admin, change forced on first login).
 echo "Nutze lokale venv unter \"$VENV_DIR\" ..."
 echo "Starte den GENESIS Whisper Server..."
+# numpy/scipy OpenBLAS starts one thread per core at import, each with a buffer it never
+# touches. 4 threads are plenty (same runtime); an explicitly set value still wins.
+export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-4}"
 "$VENV_PYTHON" -m backend.genesis_whisper_server

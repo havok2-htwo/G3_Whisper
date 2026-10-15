@@ -150,6 +150,12 @@ title G3 WHISPER Server
 REM Shrink the CUDA caching-allocator reserved pool (less fragmentation -> lower idle VRAM,
 REM leaves room for the other GPU tenants). expandable_segments is Linux-only / ignored on Windows.
 set "PYTORCH_CUDA_ALLOC_CONF=garbage_collection_threshold:0.8,max_split_size_mb:256"
+REM Let torch's bundled mimalloc hand freed CPU pages back to Windows right away (the CPU
+REM staging copies from model loading otherwise stay committed: ~4 GB commit, up to ~2.4 GB RAM).
+set "MIMALLOC_PURGE_DELAY=0"
+REM numpy/scipy OpenBLAS starts one thread per core at import, each committing a 32 MiB buffer
+REM it never touches (~1.5 GB commit). 4 threads are plenty; measured runtime is unchanged.
+set "OPENBLAS_NUM_THREADS=4"
 call "%VENV_PYTHON%" -m backend.genesis_whisper_server
 
 echo.

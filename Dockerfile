@@ -27,6 +27,9 @@ ENV PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     HF_HOME=/app/models/.hf \
     TORCH_HOME=/app/models/.torch
+# numpy/scipy OpenBLAS starts one thread per core at import, each with a buffer it never
+# touches; 4 threads are plenty for the few CPU BLAS calls here.
+ENV OPENBLAS_NUM_THREADS=4
 
 # System libraries:
 #   ffmpeg         -> decode mp3/m4a/video containers SoundFile cannot read; also brings the
