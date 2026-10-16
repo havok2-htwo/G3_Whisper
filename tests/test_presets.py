@@ -27,6 +27,7 @@ class _PresetTestCase(unittest.TestCase):
             # Never touch the real settings file either, even if a route under test would save settings.
             mock.patch.object(storage, "LOGS_DIR", self.temp_dir.name),
             mock.patch.object(storage, "SETTINGS_FILE", os.path.join(self.temp_dir.name, "settings.json")),
+            mock.patch.object(storage, "SETTINGS_SEED_FILE", os.path.join(self.temp_dir.name, "settings.seed.json")),
         ]
         for patcher in self.patches:
             patcher.start()
@@ -207,6 +208,50 @@ class UserPresetTests(_PresetTestCase):
             file_obj.write('{"24GB VRAM": {"values": {"batch_max_segments": 2}}}')
         self.assertEqual([preset["name"] for preset in presets.resolve_presets()], TIER_NAMES)
         self.assertEqual(self.tier("24GB VRAM")["values"], presets.BUILTIN_PRESETS["24GB VRAM"]["values"])
+
+
+class FirstStartPresetTests(_PresetTestCase):
+    def test_first_start_preset_is_the_single_card_24gb_tier(self) -> None:
+        self.assertEqual(presets.FIRST_START_PRESET, "24GB VRAM")
+        self.assertIsNone(presets.BUILTIN_PRESETS[presets.FIRST_START_PRESET]["target_vram_gb"])
+
+    def test_first_start_applies_the_24gb_tier_and_saves_it(self) -> None:
+        self.assertFalse(os.path.exists(storage.SETTINGS_FILE))
+        settings, applied = presets.load_settings_or_first_start_preset()
+        self.assertTrue(applied)
+        for key, value in presets.BUILTIN_PRESETS["24GB VRAM"]["values"].items():
+            self.assertEqual(settings[key], value, key)
+        self.assertEqual(settings["local_gpu_device"], "auto")
+        self.assertEqual(settings["local_model_cache_path"], storage.DEFAULT_SETTINGS["local_model_cache_path"])
+        self.assertTrue(os.path.exists(storage.SETTINGS_FILE))
+        self.assertEqual(storage.load_settings(), settings)
+
+    def test_first_start_keeps_the_seeded_cache_path(self) -> None:
+        # docker/entrypoint.sh seeds the model cache volume; the tier still applies.
+        with open(storage.SETTINGS_SEED_FILE, "w", encoding="utf-8") as file_obj:
+            file_obj.write('{"local_model_cache_path": "/app/models", "unknown_key": 1}')
+        settings, applied = presets.load_settings_or_first_start_preset()
+        self.assertTrue(applied)
+        self.assertEqual(settings["local_model_cache_path"], "/app/models")
+        self.assertEqual(settings["redimnet_max_batch_size"], 4)
+        self.assertEqual(settings["batch_max_audio_seconds"], 400.0)
+        self.assertNotIn("unknown_key", settings)
+
+    def test_corrupt_seed_file_still_applies_the_tier(self) -> None:
+        with open(storage.SETTINGS_SEED_FILE, "w", encoding="utf-8") as file_obj:
+            file_obj.write("{broken")
+        settings, applied = presets.load_settings_or_first_start_preset()
+        self.assertTrue(applied)
+        self.assertEqual(settings["redimnet_max_batch_size"], 4)
+
+    def test_saved_settings_are_kept_on_later_starts(self) -> None:
+        storage.save_settings({**storage.DEFAULT_SETTINGS, "batch_max_audio_seconds": 100.0, "redimnet_max_batch_size": 8})
+        with open(storage.SETTINGS_SEED_FILE, "w", encoding="utf-8") as file_obj:
+            file_obj.write('{"local_model_cache_path": "/app/models"}')
+        settings, applied = presets.load_settings_or_first_start_preset()
+        self.assertFalse(applied)
+        self.assertEqual((settings["batch_max_audio_seconds"], settings["redimnet_max_batch_size"]), (100.0, 8))
+        self.assertEqual(settings["local_model_cache_path"], storage.DEFAULT_SETTINGS["local_model_cache_path"])
 
 
 class AdminPresetRouteTests(_PresetTestCase):

@@ -582,7 +582,7 @@ Relevant status codes:
 - `401`: missing/invalid Whisper client API key after public API protection is enabled
 - `413`: `request` JSON exceeds 16 MiB
 - `422`: invalid schema/mode, IDs, counts, profile vectors, or insufficient usable speech
-- `503`: DIA is not configured for a `diarization` request, or a required local model is unavailable
+- `503`: the effective DIA URL is invalid for a `diarization` request (`DIA_NOT_CONFIGURED`; without a saved URL or `DIA_SERVER_BASE_URL` the default `http://127.0.0.1:7864` is used), or a required local model is unavailable
 - `502`: DIA rejected Whisper authentication, returned an upstream error, or violated the v2 response contract
 - `504`: DIA request timeout
 - `500`: unexpected local processing failure
@@ -968,7 +968,8 @@ Notes:
 - `debug_retain_history_audio` defaults to `false`. When enabled, successful public API requests may retain their byte-identical original upload for the 25-row admin history; disabling it blocks access immediately and purges retained audio after active readers finish.
 - updates are partial merges; omitted fields keep their saved value, so older admin clients cannot remove newer settings
 - `local_gpu_device` `cuda:N` follows nvidia-smi numbering: the server sets `CUDA_DEVICE_ORDER=PCI_BUS_ID` (unless the environment sets it) before torch initialises CUDA; device options show index, name and memory size
-- `dia_server_base_url` configures the DIA service used by diarization requests
+- `dia_server_base_url` configures the DIA service used by diarization requests; empty means "use the default": `DIA_SERVER_BASE_URL` if set, else `http://127.0.0.1:7864` (G3_DIA on the same machine). `dia_server_base_url_effective` shows the URL in use and `dia_server_base_url_source` is `settings`, `environment` or `default`
+- a fresh install (no settings file) starts with the defaults plus the `24GB VRAM` preset and saves them; existing settings files are left alone
 - `dia_api_key` is write-only: a non-empty value replaces the saved key, while an omitted or empty value preserves it
 - settings responses always return `dia_api_key` as an empty string and expose only `dia_api_key_configured` plus its `settings` / `environment` / `none` source
 - saved DIA values take precedence over the `DIA_SERVER_BASE_URL` and `DIA_SERVER_API_KEY` environment fallbacks

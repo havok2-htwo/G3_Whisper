@@ -14,6 +14,9 @@ import torch
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LOGS_DIR = os.path.join(PROJECT_ROOT, "logs")
 SETTINGS_FILE = os.path.join(LOGS_DIR, "genesis_whisper_settings.json")
+# Machine-specific first-start values (docker/entrypoint.sh: the model cache volume). Read only while no settings
+# file exists, see genesis_whisper_server_presets.load_settings_or_first_start_preset.
+SETTINGS_SEED_FILE = os.path.join(LOGS_DIR, "genesis_whisper_settings.seed.json")
 LOG_FILE = os.path.join(LOGS_DIR, "transcription_log.jsonl")
 HISTORY_MAX_LEN = 100
 BATCH_HISTORY_MAX_LEN = 50

@@ -63,9 +63,13 @@ class DiaUnreachableHintTests(unittest.TestCase):
             self.assertIn("host.docker.internal", hint)
             self.assertIn("http://dia:7864", dia_client.dia_unreachable_hint("http://127.0.0.1:7864", german=True))
 
-    def test_localhost_outside_a_container_needs_no_hint(self) -> None:
+    def test_localhost_outside_a_container_asks_for_the_local_dia(self) -> None:
         with mock.patch.object(dia_client, "_running_in_container", return_value=False):
-            self.assertEqual(dia_client.dia_unreachable_hint("http://localhost:7864"), "")
+            hint = dia_client.dia_unreachable_hint("http://127.0.0.1:7864")
+            self.assertIn("G3_DIA", hint)
+            self.assertIn("DIA_SERVER_BASE_URL", hint)
+            self.assertNotIn("dia:7864", hint)
+            self.assertIn("G3_DIA", dia_client.dia_unreachable_hint("http://localhost:7864", german=True))
 
     def test_compose_name_hint_and_other_hosts(self) -> None:
         self.assertIn("Compose", dia_client.dia_unreachable_hint("http://dia:7864"))

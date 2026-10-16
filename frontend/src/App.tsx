@@ -120,7 +120,7 @@ const emptySettings: AdminSettings = {
   dia_api_key_configured: false,
   dia_api_key_source: "none",
   dia_server_base_url_effective: "",
-  dia_server_base_url_source: "none",
+  dia_server_base_url_source: "default",
 };
 
 function formatValue(value: number | null | undefined, suffix = "") {
@@ -2315,7 +2315,7 @@ export default function App() {
                   <span>DIA Server URL</span>
                   <input
                     type="url"
-                    placeholder={settingsForm.dia_server_base_url_effective || "http://dia:7864"}
+                    placeholder={settingsForm.dia_server_base_url_effective || "http://127.0.0.1:7864"}
                     value={settingsForm.dia_server_base_url}
                     onChange={(event) => updateSetting("dia_server_base_url", event.target.value)}
                   />
@@ -2323,6 +2323,13 @@ export default function App() {
                 {settingsForm.dia_server_base_url_source === "environment" && !settingsForm.dia_server_base_url && (
                   <p className="field-note full-width">
                     Using <code>{settingsForm.dia_server_base_url_effective}</code> from <code>DIA_SERVER_BASE_URL</code>.
+                  </p>
+                )}
+                {settingsForm.dia_server_base_url_source === "default" && !settingsForm.dia_server_base_url && (
+                  <p className="field-note full-width">
+                    Empty: using the default <code>{settingsForm.dia_server_base_url_effective || "http://127.0.0.1:7864"}</code>{" "}
+                    (G3_DIA on this machine). <code>DIA_SERVER_BASE_URL</code> overrides the default, a URL entered
+                    here overrides both.
                   </p>
                 )}
 

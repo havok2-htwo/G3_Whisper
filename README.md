@@ -687,7 +687,8 @@ The most important environment variables:
   - **Important:** A token entered only during a manual cache download is not sufficient for later runtime loading. The token must be persisted in Admin Settings or `.env`.
   - **Important:** The same saved token is now also used by the runtime loader itself when Cohere needs to complete missing snapshot files such as `tokenizer.model`.
 - `DIA_SERVER_BASE_URL`
-  - optional fallback for the DIA server URL; use `http://dia:7864` in the bundled Compose network
+  - optional fallback for the DIA server URL; the bundled Compose stack sets `http://dia:7864`
+  - without it (and without a saved URL) Whisper uses `http://127.0.0.1:7864`, the G3_DIA on the same machine
   - a URL saved in the Whisper admin UI takes precedence
 - `DIA_SERVER_API_KEY`
   - optional fallback for a DIA client key created in the G3_DIA admin UI
@@ -704,7 +705,11 @@ The server stores runtime data under [`logs`](x:/dev/G3_WHISPER/logs).
 Important files:
 
 - `logs/genesis_whisper_settings.json`
-  - persisted server settings
+  - persisted server settings; on a fresh install (no file yet) the server creates it with the defaults plus the
+    `24GB VRAM` preset (see "Default Settings")
+- `logs/genesis_whisper_settings.seed.json`
+  - optional machine-specific first-start values (the Docker entrypoint writes the `/app/models` cache path here);
+    read only while no settings file exists
 - `logs/genesis_whisper_secrets.json`
   - admin users, browser sessions, and client API key metadata
 - `logs/transcription_log.jsonl`
@@ -715,7 +720,17 @@ Important files:
 
 ## Default Settings
 
-The active default values come from [backend/genesis_whisper_server_storage.py](x:/dev/G3_WHISPER/backend/genesis_whisper_server_storage.py):
+The active default values come from [backend/genesis_whisper_server_storage.py](x:/dev/G3_WHISPER/backend/genesis_whisper_server_storage.py).
+
+A fresh install (no `logs/genesis_whisper_settings.json` yet) starts with these defaults plus the built-in
+`24GB VRAM` tier (`FIRST_START_PRESET` in `backend/genesis_whisper_server_presets.py`): `batch_max_audio_seconds`
+`400`, `redimnet_max_batch_size` `4`, fp16, CUDA graphs and trim on (see "GPU Tier Presets"). The server saves the
+result and logs one line naming the preset, so the dashboard shows what runs. It is a single-card tier and leaves
+`local_gpu_device` at `auto`; the two-card `24+8 VRAM` tier is never applied automatically. Existing installs (a
+settings file exists) keep their saved settings. In Docker the entrypoint only seeds the model cache path into
+`logs/genesis_whisper_settings.seed.json`, so a fresh container gets the tier as well, with `/app/models` kept.
+
+Plain defaults:
 
 - `local_model`: `CohereLabs/cohere-transcribe-03-2026` (gated, see [license page](https://huggingface.co/CohereLabs/cohere-transcribe-03-2026))
 - `local_gpu_device`: `auto`
@@ -730,7 +745,7 @@ The active default values come from [backend/genesis_whisper_server_storage.py](
 - `redimnet_max_batch_size`: `8` (1/2/4/8; applies on save, no restart)
 - `debug_retain_history_audio`: `false`
 - `huggingface_token`: empty string
-- `dia_server_base_url`: empty string (falls back to `DIA_SERVER_BASE_URL`)
+- `dia_server_base_url`: empty string = use the default: `DIA_SERVER_BASE_URL` if set, else `http://127.0.0.1:7864`
 - `dia_api_key`: empty string (write-only; falls back to `DIA_SERVER_API_KEY`)
 
 ## Admin Endpoints

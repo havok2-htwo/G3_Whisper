@@ -26,10 +26,14 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from . import genesis_whisper_server_globals as whisper_globals
+from . import genesis_whisper_server_storage as storage
 from .genesis_whisper_server_globals import LOGS_DIR
 from .genesis_whisper_server_storage import normalize_settings
 
 PRESETS_FILE = os.path.join(LOGS_DIR, "genesis_whisper_presets.json")
+# A fresh install (no saved settings yet) starts with this tier; the same in every G3 service. It is a single-card
+# tier, so it never sets local_gpu_device; the two-card tier is never applied automatically.
+FIRST_START_PRESET = "24GB VRAM"
 PRESET_NAME_MAX_LENGTH = 64
 
 # Keys a preset may set: model choice, device, precision, batching, scheduler and VRAM behaviour. Machine-specific
@@ -250,3 +254,13 @@ def delete_user_preset(name: str) -> bool:
         presets.pop(clean)
         _write_user_presets(presets)
     return True
+
+
+def load_settings_or_first_start_preset() -> Tuple[Dict[str, Any], bool]:
+    """The saved settings; without a settings file (first start) the defaults with FIRST_START_PRESET applied, then
+    the machine-specific seed values (docker: the model cache path), saved so the dashboard shows what runs.
+    Returns (settings, applied)."""
+    if os.path.exists(storage.SETTINGS_FILE):
+        return storage.load_settings(), False
+    values = dict(BUILTIN_PRESETS[FIRST_START_PRESET]["values"])
+    return storage.save_settings({**storage.DEFAULT_SETTINGS, **values, **storage.load_settings_seed()}), True

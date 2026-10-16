@@ -17,7 +17,7 @@ from .genesis_whisper_server_batching import WhisperBatchManager
 from .genesis_whisper_server_globals import current_settings
 from .genesis_whisper_server_history import reset_history_audio_store, shutdown_history_audio_store
 from .genesis_whisper_server_gpu import run_blocking_gpu_phase
-from .genesis_whisper_server_storage import load_settings
+from .genesis_whisper_server_presets import FIRST_START_PRESET, load_settings_or_first_start_preset
 from .genesis_whisper_server_v2 import create_v2_api
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -132,8 +132,14 @@ def _warmup_redimnet() -> None:
 async def startup_server(app: FastAPI):
     print("--- GENESIS Transcription Server wird gestartet (FastAPI + React + lokales ASR-Batching) ---", file=sys.stderr)
 
+    loaded_settings, first_start = load_settings_or_first_start_preset()
     current_settings.clear()
-    current_settings.update(load_settings())
+    current_settings.update(loaded_settings)
+    if first_start:
+        print(
+            f"Erster Start: keine gespeicherten Einstellungen, Preset '{FIRST_START_PRESET}' angewendet und gespeichert.",
+            file=sys.stderr,
+        )
     reset_history_audio_store(
         enabled=current_settings.get("debug_retain_history_audio", False) is True,
     )

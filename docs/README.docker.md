@@ -90,7 +90,8 @@ Saved admin settings live in the `*_logs` / `*_data` volumes and survive the reb
 
 ## Whisper to DIA configuration
 
-Compose defaults `DIA_SERVER_BASE_URL` to `http://dia:7864`. Create a client API key in
+Compose defaults `DIA_SERVER_BASE_URL` to `http://dia:7864` (without it Whisper would use its native
+default `http://127.0.0.1:7864`, which inside the container is Whisper itself). Create a client API key in
 the G3_DIA admin UI and either enter the DIA URL/key in the Whisper admin settings or set
 these environment values in `.env`:
 

@@ -12,12 +12,17 @@ from .genesis_whisper_server_globals import (
     LOGS_DIR,
     PROJECT_ROOT,
     SETTINGS_FILE,
+    SETTINGS_SEED_FILE,
     SUPPORTED_LANGUAGE_VALUES,
     SUPPORTED_MODEL_PRECISION_VALUES,
 )
 
 
 load_dotenv(os.path.join(PROJECT_ROOT, ".env"), override=False)
+
+# DIA URL when neither the saved setting nor DIA_SERVER_BASE_URL names one: the suite runs on one box, so a native
+# install reaches the local G3_DIA. Compose sets DIA_SERVER_BASE_URL=http://dia:7864, which wins over this.
+DEFAULT_DIA_SERVER_BASE_URL = "http://127.0.0.1:7864"
 
 # Allowed values of redimnet_max_batch_size: the power-of-two CUDA batch buckets ReDimNet is warmed for.
 REDIMNET_MAX_BATCH_SIZE_VALUES = (1, 2, 4, 8)
@@ -48,9 +53,11 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
 def resolve_dia_server_config(settings: Optional[Dict[str, Any]] = None) -> Dict[str, str]:
     """Return the effective DIA connection without mutating or persisting env fallbacks.
 
-    Persisted admin settings take precedence. Keeping environment fallbacks out of the
-    normalized settings object prevents a legacy/full settings save from accidentally
-    copying a deployment secret from the process environment into the settings file.
+    Persisted admin settings take precedence, then DIA_SERVER_BASE_URL / DIA_SERVER_API_KEY,
+    then DEFAULT_DIA_SERVER_BASE_URL (the API key has no default). An empty saved URL means
+    "use the default". Keeping environment fallbacks out of the normalized settings object
+    prevents a legacy/full settings save from accidentally copying a deployment secret from
+    the process environment into the settings file.
     """
 
     source = settings or {}
@@ -59,12 +66,12 @@ def resolve_dia_server_config(settings: Optional[Dict[str, Any]] = None) -> Dict
     env_base_url = str(os.getenv("DIA_SERVER_BASE_URL", "") or "").strip().rstrip("/")
     env_api_key = str(os.getenv("DIA_SERVER_API_KEY", "") or "").strip()
 
-    base_url = configured_base_url or env_base_url
+    base_url = configured_base_url or env_base_url or DEFAULT_DIA_SERVER_BASE_URL
     api_key = configured_api_key or env_api_key
     return {
         "base_url": base_url,
         "api_key": api_key,
-        "base_url_source": "settings" if configured_base_url else ("environment" if env_base_url else "none"),
+        "base_url_source": "settings" if configured_base_url else ("environment" if env_base_url else "default"),
         "api_key_source": "settings" if configured_api_key else ("environment" if env_api_key else "none"),
     }
 
@@ -196,6 +203,21 @@ def load_settings() -> Dict[str, Any]:
     except (json.JSONDecodeError, IOError) as exc:
         print(f"[FEHLER] Konnte Einstellungsdatei nicht laden: {exc}", file=sys.stderr)
         return DEFAULT_SETTINGS.copy()
+
+
+def load_settings_seed() -> Dict[str, Any]:
+    """First-start values from SETTINGS_SEED_FILE (written by docker/entrypoint.sh), known keys only; {} without one."""
+    if not os.path.exists(SETTINGS_SEED_FILE):
+        return {}
+    try:
+        with open(SETTINGS_SEED_FILE, "r", encoding="utf-8") as file_obj:
+            data = json.load(file_obj)
+    except (json.JSONDecodeError, IOError) as exc:
+        print(f"[FEHLER] Konnte Seed-Einstellungen nicht laden: {exc}", file=sys.stderr)
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {key: value for key, value in data.items() if key in DEFAULT_SETTINGS}
 
 
 def save_settings(settings: Dict[str, Any]) -> Dict[str, Any]:

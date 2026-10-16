@@ -361,6 +361,41 @@ class AdminDiaSettingsTests(unittest.TestCase):
         self.assertEqual(effective["base_url_source"], "environment")
         self.assertEqual(effective["api_key_source"], "environment")
 
+    def test_without_setting_or_environment_the_local_dia_is_the_default(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("DIA_SERVER_BASE_URL", None)
+            os.environ.pop("DIA_SERVER_API_KEY", None)
+            effective = storage.resolve_dia_server_config(storage.normalize_settings(storage.DEFAULT_SETTINGS))
+
+        self.assertEqual(storage.DEFAULT_SETTINGS["dia_server_base_url"], "")
+        self.assertEqual(effective["base_url"], "http://127.0.0.1:7864")
+        self.assertEqual(effective["base_url"], storage.DEFAULT_DIA_SERVER_BASE_URL)
+        self.assertEqual(effective["base_url_source"], "default")
+        self.assertEqual(effective["api_key"], "")
+        self.assertEqual(effective["api_key_source"], "none")
+
+    def test_environment_and_saved_url_win_over_the_default(self) -> None:
+        with mock.patch.dict(os.environ, {"DIA_SERVER_BASE_URL": "http://dia:7864"}):
+            from_env = storage.resolve_dia_server_config({"dia_server_base_url": ""})
+            from_settings = storage.resolve_dia_server_config({"dia_server_base_url": "http://saved-dia:7864/"})
+
+        self.assertEqual((from_env["base_url"], from_env["base_url_source"]), ("http://dia:7864", "environment"))
+        self.assertEqual(
+            (from_settings["base_url"], from_settings["base_url_source"]), ("http://saved-dia:7864", "settings")
+        )
+
+    def test_default_url_is_shown_to_admin(self) -> None:
+        endpoint = self._endpoint("/api/admin/settings", "GET")
+        admin.current_settings["dia_server_base_url"] = ""
+
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("DIA_SERVER_BASE_URL", None)
+            response = asyncio.run(endpoint({"username": "admin"}))
+
+        self.assertEqual(response["settings"]["dia_server_base_url"], "")
+        self.assertEqual(response["settings"]["dia_server_base_url_effective"], "http://127.0.0.1:7864")
+        self.assertEqual(response["settings"]["dia_server_base_url_source"], "default")
+
     def test_valid_environment_fallback_is_visible_without_exposing_key(self) -> None:
         endpoint = self._endpoint("/api/admin/settings", "GET")
         admin.current_settings["dia_server_base_url"] = ""

@@ -3,34 +3,24 @@ set -e
 
 # The GENESIS Whisper server's built-in default model cache path is the Windows
 # literal ".\\models", which is meaningless on Linux. On first boot (before any
-# settings file exists) seed one that pins the cache to the mounted /app/models
-# volume. Existing settings (written by the admin dashboard) are left untouched.
+# settings file exists) seed the cache path of the mounted /app/models volume into
+# the first-start seed file, NOT into the settings file: the server only treats a
+# start without a settings file as a first start, applies the "24GB VRAM" GPU tier
+# on top of the defaults, merges these seed values and saves the result. Writing
+# the settings file here would hide the first start from the server. Existing
+# settings (written by the server or the admin dashboard) are left untouched.
 
 SETTINGS_DIR="/app/logs"
 SETTINGS_FILE="${SETTINGS_DIR}/genesis_whisper_settings.json"
+SEED_FILE="${SETTINGS_DIR}/genesis_whisper_settings.seed.json"
 
 mkdir -p "${SETTINGS_DIR}" /app/models
 
 if [ ! -f "${SETTINGS_FILE}" ]; then
-  echo "[entrypoint] Seeding ${SETTINGS_FILE} (cache -> /app/models)"
-  cat > "${SETTINGS_FILE}" <<'JSON'
+  echo "[entrypoint] First start: seeding ${SEED_FILE} (cache -> /app/models)"
+  cat > "${SEED_FILE}" <<'JSON'
 {
-    "local_model": "CohereLabs/cohere-transcribe-03-2026",
-    "local_gpu_device": "auto",
-    "local_model_precision": "fp16",
-    "local_model_cache_path": "/app/models",
-    "transcription_language": "auto",
-    "batch_wait_time_ms": 500,
-    "batch_max_segments": 16,
-    "batch_max_audio_seconds": 100.0,
-    "scheduler_long_job_min_chunks": 5,
-    "scheduler_max_parallel_long_jobs": 2,
-    "scheduler_first_chunk_fast_path": true,
-    "cuda_memory_trim_after_batch": true,
-    "cohere_cuda_graphs": true,
-    "redimnet_max_batch_size": 8,
-    "debug_retain_history_audio": false,
-    "huggingface_token": ""
+    "local_model_cache_path": "/app/models"
 }
 JSON
 fi

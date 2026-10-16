@@ -45,7 +45,19 @@ def dia_unreachable_hint(base_url: str, *, german: bool = False) -> str:
     """Explain the usual container networking mistake behind an unreachable DIA URL."""
 
     host = (urlsplit(base_url).hostname or "").lower()
-    if (host in _LOOPBACK_HOSTS or host.startswith("127.")) and _running_in_container():
+    loopback = host in _LOOPBACK_HOSTS or host.startswith("127.")
+    if loopback and not _running_in_container():
+        # Native install: the default URL (DEFAULT_DIA_SERVER_BASE_URL) is the G3_DIA on this machine.
+        if german:
+            return (
+                " Laeuft G3_DIA auf diesem Rechner (Port 7864)? Sonst die URL des DIA-Servers eintragen oder "
+                "DIA_SERVER_BASE_URL setzen."
+            )
+        return (
+            " Is G3_DIA running on this machine (port 7864)? Otherwise enter the DIA server's URL or set "
+            "DIA_SERVER_BASE_URL."
+        )
+    if loopback:
         if german:
             return (
                 " 'localhost' ist im Whisper-Container der Container selbst, nicht der Server. Im gemeinsamen "

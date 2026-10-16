@@ -25,7 +25,7 @@ export type AdminSettings = {
   dia_api_key_configured: boolean;
   dia_api_key_source: "settings" | "environment" | "none";
   dia_server_base_url_effective: string;
-  dia_server_base_url_source: "settings" | "environment" | "none";
+  dia_server_base_url_source: "settings" | "environment" | "default";
 };
 
 export type HistoryRetryMode = "transcript" | "transcript_embedding" | null;
