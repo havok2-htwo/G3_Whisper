@@ -722,6 +722,9 @@ Active admin routes:
 - `DELETE /api/admin/api-keys/{key_id}`
 - `GET /api/admin/settings`
 - `PUT /api/admin/settings`
+- `GET /api/admin/settings/presets`
+- `PUT /api/admin/settings/presets/{name}`
+- `DELETE /api/admin/settings/presets/{name}`
 - `DELETE /api/admin/settings/dia-api-key`
 - `POST /api/admin/dia/test`
 - `GET /api/admin/models`
@@ -739,6 +742,15 @@ entered in the admin UI. The saved URL/key take precedence over their environmen
 fallbacks. The key is write-only in responses, a blank update preserves it, and only
 `DELETE /api/admin/settings/dia-api-key` removes the saved value explicitly. The
 connection test calls the configured DIA `GET /v2/capabilities` endpoint.
+
+Settings presets: the admin settings panel offers the built-in GPU tiers `32GB VRAM`
+(RTX 5090) and `24GB VRAM` (RTX 4090), both with every G3 service on one card, and
+`24+8 VRAM` (Whisper on the 24 GB card of a 3090 + 2070S box; the GPU is picked by card
+size), plus presets saved from the current form. Loading a preset only fills the form;
+Save Settings applies it. Presets hold only model, device, precision, batching, scheduler
+and VRAM settings, never the token, the DIA connection, the language or the model cache
+path; saved presets live in `logs/genesis_whisper_presets.json`. The tier values are the
+current defaults until they are replaced by measured values.
 
 `debug_retain_history_audio` is a diagnostics-only, default-off setting for investigating
 sporadic latency and transcription differences. When enabled, successful requests through

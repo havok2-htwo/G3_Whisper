@@ -138,11 +138,17 @@ def resolve_local_model_cache_path(cache_path: str) -> str:
 
 
 # --- GPU-Geraeteerkennung ---
+# Indizes folgen CUDA_DEVICE_ORDER=PCI_BUS_ID (backend/__init__.py), also cuda:N == nvidia-smi GPU N.
 AVAILABLE_DEVICES: List[str] = ["Auto (Empfohlen)", "CPU"]
 DEVICE_MAP_UI_TO_INTERNAL: Dict[str, str] = {"Auto (Empfohlen)": "auto", "CPU": "cpu"}
+# Gesamtspeicher je CUDA-Karte in MiB (Index = cuda:N); die Zwei-Karten-Presets waehlen darueber die GPU.
+CUDA_DEVICE_TOTAL_MIB: List[int] = []
 if torch.cuda.is_available():
     for i in range(torch.cuda.device_count()):
-        device_name = f"GPU {i} ({torch.cuda.get_device_name(i)})"
+        device_props = torch.cuda.get_device_properties(i)
+        total_mib = int(device_props.total_memory // (1024 * 1024))
+        CUDA_DEVICE_TOTAL_MIB.append(total_mib)
+        device_name = f"GPU {i} ({device_props.name}, {total_mib / 1024:.0f} GB)"
         AVAILABLE_DEVICES.append(device_name)
         DEVICE_MAP_UI_TO_INTERNAL[device_name] = f"cuda:{i}"
 

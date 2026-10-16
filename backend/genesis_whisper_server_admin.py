@@ -59,6 +59,7 @@ from .genesis_whisper_server_repetition import (
     repetition_filter_enabled,
 )
 from .genesis_whisper_server_dia_client import dia_unreachable_hint
+from .genesis_whisper_server_presets import delete_user_preset, resolve_presets, save_user_preset
 from .genesis_whisper_server_storage import normalize_settings, resolve_dia_server_config, save_settings
 
 
@@ -80,6 +81,11 @@ class AdminSettingsPayload(BaseModel):
     huggingface_token: str | None = None
     dia_server_base_url: str | None = None
     dia_api_key: str | None = None
+
+
+class PresetPayload(BaseModel):
+    # Settings values; anything outside presets.PRESET_KEYS is dropped, the rest normalised like a saved setting.
+    values: Dict[str, Any]
 
 
 class _HistoryAudioFileResponse(FileResponse):
@@ -462,6 +468,29 @@ def create_admin_api(app: FastAPI) -> FastAPI:
             "models": list_model_statuses(saved_settings.get("local_model_cache_path", "")),
             "loaded_model_identifier": list(local_model_components.get("model_identifier") or []) or None,
         }
+
+    # --- Settings presets (built-in GPU tiers + saved ones; loading fills the form, Save applies) ---
+    @app.get("/api/admin/settings/presets")
+    async def admin_list_presets(_: dict[str, str] = Depends(require_admin)):
+        return {"presets": await asyncio.to_thread(resolve_presets)}
+
+    @app.put("/api/admin/settings/presets/{name}")
+    async def admin_save_preset(name: str, payload: PresetPayload, _: dict[str, str] = Depends(require_admin)):
+        try:
+            preset = await asyncio.to_thread(save_user_preset, name, payload.values)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {"ok": True, "preset": preset}
+
+    @app.delete("/api/admin/settings/presets/{name}")
+    async def admin_delete_preset(name: str, _: dict[str, str] = Depends(require_admin)):
+        try:
+            deleted = await asyncio.to_thread(delete_user_preset, name)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if not deleted:
+            raise HTTPException(status_code=404, detail=f"No saved preset '{name[:100]}'.")
+        return {"ok": True}
 
     @app.delete("/api/admin/settings/dia-api-key")
     async def admin_delete_dia_api_key(_: dict[str, str] = Depends(require_admin)):

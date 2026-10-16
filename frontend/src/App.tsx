@@ -12,6 +12,7 @@ import {
   HistoryEntry,
   ManagedModel,
   QueueResponse,
+  SettingsPreset,
   SettingsResponse,
   SpeakerRefinementMode,
   StatsResponse,
@@ -21,6 +22,7 @@ import {
   deleteApiKey,
   deleteDiaApiKey,
   deleteModel,
+  deletePreset,
   downloadHistoryAudio,
   downloadModel,
   getModels,
@@ -28,11 +30,13 @@ import {
   getSettings,
   getStats,
   listApiKeys,
+  listPresets,
   login,
   logout,
   processAudioV2,
   retryHistoryAudio,
   runBenchmark,
+  savePreset,
   saveSettings,
   testDiaConnection,
   whoami,
@@ -541,6 +545,11 @@ export default function App() {
   const [dashboardHistory, setDashboardHistory] = useState<DashboardHistoryPoint[]>([]);
   const [saveBusy, setSaveBusy] = useState(false);
   const [saveMessage, setSaveMessage] = useState("");
+  const [presets, setPresets] = useState<SettingsPreset[]>([]);
+  const [presetName, setPresetName] = useState("");
+  const [presetBusy, setPresetBusy] = useState(false);
+  const [presetMessage, setPresetMessage] = useState("");
+  const [presetFailed, setPresetFailed] = useState(false);
   const [diaActionBusy, setDiaActionBusy] = useState<"test" | "clear" | null>(null);
   const [diaActionMessage, setDiaActionMessage] = useState("");
   const [diaActionSucceeded, setDiaActionSucceeded] = useState<boolean | null>(null);
@@ -574,6 +583,10 @@ export default function App() {
       setQueue(null);
       setDashboardHistory([]);
       setSettingsForm(emptySettings);
+      setPresets([]);
+      setPresetName("");
+      setPresetMessage("");
+      setPresetFailed(false);
       setManagedModels([]);
       setLoadedModelIdentifier(null);
       setSettingsOptions({ models: [], devices: [], precisions: [], languages: [] });
@@ -639,8 +652,88 @@ export default function App() {
         setApiKeys(keysResponse.keys);
         setGlobalError("");
       });
+      await reloadPresets();
     } catch (error) {
       handleApiError(error, "The dashboard could not be loaded.");
+    }
+  }
+
+  async function reloadPresets() {
+    try {
+      const response = await listPresets();
+      setPresets(response.presets);
+    } catch (error) {
+      if (handleApiError(error, "Presets could not be loaded.")) {
+        return;
+      }
+      setPresetMessage(error instanceof Error ? error.message : "Presets could not be loaded.");
+      setPresetFailed(true);
+    }
+  }
+
+  function handleLoadPreset() {
+    const preset = presets.find((entry) => entry.name === presetName);
+    if (!preset) {
+      return;
+    }
+    // Into the form only: Save Settings applies it through the normal validated update.
+    setSettingsForm((current) => ({ ...current, ...preset.values }));
+    setSaveMessage("");
+    setPresetMessage(
+      `Preset "${preset.name}" loaded into the form; review it and click Save Settings to apply.`
+        + (preset.note ? ` ${preset.note}` : ""),
+    );
+    setPresetFailed(false);
+  }
+
+  async function handleSavePreset() {
+    const name = presetName.trim();
+    if (!name) {
+      return;
+    }
+    setPresetBusy(true);
+    setPresetMessage("");
+    try {
+      const response = await savePreset(name, settingsForm);
+      await reloadPresets();
+      setPresetName(response.preset.name);
+      setPresetMessage(`Preset "${response.preset.name}" saved from the current form.`);
+      setPresetFailed(false);
+    } catch (error) {
+      if (handleApiError(error, "The preset could not be saved.")) {
+        return;
+      }
+      setPresetMessage(error instanceof Error ? error.message : "The preset could not be saved.");
+      setPresetFailed(true);
+    } finally {
+      setPresetBusy(false);
+    }
+  }
+
+  async function handleDeletePreset() {
+    const preset = presets.find((entry) => entry.name === presetName);
+    if (!preset || preset.built_in) {
+      return;
+    }
+    if (!window.confirm(`Delete the saved preset "${preset.name}"?`)) {
+      return;
+    }
+    setPresetBusy(true);
+    setPresetMessage("");
+    try {
+      await deletePreset(preset.name);
+      setPresetName("");
+      await reloadPresets();
+      setPresetMessage(`Preset "${preset.name}" deleted.`);
+      setPresetFailed(false);
+    } catch (error) {
+      if (handleApiError(error, "The preset could not be deleted.")) {
+        return;
+      }
+      setPresetMessage(error instanceof Error ? error.message : "The preset could not be deleted.");
+      setPresetFailed(true);
+    } finally {
+      setPresetBusy(false);
     }
   }
 
@@ -1303,6 +1396,7 @@ export default function App() {
   const recentJobs = (queue?.recent_jobs ?? []) as JobEntry[];
   const queueJobs = queue?.jobs ?? [];
   const latestBatchRealtime = computeBatchRealtime(recentBatches[0]);
+  const selectedPreset = presets.find((preset) => preset.name === presetName);
   const configuredDeviceLabel = resolveOptionLabel(settingsOptions.devices, settingsForm.local_gpu_device, "Auto");
   const configuredLanguageLabel = resolveOptionLabel(settingsOptions.languages, settingsForm.transcription_language, "Auto");
   const loadedModelLabel = loadedModelIdentifier ? loadedModelIdentifier.join(" | ") : "No model loaded";
@@ -2052,6 +2146,71 @@ export default function App() {
               <span>Loaded Model</span>
               <strong>{loadedModelLabel}</strong>
             </div>
+          </div>
+
+          <div className="settings-form preset-settings">
+            <div className="full-width">
+              <span className="eyebrow">Presets</span>
+              <p className="field-note preset-copy">
+                Built-in GPU tiers: 32GB VRAM (RTX 5090) and 24GB VRAM (RTX 4090) with every G3 service on one card;
+                24+8 VRAM runs Whisper on the 24 GB card of a two-GPU box (the GPU is picked by card size). Loading
+                fills the form below; Save Settings applies it.
+              </p>
+            </div>
+            <label>
+              <span>Preset</span>
+              <select value={selectedPreset ? presetName : ""} onChange={(event) => setPresetName(event.target.value)}>
+                <option value="">(choose)</option>
+                {presets.map((preset) => (
+                  <option key={preset.name} value={preset.name}>
+                    {preset.built_in ? `${preset.name} (built-in)` : preset.name}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label>
+              <span>Save the Current Form As</span>
+              <input
+                value={presetName}
+                maxLength={64}
+                placeholder="preset name"
+                onChange={(event) => setPresetName(event.target.value)}
+              />
+            </label>
+            {selectedPreset?.description && <p className="field-note full-width">{selectedPreset.description}</p>}
+            {selectedPreset?.note && <p className="message error full-width">{selectedPreset.note}</p>}
+            <p className="field-note full-width">
+              Built-in names cannot be overwritten. A preset stores only model, device, precision, batching and VRAM
+              settings; the model cache path, the language, the Hugging Face token and the DIA connection are never
+              stored in a preset.
+            </p>
+            <div className="button-row full-width">
+              <button
+                type="button"
+                className="secondary-button"
+                onClick={handleLoadPreset}
+                disabled={!selectedPreset || presetBusy || saveBusy}
+              >
+                Load into Form
+              </button>
+              <button
+                type="button"
+                className="secondary-button"
+                onClick={() => void handleSavePreset()}
+                disabled={!presetName.trim() || selectedPreset?.built_in === true || presetBusy}
+              >
+                {presetBusy ? "Working..." : "Save as Preset"}
+              </button>
+              <button
+                type="button"
+                className="ghost-button danger-button"
+                onClick={() => void handleDeletePreset()}
+                disabled={!selectedPreset || selectedPreset.built_in || presetBusy}
+              >
+                Delete Preset
+              </button>
+            </div>
+            {presetMessage && <p className={`message full-width ${presetFailed ? "error" : ""}`}>{presetMessage}</p>}
           </div>
 
           <form className="settings-form" onSubmit={handleSaveSettings}>

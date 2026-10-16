@@ -417,6 +417,33 @@ export async function saveSettings(settings: AdminSettings) {
   );
 }
 
+// Built-in GPU tiers ("32GB VRAM", "24GB VRAM", "24+8 VRAM") plus saved presets. Loading one fills the settings form;
+// Save Settings applies it through the normal PUT. A preset only carries runtime/VRAM keys, never tokens or paths.
+export type SettingsPreset = {
+  name: string;
+  built_in: boolean;
+  description: string;
+  target_vram_gb?: number | null;
+  note?: string | null;
+  created_at?: string | null;
+  values: Partial<AdminSettings>;
+};
+
+export async function listPresets() {
+  return requestJson<{ presets: SettingsPreset[] }>("/api/admin/settings/presets", { method: "GET" });
+}
+
+export async function savePreset(name: string, values: AdminSettings) {
+  return requestJson<{ ok: boolean; preset: SettingsPreset }>(`/api/admin/settings/presets/${encodeURIComponent(name)}`, {
+    method: "PUT",
+    body: JSON.stringify({ values }),
+  });
+}
+
+export async function deletePreset(name: string) {
+  return requestJson<{ ok: boolean }>(`/api/admin/settings/presets/${encodeURIComponent(name)}`, { method: "DELETE" });
+}
+
 export async function deleteDiaApiKey() {
   return requestJson<SettingsResponse & { ok: boolean; removed: boolean; environment_fallback_active: boolean }>(
     "/api/admin/settings/dia-api-key",

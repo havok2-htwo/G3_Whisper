@@ -881,7 +881,8 @@ Response shape:
       { "label": "Whisper Large v3 Turbo", "value": "openai/whisper-large-v3-turbo" }
     ],
     "devices": [
-      { "label": "Auto (Empfohlen)", "value": "auto" }
+      { "label": "Auto (Empfohlen)", "value": "auto" },
+      { "label": "GPU 0 (NVIDIA GeForce RTX 3090, 24 GB)", "value": "cuda:0" }
     ],
     "precisions": [
       { "label": "INT8 (bitsandbytes)", "value": "int8_bnb" },
@@ -962,12 +963,87 @@ Notes:
 - `cohere_cuda_graphs` defaults to `true`: for the Cohere model on CUDA in `fp16`/`bf16`, encoder and greedy decoder run as captured CUDA graphs (2 s clip ~270 -> 30 ms, 14 s file ~0.9 -> 0.12 s on an RTX 4090, identical transcripts) for ~0.55 GB of graph memory after warmup and a hard cap of 1.5 GB. Changing it does not reload the model (`model_reloaded` stays `false`); it applies on the next model load (server restart or a change of model, device, precision or cache path). Other precisions and Whisper models ignore it.
 - `debug_retain_history_audio` defaults to `false`. When enabled, successful public API requests may retain their byte-identical original upload for the 25-row admin history; disabling it blocks access immediately and purges retained audio after active readers finish.
 - updates are partial merges; omitted fields keep their saved value, so older admin clients cannot remove newer settings
+- `local_gpu_device` `cuda:N` follows nvidia-smi numbering: the server sets `CUDA_DEVICE_ORDER=PCI_BUS_ID` (unless the environment sets it) before torch initialises CUDA; device options show index, name and memory size
 - `dia_server_base_url` configures the DIA service used by diarization requests
 - `dia_api_key` is write-only: a non-empty value replaces the saved key, while an omitted or empty value preserves it
 - settings responses always return `dia_api_key` as an empty string and expose only `dia_api_key_configured` plus its `settings` / `environment` / `none` source
 - saved DIA values take precedence over the `DIA_SERVER_BASE_URL` and `DIA_SERVER_API_KEY` environment fallbacks
 - the key is sent upstream only in `X-API-Key` and is never returned or written to application logs
 - DIA settings affect only v2 requests whose mode is `diarization`
+
+### `GET /api/admin/settings/presets`
+
+Purpose:
+
+- lists the named settings presets: the built-in GPU tiers first, in tier order, then the saved presets by name
+- built-in tiers (identical names across the G3 services): `32GB VRAM` (RTX 5090, every G3 service on one card), `24GB VRAM` (RTX 4090, every G3 service on one card) and `24+8 VRAM` (3090 + 2070S box, Whisper on the 24 GB card). Whisper has no `8+24 VRAM` tier; on the two-GPU box only DIA runs on the 8 GB card.
+- a tier with a `target_vram_gb` gets `local_gpu_device` set to the CUDA card whose total memory matches within 2 GiB (machines number their cards differently); if no card matches, `local_gpu_device` is left out and `note` explains why. Single-card tiers never set the GPU.
+- the built-in tier values are currently the service defaults; measured per-tier values replace them in a later step
+
+Response shape:
+
+```json
+{
+  "presets": [
+    {
+      "name": "24+8 VRAM",
+      "built_in": true,
+      "description": "3090 + 2070S box, Whisper on the 3090 (24 GB) ...",
+      "target_vram_gb": 24,
+      "note": null,
+      "values": {
+        "local_model": "CohereLabs/cohere-transcribe-03-2026",
+        "local_model_precision": "fp16",
+        "batch_wait_time_ms": 500,
+        "batch_max_segments": 16,
+        "batch_max_audio_seconds": 100.0,
+        "scheduler_long_job_min_chunks": 5,
+        "scheduler_max_parallel_long_jobs": 2,
+        "scheduler_first_chunk_fast_path": true,
+        "cuda_memory_trim_after_batch": true,
+        "cohere_cuda_graphs": true,
+        "local_gpu_device": "cuda:0"
+      }
+    },
+    {
+      "name": "lab",
+      "built_in": false,
+      "description": "",
+      "target_vram_gb": null,
+      "created_at": "2026-10-16T12:00:00",
+      "note": null,
+      "values": { "batch_max_segments": 8 }
+    }
+  ]
+}
+```
+
+### `PUT /api/admin/settings/presets/{name}`
+
+Purpose:
+
+- saves (or replaces) a user preset from settings values; `created_at` is kept on replace
+
+Request body:
+
+```json
+{ "values": { "batch_max_segments": 8, "local_gpu_device": "cuda:1" } }
+```
+
+Notes:
+
+- only the preset keys are stored: `local_model`, `local_gpu_device`, `local_model_precision`, `batch_wait_time_ms`, `batch_max_segments`, `batch_max_audio_seconds`, `scheduler_long_job_min_chunks`, `scheduler_max_parallel_long_jobs`, `scheduler_first_chunk_fast_path`, `cuda_memory_trim_after_batch`, `cohere_cuda_graphs`. Every other key (token, DIA URL/key, model cache path, language, debug audio) is dropped; the kept values are normalised exactly like saved settings.
+- names are trimmed, inner whitespace collapsed, at most 64 characters
+- `400` for an empty or too long name, a built-in tier name, or values without any preset key
+- presets are stored in `logs/genesis_whisper_presets.json` next to the settings file (atomic write)
+- loading a preset in the admin UI only fills the settings form; `PUT /api/admin/settings` applies it with the usual validation and model reload rules
+
+### `DELETE /api/admin/settings/presets/{name}`
+
+Purpose:
+
+- deletes a saved preset
+- `400` for a built-in tier name, `404` if no saved preset has that name
 
 ### `DELETE /api/admin/settings/dia-api-key`
 

@@ -331,6 +331,18 @@ button:disabled {
   color: var(--text-dim);
 }
 
+.preset-settings {
+  margin-bottom: 24px;
+  padding: 20px;
+  border: 1px solid rgba(149, 242, 199, 0.16);
+  border-radius: 20px;
+  background: rgba(149, 242, 199, 0.035);
+}
+
+.preset-copy {
+  margin-top: 8px;
+}
+
 .dia-settings {
   margin: 6px 0 2px;
   padding: 20px;
