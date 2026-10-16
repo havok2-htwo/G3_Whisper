@@ -29,7 +29,7 @@ import torch
 
 from .genesis_whisper_server_gpu import shared_gpu_lease
 from .genesis_whisper_server_turn_gate import clean_segment_text
-from .genesis_whisper_server_vid import EmbeddedVoiceWindow, VoiceWindow, embed_voice_windows
+from .genesis_whisper_server_vid import EmbeddedVoiceWindow, VoiceWindow, embed_voice_windows, resolve_local_device
 
 SAMPLE_RATE = 16000
 
@@ -60,6 +60,8 @@ VERIFY_TRIM_MIN_S = 1.2
 SENTENCE_GAP_S = 1.5
 
 _silero_lock = threading.Lock()
+# Guards inference, not loading: the model is stateful (see silero_frame_probs).
+_silero_inference_lock = threading.Lock()
 _silero_model: Any | None = None
 _mms_lock = threading.Lock()
 _mms_components: dict[str, Any] = {"model": None, "tokenizer": None, "aligner": None, "device": None, "dtype": None}
@@ -116,14 +118,21 @@ def silero_frame_probs(audio: np.ndarray) -> np.ndarray:
     padded[: n_frames * SILERO_WINDOW] = samples[: n_frames * SILERO_WINDOW]
     streams = torch.from_numpy(padded).reshape(n_streams, SILERO_STREAM_FRAMES * SILERO_WINDOW)
 
-    model.reset_states()
     probs = np.empty((n_streams, SILERO_STREAM_FRAMES), dtype=np.float32)
-    with torch.no_grad():
-        for frame_index in range(SILERO_STREAM_FRAMES):
-            chunk = streams[:, frame_index * SILERO_WINDOW : (frame_index + 1) * SILERO_WINDOW]
-            out = model(chunk, SAMPLE_RATE)
-            probs[:, frame_index] = out.reshape(-1).cpu().numpy()
-    model.reset_states()
+    # The one Silero model carries recurrent state per stream row between calls.
+    # Two long requests run this on different asyncio.to_thread workers, so one
+    # pass at a time: interleaved steps would corrupt each other's state (or
+    # fail on a mismatched batch shape).
+    with _silero_inference_lock:
+        model.reset_states()
+        try:
+            with torch.no_grad():
+                for frame_index in range(SILERO_STREAM_FRAMES):
+                    chunk = streams[:, frame_index * SILERO_WINDOW : (frame_index + 1) * SILERO_WINDOW]
+                    out = model(chunk, SAMPLE_RATE)
+                    probs[:, frame_index] = out.reshape(-1).cpu().numpy()
+        finally:
+            model.reset_states()
     return probs.reshape(-1)[:n_frames]
 
 
@@ -210,9 +219,48 @@ def split_audio_into_superchunks(
 # MMS_FA forced alignment
 # ---------------------------------------------------------------------------
 
+def _mms_dtype(device: torch.device) -> torch.dtype:
+    return MMS_CUDA_DTYPE if device.type == "cuda" else torch.float32
+
+
+def _move_mms(target_device: torch.device) -> None:
+    """Move the loaded MMS_FA model to ``target_device`` (caller holds ``_mms_lock``)."""
+
+    previous = _mms_components["device"]
+    dtype = _mms_dtype(target_device)
+    _mms_components["model"].to(device=target_device, dtype=dtype)
+    _mms_components.update({"device": target_device, "dtype": dtype})
+    # The old card keeps the weights' blocks cached until the pool is released.
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+    print(f"[INFO-WXC] MMS_FA Alignment-Modell von '{previous}' nach '{target_device}' verschoben.", file=sys.stderr)
+
+
+def apply_mms_device_setting() -> bool:
+    """Admin hook: move a loaded MMS_FA model to the current ``local_gpu_device``.
+
+    Returns True when it moved. A not yet loaded model needs nothing; its first
+    load resolves the device itself.
+    """
+
+    with _mms_lock:
+        if _mms_components["model"] is None:
+            return False
+        target_device = resolve_local_device()
+        if str(_mms_components["device"]) == str(target_device):
+            return False
+        _move_mms(target_device)
+        return True
+
+
 def _load_mms():
     with _mms_lock:
         if _mms_components["model"] is not None:
+            # Follow a changed local_gpu_device instead of staying on the old card.
+            target_device = resolve_local_device()
+            if str(_mms_components["device"]) != str(target_device):
+                _move_mms(target_device)
             return _mms_components
         # ReDimNet's loader redirects the global torch.hub dir into the model
         # cache; the MMS checkpoint usually already lives in the user hub, so
@@ -224,8 +272,10 @@ def _load_mms():
                 torch.hub.set_dir(str(user_hub))
             from torchaudio.pipelines import MMS_FA as bundle
 
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            dtype = MMS_CUDA_DTYPE if device.type == "cuda" else torch.float32
+            # Same card as the ASR engine (local_gpu_device). torch.device("cuda")
+            # would be cuda:0, which on the 3090 + 2070S box can be the DIA card.
+            device = resolve_local_device()
+            dtype = _mms_dtype(device)
             model = bundle.get_model().to(device=device, dtype=dtype)
             model.eval()
             _mms_components.update(

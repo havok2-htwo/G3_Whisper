@@ -451,16 +451,23 @@ The local ASR path already utilizes several optimizations:
   whole-file call
 - real batched inference: Whisper uses one processor/model forward per worker batch;
   Cohere uses sub-batches of at most 16 audio items and performs its own long-audio chunking
-- startup warmup of the configured ASR model with a sample clip (see "Startup Warmup" below)
-- optional idle CUDA-cache trimming, disabled by default to preserve low tail latency (see "Idle VRAM Trimming" below)
-- ReDimNet2 window batching (`REDIMNET_MAX_BATCH_SIZE` = 8) with automatic CUDA-OOM
-  batch-size reduction, one shared batch stream across DIA speakers, block-vectorized VAD,
-  and lazy audio windows that avoid full recording/speech copies. CUDA batches are
-  zero-padded to the next power of two (1/2/4/8, padding outputs discarded); longer window
-  streams run in chunks of 8. All four buckets are prepared at startup, which prevents the
-  roughly 4-second first-use kernel preparation for every new batch dimension. This
-  internal window batch is separate from the ASR queue setting `batch_max_segments` and is
-  deliberately a constant rather than an arbitrary setting.
+- startup warmup of the configured ASR model with a sample clip, or a synthetic clip when
+  `testaudio/` is missing (see "Startup Warmup" below)
+- idle CUDA-cache trimming, enabled by default (`cuda_memory_trim_after_batch`), 5 s after the
+  last local GPU phase of any kind (see "Idle VRAM Trimming" below)
+- ReDimNet2 window batching (setting `redimnet_max_batch_size`, 1/2/4/8, default 8) with
+  automatic CUDA-OOM batch-size reduction, one shared batch stream across DIA speakers,
+  block-vectorized VAD, and lazy audio windows that avoid full recording/speech copies. CUDA
+  batches are zero-padded to the next power of two up to the maximum (padding outputs
+  discarded); longer window streams run in chunks of the maximum. Every bucket up to the
+  maximum is prepared at startup, which prevents the roughly 4-second first-use kernel
+  preparation for every new batch dimension. The reserved pool scales with the maximum
+  (RTX 5090: 746 / 1442 / 2816 MiB for 2 / 4 / 8). Saving a new value re-warms the loaded
+  model and releases the old pool without a restart. This window batch is separate from the
+  ASR queue setting `batch_max_segments`; only the four power-of-two buckets are allowed
+  (other numbers snap down, 6 -> 4).
+- ReDimNet2 and MMS_FA alignment run on the same card as the ASR model (`local_gpu_device`);
+  a changed device moves both on save
 - serial DIA, ASR, and ReDim phases on the local GPU; an optional cross-process file lease coordinates Whisper and DIA when they share a physical GPU
 
 ### Fair ASR Scheduling
@@ -508,11 +515,15 @@ VRAM one Cohere batch needs; raise it only on a GPU that is not shared with othe
 
 ### Startup Warmup
 
-The configured ASR model is now eager-loaded at startup and warmed with `testaudio/Testaudio_02.wav`
-(previously the model was loaded lazily on the first request). After the warmup transcription the
-ASR CUDA cache is trimmed. ReDimNet is then eager-loaded and warmed for its four CUDA batch buckets
-(1/2/4/8, largest first, ~4 s each on an RTX 4090). Its prepared allocator pool deliberately remains
-resident, so both the first embedding and later DIA tail batches avoid first-shape latency spikes.
+The configured ASR model is eager-loaded at startup and warmed with `testaudio/Testaudio_02.wav`
+when that file exists, otherwise with a synthetic 4 s clip generated in memory (quiet noise plus a
+220 Hz tone at 16 kHz; the transcript is irrelevant). Before this fallback a missing `testaudio/`
+made the warmup a silent no-op: no model load, no Cohere graph capture, and the first real request
+paid both. After the warmup transcription the ASR CUDA cache is trimmed. ReDimNet is then
+eager-loaded and warmed for its CUDA batch buckets up to `redimnet_max_batch_size` (1/2/4/8, largest
+first, ~4 s each on an RTX 4090). The prepared shapes stay warm, so the first embedding and later DIA
+tail batches avoid first-shape latency spikes; the allocator pool the warmup reserved is released by
+the idle trim 5 s later (before, the process idled at 8.5 GB after startup instead of 6.3 GB).
 
 Both warmups are best-effort: any warmup failure (for example an unsupported precision) is logged
 and never blocks server startup. Batching does not duplicate the model: model weights stay
@@ -533,10 +544,15 @@ it to one worker therefore removes thread-local cold starts without reducing sup
 ### Idle VRAM Trimming
 
 The `cuda_memory_trim_after_batch` admin checkbox mirrors OmniVoice's "Auto VRAM trim after batch"
-setting and defaults to `true`. Once the ASR queue has been empty for 5 s, the batch worker calls the
-process-wide `torch.cuda.empty_cache()` (serialized with the local GPU lock, yielding to newly queued
-ASR work), so the idle footprint drops to the model floor instead of keeping every pool a bulk job ever
-grew. The next request re-reserves its pool; measured on an RTX 4090 this costs about +80 ms once for
+setting and defaults to `true`. Once every local GPU phase has been quiet for 5 s, the batch worker
+calls the process-wide `torch.cuda.empty_cache()` (serialized with the local GPU lock, yielding to newly
+queued ASR work), so the idle footprint drops to the model floor instead of keeping every pool a bulk job
+ever grew. "Every phase" means each `run_blocking_gpu_phase` call: ASR batches, ReDimNet speaker clouds,
+MMS_FA alignment, sentence verification, embedding requests, the startup warmups and model reloads. Each
+phase restarts the 5 s grace, and a phase that runs while the trim waits for the GPU lock cancels that
+trim, so the pool is never released in the middle of a diarization. Measured on the RTX 5090 before
+this: the trim only followed ASR batches, so the process idled at about 9.5 GB after a diarization or
+an embedding request and 8.5 GB after startup instead of about 6.3 GB. The next request re-reserves its pool; measured on an RTX 4090 this costs about +80 ms once for
 a padded ReDimNet batch, and steady live traffic (requests every few seconds) never idles long enough
 to pay it. Without the trim, a 47-minute diarization job left the process at 17 GB reserved on a 24 GB
 card shared with DIA and OmniVoice, Windows paged part of it to system memory, and ReDimNet ran ~100x
@@ -601,6 +617,14 @@ shared with other services, fp16), transcripts byte-identical in every case:
 
 The setting `cohere_cuda_graphs` (default `true`, admin checkbox "Cohere CUDA graphs") takes effect
 on the next model (re)load: restart the server or change model, device, precision or cache path.
+
+The graphs need the decoder's `eos_token_id` and `pad_token_id`. Some Cohere snapshots (the default
+`.\models` cache on the dev PC) lack `generation_config.json`, and `config.json` carries no token ids
+either; the graphs then refused to install and every request silently ran eager (about 1.1 s instead
+of 0.1 s per clip, 48x instead of 114x real time on 16 concurrent clips). The engine now fills the
+missing ids from the model config or the tokenizer (`<|endoftext|>` = 3, `<pad>` = 2) after loading
+and logs a `[WARNUNG] Cohere-Snapshot ohne generation_config.json/Token-IDs` line. Re-downloading the
+snapshot is not required.
 
 ### Experimental fp8 Precision
 
@@ -703,6 +727,7 @@ The active default values come from [backend/genesis_whisper_server_storage.py](
 - `batch_max_audio_seconds`: `100.0`
 - `cuda_memory_trim_after_batch`: `true`
 - `cohere_cuda_graphs`: `true` (applies on the next model load)
+- `redimnet_max_batch_size`: `8` (1/2/4/8; applies on save, no restart)
 - `debug_retain_history_audio`: `false`
 - `huggingface_token`: empty string
 - `dia_server_base_url`: empty string (falls back to `DIA_SERVER_BASE_URL`)
@@ -749,8 +774,40 @@ Settings presets: the admin settings panel offers the built-in GPU tiers `32GB V
 size), plus presets saved from the current form. Loading a preset only fills the form;
 Save Settings applies it. Presets hold only model, device, precision, batching, scheduler
 and VRAM settings, never the token, the DIA connection, the language or the model cache
-path; saved presets live in `logs/genesis_whisper_presets.json`. The tier values are the
-current defaults until they are replaced by measured values.
+path; saved presets live in `logs/genesis_whisper_presets.json`. The tier values were
+measured on the RTX 5090 (see "GPU Tier Presets" below).
+
+### GPU Tier Presets
+
+Measured on the RTX 5090 (2026-10-16, in-process with the service's own modules, Cohere
+Transcribe fp16 + ReDimNet2-B6 + MMS_FA, `start.bat` allocator settings). Process VRAM is
+NVML card usage minus the desktop baseline (cross-checked with the Windows per-process
+counter: 9672 vs 9671 MiB).
+
+| Tier | Values | Idle | Peak |
+| --- | --- | --- | --- |
+| `32GB VRAM` | fp16, `cohere_cuda_graphs` on, `batch_max_segments` 16, `batch_max_audio_seconds` 400, trim on, `redimnet_max_batch_size` 8 | ~6.3 GB | 9.7 GB |
+| `24GB VRAM` | same, `redimnet_max_batch_size` 4 | ~6.3 GB | ~8.3 GB |
+| `24+8 VRAM` | same as `24GB VRAM`; `local_gpu_device` = the 24 GB card | ~6.3 GB | ~8.3 GB |
+
+Why these values:
+
+- `batch_max_audio_seconds` on a 60-min transcription: 50 s 207x, 100 s (default) 283x,
+  200 s 336x, 400 s 393x, 800 s 398x real time. At 400 s the batches hit the 16-segment cap;
+  the ASR peak is the same (6.56 GB at 200 s, 6.58 GB at 400 s). The cost is latency: a live
+  request can wait about 0.9 s behind one bulk batch instead of about 0.37 s.
+- ReDimNet batch 8 / 4 / 2 reserves 2816 / 1442 / 746 MiB (384 / 213 / 110 windows/s). A
+  60-min diarization takes 19.6 s at 8 and 23.2 s at 4; the peak drops from 9.7 to 8.3 GB.
+- Cohere CUDA graphs cost about 1.0 GB idle and peak for 2.8x faster 60-min ASR and about
+  10x lower per-clip inference latency. bf16 measured the same VRAM and speed within 2-3 %.
+- The peak (9.7 GB) is ASR weights ~4.4 GB + graphs ~1.0 GB + ASR activations ~0.3 GB +
+  ReDimNet pool + MMS_FA ~0.6 GB + CUDA context ~0.85 GB; it already appears with 5-min
+  audio, so it does not grow with the recording length.
+- `batch_wait_time_ms` is not part of the tiers: the 500 ms default adds up to 0.5 s to
+  every fresh live request (clip latency 0.56-0.67 s, of which 0.5 s is waiting); 50-100 ms
+  would likely be enough but was not measured.
+- Whisper does not fit the 8 GB 2070S (weights + graphs + ReDimNet + MMS_FA + context
+  exceed 9 GB, no bf16), so there is no `8+24 VRAM` tier.
 
 `debug_retain_history_audio` is a diagnostics-only, default-off setting for investigating
 sporadic latency and transcription differences. When enabled, successful requests through

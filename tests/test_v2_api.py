@@ -795,7 +795,7 @@ class V2DiarizationAssemblyTests(unittest.TestCase):
         extract_mock = mock.AsyncMock(side_effect=lambda *_args: events.append("embedding") or clouds)
         refine_mock = mock.Mock(side_effect=lambda *_args, **_kwargs: events.append("refinement") or result_object)
 
-        async def transcribe(_request, _audio, turns, _overlaps, _filter):
+        async def transcribe(_request, _audio, turns, _overlaps, _filter, *_gate_and_language):
             events.append("transcription")
             segments = []
             for index, turn in enumerate(turns):

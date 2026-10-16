@@ -28,6 +28,7 @@ if [ ! -f "${SETTINGS_FILE}" ]; then
     "scheduler_first_chunk_fast_path": true,
     "cuda_memory_trim_after_batch": true,
     "cohere_cuda_graphs": true,
+    "redimnet_max_batch_size": 8,
     "debug_retain_history_audio": false,
     "huggingface_token": ""
 }

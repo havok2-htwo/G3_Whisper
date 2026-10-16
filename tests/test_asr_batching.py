@@ -12,6 +12,7 @@ from fastapi.testclient import TestClient
 from backend import genesis_whisper_server_admin as admin
 from backend import genesis_whisper_server_api as legacy_api
 from backend import genesis_whisper_server_batching as batching
+from backend import genesis_whisper_server_gpu as gpu
 from backend import genesis_whisper_server_storage as storage
 from backend import genesis_whisper_server_v2 as v2
 from backend import genesis_whisper_server_wxc as wxc
@@ -369,6 +370,88 @@ class SchedulerSettingsTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(
             storage.normalize_settings({"scheduler_first_chunk_fast_path": False})["scheduler_first_chunk_fast_path"]
         )
+
+
+class IdleTrimAfterOtherGpuPhasesTests(unittest.IsolatedAsyncioTestCase):
+    """The idle trim must also fire after GPU phases outside the ASR queue (ReDimNet clouds, MMS_FA alignment,
+    verification, embeddings, startup warmups); measured before the fix: 9.5 GB idle after a diarization instead of
+    6.3 GB, 8.5 GB after startup."""
+
+    GRACE = 0.05
+
+    async def asyncSetUp(self) -> None:
+        self._previous_settings = current_settings.copy()
+        with settings_lock:
+            current_settings.clear()
+            current_settings.update({**SCHEDULER_TEST_SETTINGS, "cuda_memory_trim_after_batch": True})
+        self.gpu_lock = asyncio.Lock()
+        self.manager = WhisperBatchManager(lambda audio, key: [""] * len(audio), self.gpu_lock)
+        self.trims: list[float] = []
+        loop = asyncio.get_running_loop()
+        self._patches = [
+            mock.patch.object(batching, "IDLE_TRIM_GRACE_SECONDS", self.GRACE),
+            mock.patch.object(self.manager, "_trim_cuda_cache", side_effect=lambda: self.trims.append(loop.time())),
+        ]
+        for patcher in self._patches:
+            patcher.start()
+        await self.manager.start()
+
+    async def asyncTearDown(self) -> None:
+        await self.manager.stop()
+        for patcher in reversed(self._patches):
+            patcher.stop()
+        with settings_lock:
+            current_settings.clear()
+            current_settings.update(self._previous_settings)
+
+    async def _gpu_phase(self, seconds: float = 0.0) -> float:
+        import time as _time
+
+        async with self.gpu_lock:
+            await gpu.run_blocking_gpu_phase(_time.sleep, seconds)
+        return asyncio.get_running_loop().time()
+
+    async def test_no_gpu_activity_means_no_trim(self) -> None:
+        await asyncio.sleep(self.GRACE * 4)
+        self.assertEqual(self.trims, [])
+
+    async def test_a_non_asr_gpu_phase_is_trimmed_once_after_the_grace(self) -> None:
+        finished = await self._gpu_phase()
+        await asyncio.sleep(self.GRACE * 4)
+
+        self.assertEqual(len(self.trims), 1)
+        self.assertGreaterEqual(self.trims[0] - finished, self.GRACE * 0.9)
+
+    async def test_steady_phases_keep_the_pool_until_the_last_one(self) -> None:
+        last = 0.0
+        for _ in range(6):
+            last = await self._gpu_phase()
+            await asyncio.sleep(self.GRACE / 3)
+        self.assertEqual(self.trims, [])
+        await asyncio.sleep(self.GRACE * 4)
+        self.assertEqual(len(self.trims), 1)
+        self.assertGreaterEqual(self.trims[0] - last, self.GRACE * 0.9)
+
+    async def test_trim_never_lands_in_the_middle_of_a_long_phase(self) -> None:
+        # The phase outlasts the grace period: the worker's trim waits for the lock and must then see that the
+        # phase ran, skip, and trim only one grace period after the phase ended.
+        finished = await self._gpu_phase(self.GRACE * 3)
+        await asyncio.sleep(self.GRACE * 4)
+
+        self.assertEqual(len(self.trims), 1)
+        self.assertGreaterEqual(self.trims[0] - finished, self.GRACE * 0.9)
+
+    async def test_disabled_trim_never_trims_after_other_phases(self) -> None:
+        with settings_lock:
+            current_settings["cuda_memory_trim_after_batch"] = False
+        await self._gpu_phase()
+        await asyncio.sleep(self.GRACE * 4)
+        self.assertEqual(self.trims, [])
+
+    async def test_the_trim_itself_does_not_count_as_activity(self) -> None:
+        await self._gpu_phase()
+        await asyncio.sleep(self.GRACE * 8)
+        self.assertEqual(len(self.trims), 1)
 
 
 class LongAudioSuperchunkTests(unittest.TestCase):

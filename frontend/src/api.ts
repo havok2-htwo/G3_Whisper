@@ -17,6 +17,7 @@ export type AdminSettings = {
   scheduler_first_chunk_fast_path: boolean;
   cuda_memory_trim_after_batch: boolean;
   cohere_cuda_graphs: boolean;
+  redimnet_max_batch_size: number;
   debug_retain_history_audio: boolean;
   huggingface_token: string;
   dia_server_base_url: string;

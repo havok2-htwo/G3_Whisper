@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 import time
 import uuid
 from statistics import mean
@@ -61,6 +62,8 @@ from .genesis_whisper_server_repetition import (
 from .genesis_whisper_server_dia_client import dia_unreachable_hint
 from .genesis_whisper_server_presets import delete_user_preset, resolve_presets, save_user_preset
 from .genesis_whisper_server_storage import normalize_settings, resolve_dia_server_config, save_settings
+from .genesis_whisper_server_vid import apply_vid_settings
+from .genesis_whisper_server_wxc import apply_mms_device_setting
 
 
 class AdminSettingsPayload(BaseModel):
@@ -77,6 +80,7 @@ class AdminSettingsPayload(BaseModel):
     scheduler_first_chunk_fast_path: bool | None = None
     cuda_memory_trim_after_batch: bool | None = None
     cohere_cuda_graphs: bool | None = None
+    redimnet_max_batch_size: int | None = None
     debug_retain_history_audio: StrictBool | None = None
     huggingface_token: str | None = None
     dia_server_base_url: str | None = None
@@ -182,6 +186,12 @@ def _load_model_for_settings(settings_snapshot: Dict[str, Any]) -> bool:
     cache_path = settings_snapshot["local_model_cache_path"]
     with shared_gpu_lease():
         return load_local_asr_model(model_id, device, cache_path, precision)
+
+
+def _apply_voice_model_settings() -> Dict[str, bool]:
+    """Move/re-warm the loaded ReDimNet and MMS_FA models for the saved settings (GPU thread)."""
+
+    return {"redimnet": apply_vid_settings(), "mms_fa": apply_mms_device_setting()}
 
 
 def _get_local_processing_key() -> tuple[str, str, str, str, str]:
@@ -458,6 +468,20 @@ def create_admin_api(app: FastAPI) -> FastAPI:
         if model_settings_changed:
             async with request.app.state.local_gpu_lock:
                 model_loaded = await run_blocking_gpu_phase(_load_model_for_settings, saved_settings)
+
+        # ReDimNet and MMS_FA follow local_gpu_device, ReDimNet also its max batch. Re-prepare loaded
+        # models now, so the old card / the larger bucket pool is released and the next request is warm.
+        voice_settings_changed = any(
+            previous_settings.get(key) != saved_settings.get(key)
+            for key in ("local_gpu_device", "redimnet_max_batch_size")
+        )
+        if voice_settings_changed:
+            try:
+                async with request.app.state.local_gpu_lock:
+                    await run_blocking_gpu_phase(_apply_voice_model_settings)
+            except Exception as exc:
+                # Not fatal: the next ReDimNet/MMS_FA use re-prepares lazily from the same settings.
+                print(f"[WARNUNG] ReDimNet/MMS_FA konnten nicht neu vorbereitet werden: {exc}", file=sys.stderr)
 
         return {
             "ok": True,

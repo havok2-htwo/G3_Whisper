@@ -456,5 +456,55 @@ class CudaGraphSettingTests(unittest.TestCase):
             current_settings.update(original)
 
 
+class MissingGenerationConfigTests(unittest.TestCase):
+    """The default .\\models snapshot has no generation_config.json, so eos/pad were missing and the graphs
+    silently fell back to eager (about 10x slower per clip)."""
+
+    def _model_without_token_ids(self, **config_ids) -> _FakeModel:
+        model = _FakeModel()
+        model.generation_config = SimpleNamespace(eos_token_id=None, pad_token_id=None)
+        model.config = SimpleNamespace(**config_ids)
+        return model
+
+    def test_engine_fills_token_ids_from_the_tokenizer(self) -> None:
+        model = self._model_without_token_ids()
+        processor = SimpleNamespace(tokenizer=SimpleNamespace(eos_token_id=3, pad_token_id=2))
+
+        engine._ensure_cohere_generation_token_ids(model, processor)
+
+        self.assertEqual((model.generation_config.eos_token_id, model.generation_config.pad_token_id), (3, 2))
+        handle = graphs.install_cohere_cuda_graphs(model)
+        try:
+            self.assertEqual((handle.eos_token_id, handle.pad_token_id), (3, 2))
+        finally:
+            handle.uninstall()
+
+    def test_engine_prefers_model_config_and_keeps_present_ids(self) -> None:
+        model = self._model_without_token_ids(eos_token_id=[7, 8], pad_token_id=None)
+        model.generation_config.pad_token_id = 5
+        processor = SimpleNamespace(tokenizer=SimpleNamespace(eos_token_id=3, pad_token_id=2))
+
+        engine._ensure_cohere_generation_token_ids(model, processor)
+
+        self.assertEqual((model.generation_config.eos_token_id, model.generation_config.pad_token_id), (7, 5))
+
+    def test_engine_leaves_ids_unset_when_no_source_has_them(self) -> None:
+        model = self._model_without_token_ids()
+
+        engine._ensure_cohere_generation_token_ids(model, SimpleNamespace(tokenizer=None))
+
+        self.assertIsNone(model.generation_config.eos_token_id)
+        with self.assertRaises(ValueError):
+            graphs.install_cohere_cuda_graphs(model)
+
+    def test_graphs_fall_back_to_model_config(self) -> None:
+        model = self._model_without_token_ids(eos_token_id=3, pad_token_id=2)
+        handle = graphs.install_cohere_cuda_graphs(model)
+        try:
+            self.assertEqual((handle.eos_token_id, handle.pad_token_id), (3, 2))
+        finally:
+            handle.uninstall()
+
+
 if __name__ == "__main__":
     unittest.main()

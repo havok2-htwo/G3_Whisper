@@ -525,6 +525,52 @@ def _install_cohere_inference_patch(model, normalized_precision: str) -> None:
         print(f"[WARNUNG] cuDNN-freier Cohere-Encoder konnte nicht installiert werden: {exc}", file=sys.stderr)
 
 
+def _first_token_id(value) -> Optional[int]:
+    if isinstance(value, (list, tuple)):
+        value = value[0] if value else None
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _ensure_cohere_generation_token_ids(model, processor) -> None:
+    """Fill eos/pad token ids of a Cohere model whose snapshot has no generation_config.json.
+
+    Older or partial snapshots (the default ``.\\models`` cache on the dev PC) ship only
+    config.json, which carries no token ids either, so ``model.generation_config`` has no
+    eos/pad and the CUDA graphs refused to install: every request ran eager, about 10x
+    slower per clip. Take the ids from the model config, else from the tokenizer
+    (special_tokens_map: eos ``<|endoftext|>`` = 3, pad ``<pad>`` = 2), and say so in the log.
+    """
+
+    generation_config = getattr(model, "generation_config", None)
+    if generation_config is None:
+        return
+    model_config = getattr(model, "config", None)
+    tokenizer = getattr(processor, "tokenizer", None)
+    filled = {}
+    for name in ("eos_token_id", "pad_token_id"):
+        if _first_token_id(getattr(generation_config, name, None)) is not None:
+            continue
+        source, value = "config.json", _first_token_id(getattr(model_config, name, None))
+        if value is None:
+            source, value = "Tokenizer", _first_token_id(getattr(tokenizer, name, None))
+        if value is None:
+            continue
+        setattr(generation_config, name, value)
+        filled[name] = (value, source)
+    if filled:
+        details = ", ".join(f"{name}={value} (aus {source})" for name, (value, source) in filled.items())
+        print(
+            f"[WARNUNG] Cohere-Snapshot ohne generation_config.json/Token-IDs: setze {details}. "
+            "Ohne diese IDs liefen die CUDA-Graphs nicht (eager, ~10x langsamer pro Clip).",
+            file=sys.stderr,
+        )
+
+
 def _cleanup_previous_model():
     _uninstall_cohere_inference_patch()
     if local_model_components.get("model") is None:
@@ -719,6 +765,7 @@ def load_local_asr_model(model_id: str, device_selection: str, cache_path: str, 
             if not use_gpu and model_device.type != "cpu":
                 model.to("cpu")
             if uses_cohere_backend(model_id):
+                _ensure_cohere_generation_token_ids(model, processor)
                 _install_cohere_inference_patch(model, normalized_precision)
 
             _store_local_model_components(model, processor, target_identifier, model_backend)

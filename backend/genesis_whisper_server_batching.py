@@ -19,14 +19,22 @@ from .genesis_whisper_server_globals import (
     job_history,
     settings_lock,
 )
-from .genesis_whisper_server_gpu import run_blocking_gpu_phase
+from .genesis_whisper_server_gpu import (
+    add_gpu_activity_listener,
+    gpu_activity_count,
+    remove_gpu_activity_listener,
+    run_blocking_gpu_phase,
+    run_gpu_housekeeping,
+)
 
 
 SAMPLE_RATE = 16000
-# How long the ASR queue must stay empty before the (optional) idle trim releases
-# the reserved CUDA pool. Five seconds keeps the pool warm under steady live
-# traffic (requests every few seconds never pay the re-reservation) while a
-# genuinely idle server still drops to its model floor on a shared GPU.
+# How long every local GPU phase must stay quiet before the (optional) idle trim
+# releases the reserved CUDA pool. Five seconds keeps the pool warm under steady
+# live traffic (requests every few seconds never pay the re-reservation) while a
+# genuinely idle server still drops to its model floor on a shared GPU. Not only
+# ASR batches count: ReDimNet clouds, MMS_FA alignment, verification, embedding
+# requests and the startup warmups do too (gpu_activity_count).
 IDLE_TRIM_GRACE_SECONDS = 5.0
 
 DEFAULT_LONG_JOB_MIN_CHUNKS = 5
@@ -152,19 +160,32 @@ class WhisperBatchManager:
         self._worker_task: Optional[asyncio.Task] = None
         self._stop_event = asyncio.Event()
         self._last_batch_was_fast_path = False
+        # gpu_activity_count() as of the last trim decision; a different value
+        # means GPU work ran since then and the pool may be grown again.
+        # None = an ASR batch ran (also when a test replaces the GPU phase).
+        self._settled_gpu_activity: Optional[int] = gpu_activity_count()
+        self._idle_waiting = False
 
     # ------------------------------------------------------------------ lifecycle
+
+    def _on_gpu_activity(self) -> None:
+        # Wake only the idle wait so it restarts its grace period; waking the
+        # batch-wait would cut a newcomer's batch window short.
+        if self._idle_waiting:
+            self._wake.set()
 
     async def start(self):
         if self._worker_task and not self._worker_task.done():
             return
         self._stop_event = asyncio.Event()
+        add_gpu_activity_listener(self._on_gpu_activity)
         self._worker_task = asyncio.create_task(self._worker_loop(), name="whisper-batch-worker")
         with batch_state_lock:
             batch_runtime_state["worker_running"] = True
             batch_runtime_state["last_error"] = None
 
     async def stop(self):
+        remove_gpu_activity_listener(self._on_gpu_activity)
         self._stop_event.set()
         self._wake.set()
         if self._worker_task:
@@ -499,13 +520,16 @@ class WhisperBatchManager:
         except Exception:
             pass
 
-    async def _trim_cuda_cache_if_enabled(self) -> bool:
-        """Trim only when the operator explicitly trades latency for idle VRAM.
+    async def _trim_cuda_cache_if_enabled(self, activity: Optional[int] = None) -> bool:
+        """Trim unless the operator disabled it (``cuda_memory_trim_after_batch``, default on).
 
-        ``torch.cuda.empty_cache()`` is process-wide rather than model-scoped.
-        Keeping this disabled therefore preserves the warm allocator state used
-        by both Cohere ASR and ReDimNet.  When enabled, serialize the trim with
-        every other local CUDA phase so it cannot race an embedding inference.
+        ``torch.cuda.empty_cache()`` is process-wide rather than model-scoped:
+        it releases the idle pools of Cohere ASR, ReDimNet and MMS_FA alike.
+        Serialize the trim with every other local CUDA phase so it cannot race
+        an embedding inference. ``activity`` is ``gpu_activity_count()`` at the
+        moment the idle grace ran out; a GPU phase that ran while this worker
+        waited for the lock (a long alignment slice) skips the trim, so the
+        pool is never released in the middle of a diarization.
         """
 
         with settings_lock:
@@ -518,7 +542,9 @@ class WhisperBatchManager:
             # Serving it has priority over an optional housekeeping operation.
             if self._has_schedulable_work():
                 return False
-            await run_blocking_gpu_phase(self._trim_cuda_cache)
+            if activity is not None and gpu_activity_count() != activity:
+                return False
+            await run_gpu_housekeeping(self._trim_cuda_cache)
         return True
 
     async def _wait_for_wake(self, timeout: Optional[float]) -> bool:
@@ -533,22 +559,34 @@ class WhisperBatchManager:
             return False
         return True
 
+    async def _wait_idle(self, timeout: Optional[float]) -> bool:
+        """``_wait_for_wake`` that GPU phases outside this queue can also end."""
+
+        self._idle_waiting = True
+        try:
+            return await self._wait_for_wake(timeout)
+        finally:
+            self._idle_waiting = False
+
     async def _worker_loop(self):
-        dirty = False
         try:
             while not self._stop_event.is_set():
                 if not self._has_schedulable_work():
                     # Clearing before waiting cannot lose a wake-up: every state
                     # change sets the event synchronously on this loop.
                     self._wake.clear()
-                    if not dirty:
-                        await self._wait_for_wake(None)
-                    elif not await self._wait_for_wake(IDLE_TRIM_GRACE_SECONDS):
-                        # Queue drained: trim once after a burst so the inference
-                        # reserved-pool spike is returned to the driver instead of
-                        # staying pinned while idle.
-                        await self._trim_cuda_cache_if_enabled()
-                        dirty = False
+                    activity = gpu_activity_count()
+                    if activity == self._settled_gpu_activity:
+                        await self._wait_idle(None)
+                    elif not await self._wait_idle(IDLE_TRIM_GRACE_SECONDS):
+                        # Every GPU phase has been quiet for the grace period
+                        # (ASR batches, diarization phases, embeddings, startup
+                        # warmups): trim once so the reserved-pool spike is
+                        # returned to the driver instead of staying pinned while
+                        # idle. A phase that ran meanwhile leaves the counter
+                        # changed, so the next pass waits another grace period.
+                        await self._trim_cuda_cache_if_enabled(activity)
+                        self._settled_gpu_activity = activity
                     continue
 
                 limits = self._get_limits()
@@ -565,7 +603,7 @@ class WhisperBatchManager:
 
                 batch_items = self._reserve_batch(plan)
                 await self._process_batch(batch_items, fast_path=plan.fast_path)
-                dirty = True
+                self._settled_gpu_activity = None
         except asyncio.CancelledError:
             raise
         except Exception as exc:

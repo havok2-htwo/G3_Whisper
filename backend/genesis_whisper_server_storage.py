@@ -19,6 +19,9 @@ from .genesis_whisper_server_globals import (
 
 load_dotenv(os.path.join(PROJECT_ROOT, ".env"), override=False)
 
+# Allowed values of redimnet_max_batch_size: the power-of-two CUDA batch buckets ReDimNet is warmed for.
+REDIMNET_MAX_BATCH_SIZE_VALUES = (1, 2, 4, 8)
+
 
 DEFAULT_SETTINGS: Dict[str, Any] = {
     "local_model": COHERE_MODEL_ID,
@@ -34,6 +37,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "scheduler_first_chunk_fast_path": True,
     "cuda_memory_trim_after_batch": True,
     "cohere_cuda_graphs": True,
+    "redimnet_max_batch_size": 8,
     "debug_retain_history_audio": False,
     "huggingface_token": "",
     "dia_server_base_url": "",
@@ -63,6 +67,23 @@ def resolve_dia_server_config(settings: Optional[Dict[str, Any]] = None) -> Dict
         "base_url_source": "settings" if configured_base_url else ("environment" if env_base_url else "none"),
         "api_key_source": "settings" if configured_api_key else ("environment" if env_api_key else "none"),
     }
+
+
+def normalize_redimnet_max_batch_size(value: Any) -> int:
+    """Largest ReDimNet CUDA batch bucket (1/2/4/8); the reserved pool scales with it.
+
+    RTX 5090: 746 / 1442 / 2816 MiB reserved for 2 / 4 / 8. Other numbers snap down to the next allowed
+    bucket (6 -> 4, 0 or negative -> 1, above 8 -> 8); a non-number falls back to the default.
+    """
+
+    if isinstance(value, bool):
+        return DEFAULT_SETTINGS["redimnet_max_batch_size"]
+    try:
+        configured = int(value)
+    except (TypeError, ValueError):
+        return DEFAULT_SETTINGS["redimnet_max_batch_size"]
+    allowed = [size for size in REDIMNET_MAX_BATCH_SIZE_VALUES if size <= configured]
+    return max(allowed) if allowed else REDIMNET_MAX_BATCH_SIZE_VALUES[0]
 
 
 def normalize_settings(settings: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -145,6 +166,10 @@ def normalize_settings(settings: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         configured_cuda_graphs
         if isinstance(configured_cuda_graphs, bool)
         else DEFAULT_SETTINGS["cohere_cuda_graphs"]
+    )
+
+    normalized["redimnet_max_batch_size"] = normalize_redimnet_max_batch_size(
+        source.get("redimnet_max_batch_size", DEFAULT_SETTINGS["redimnet_max_batch_size"])
     )
 
     configured_history_audio_debug = source.get(

@@ -163,6 +163,21 @@ def _private_pool_bytes(pool_id: Optional[Tuple[int, int]]) -> int:
         return 0
 
 
+def _token_id(model: Any, name: str) -> Optional[int]:
+    """``name`` (eos_token_id/pad_token_id) aus generation_config, sonst aus model.config."""
+
+    for config in (getattr(model, "generation_config", None), getattr(model, "config", None)):
+        value = getattr(config, name, None)
+        if isinstance(value, (list, tuple)):
+            value = value[0] if value else None
+        if value is not None and not isinstance(value, bool):
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
 def cohere_cuda_graphs_supported(model: Any, model_precision: str) -> Tuple[bool, str]:
     """Darf auf diesem geladenen Modell ueberhaupt gecaptured werden? (bool, Grund)."""
 
@@ -301,15 +316,17 @@ class CohereCudaGraphs:
         self.max_graphs = max(0, int(max_graphs))
         self.memory_budget_bytes = None if memory_budget_mb is None else int(float(memory_budget_mb) * 2**20)
 
-        generation_config = model.generation_config
-        eos = generation_config.eos_token_id
-        if isinstance(eos, (list, tuple)):
-            eos = eos[0] if eos else None
-        pad = generation_config.pad_token_id
+        # The engine fills generation_config from config/tokenizer when the snapshot
+        # lacks generation_config.json; the model config is the fallback here.
+        eos = _token_id(model, "eos_token_id")
+        pad = _token_id(model, "pad_token_id")
         if eos is None or pad is None:
-            raise ValueError("Cohere generation_config ohne eos_token_id/pad_token_id.")
-        self.eos_token_id = int(eos)
-        self.pad_token_id = int(pad)
+            raise ValueError(
+                "Cohere generation_config und config ohne eos_token_id/pad_token_id "
+                "(Snapshot ohne generation_config.json?)."
+            )
+        self.eos_token_id = eos
+        self.pad_token_id = pad
 
         self._lock = threading.RLock()
         self._owner_thread: Optional[int] = None

@@ -112,6 +112,7 @@ const emptySettings: AdminSettings = {
   scheduler_first_chunk_fast_path: true,
   cuda_memory_trim_after_batch: true,
   cohere_cuda_graphs: true,
+  redimnet_max_batch_size: 8,
   debug_retain_history_audio: false,
   huggingface_token: "",
   dia_server_base_url: "",
@@ -2340,6 +2341,25 @@ export default function App() {
                   key. Environment keys remain managed through <code>DIA_SERVER_API_KEY</code>.
                 </p>
 
+                <label className="full-width">
+                  <span>ReDimNet Max Batch (voice ID)</span>
+                  <select
+                    value={settingsForm.redimnet_max_batch_size}
+                    onChange={(event) => updateSetting("redimnet_max_batch_size", Number(event.target.value))}
+                  >
+                    {[8, 4, 2, 1].map((size) => (
+                      <option key={size} value={size}>
+                        {size}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <p className="field-note full-width">
+                  Largest CUDA batch of 3 s windows for speaker clouds, sentence verification and embeddings. The
+                  reserved pool scales with it (RTX 5090: about 2.8 GB at 8, 1.4 GB at 4, 0.75 GB at 2); a 60-min
+                  diarization took 19.6 s at 8 and 23.2 s at 4. Applies on save, no restart needed.
+                </p>
+
                 <div className="dia-actions full-width">
                   <button
                     type="button"
@@ -2449,8 +2469,9 @@ export default function App() {
               <span>
                 Auto VRAM trim after batch
                 <small>
-                  Releases the process-wide CUDA allocator pool once the ASR queue has been idle for 5 s, so the
-                  idle footprint stays near the model floor on a shared GPU. The next request re-reserves its pool
+                  Releases the process-wide CUDA allocator pool once every local GPU phase (ASR batches,
+                  diarization, embeddings, startup warmup) has been idle for 5 s, so the idle footprint stays near
+                  the model floor on a shared GPU (RTX 5090: about 6.3 GB). The next request re-reserves its pool
                   (measured: about +80 ms once for a ReDimNet batch). Disable only on a GPU this server has to itself.
                 </small>
               </span>

@@ -269,6 +269,132 @@ class RedimNetVoicePathTests(unittest.TestCase):
         self.assertEqual(prepared, 1)
         self.assertEqual(warmed, [1])
 
+    def test_cuda_warmup_honours_a_smaller_configured_maximum(self) -> None:
+        warmed: list[int] = []
+        with mock.patch.object(vid, "_run_model_warmup", side_effect=lambda m, d, t, b: warmed.append(b)):
+            prepared = vid._warm_model_shapes(object(), torch.device("cuda"), torch.float16, 4)
+        self.assertEqual(prepared, 4)
+        self.assertEqual(warmed, [4, 2, 1])
+
+    def test_max_batch_setting_is_normalised_to_a_bucket(self) -> None:
+        from backend import genesis_whisper_server_storage as storage
+
+        self.assertEqual(storage.DEFAULT_SETTINGS["redimnet_max_batch_size"], 8)
+        cases = [(8, 8), (4, 4), (2, 2), (1, 1), ("4", 4), (6, 4), (3, 2), (16, 8), (0, 1), (-2, 1), ("x", 8), (None, 8), (True, 8)]
+        for value, expected in cases:
+            with self.subTest(value=value):
+                self.assertEqual(storage.normalize_settings({"redimnet_max_batch_size": value})["redimnet_max_batch_size"], expected)
+        self.assertEqual(storage.normalize_settings({})["redimnet_max_batch_size"], 8)
+        with mock.patch.dict(vid.current_settings, {"redimnet_max_batch_size": 4}, clear=True):
+            self.assertEqual(vid.configured_max_batch_size(), 4)
+        with mock.patch.dict(vid.current_settings, {}, clear=True):
+            self.assertEqual(vid.configured_max_batch_size(), 8)
+
+    def test_embedding_default_batch_follows_the_setting(self) -> None:
+        calls: list[int] = []
+
+        class FakeModel:
+            def __call__(self, waveform):
+                calls.append(len(waveform))
+                result = torch.zeros((len(waveform), vid.REDIMNET_EMBEDDING_DIMENSION))
+                result[:, 0] = 1.0
+                return result
+
+        windows = [
+            vid.VoiceWindow(audio=np.full(vid.REDIMNET_WINDOW_SAMPLES, 0.05, dtype=np.float32), start_ms=index)
+            for index in range(10)
+        ]
+        components = {"model": FakeModel(), "device": torch.device("cpu"), "dtype": torch.float32, "cuda_batch_size": 8}
+        with (
+            mock.patch.object(vid, "load_vid_model", return_value=True),
+            mock.patch.dict(vid._redimnet_components, components, clear=True),
+            mock.patch.object(vid, "shared_gpu_lease", return_value=nullcontext()),
+            mock.patch.dict(vid.current_settings, {"redimnet_max_batch_size": 4}, clear=True),
+        ):
+            vid.embed_voice_windows(windows)
+
+        self.assertEqual(calls, [4, 4, 2])
+
+    def _loaded_components(self, model, device="cuda:0", maximum=8) -> dict:
+        return {
+            "model": model,
+            "device": torch.device(device),
+            "dtype": torch.float16,
+            "cache_root": None,
+            "cuda_batch_size": maximum,
+            "max_batch_size": maximum,
+        }
+
+    def test_changed_max_batch_releases_the_pool_and_rewarms_the_loaded_model(self) -> None:
+        model = mock.Mock()
+        events: list[str] = []
+        with (
+            mock.patch.dict(vid._redimnet_components, self._loaded_components(model), clear=True),
+            mock.patch.dict(vid.current_settings, {"redimnet_max_batch_size": 4, "local_gpu_device": "cuda:0"}, clear=True),
+            mock.patch.object(vid, "resolve_local_device", return_value=torch.device("cuda:0")),
+            mock.patch.object(vid, "_release_cuda_pool", side_effect=lambda: events.append("release")),
+            mock.patch.object(vid, "_warm_model_shapes", side_effect=lambda m, d, t, n: events.append(f"warm{n}") or n),
+        ):
+            self.assertTrue(vid.load_vid_model())
+            self.assertEqual(vid._redimnet_components["max_batch_size"], 4)
+            self.assertEqual(vid._redimnet_components["cuda_batch_size"], 4)
+            # Unchanged settings: no second re-warm.
+            self.assertTrue(vid.load_vid_model())
+            self.assertFalse(vid.apply_vid_settings())
+
+        self.assertEqual(events, ["release", "warm4"])
+        model.to.assert_not_called()
+
+    def test_oom_backoff_alone_does_not_trigger_a_rewarm(self) -> None:
+        components = self._loaded_components(mock.Mock())
+        components["cuda_batch_size"] = 2
+        with (
+            mock.patch.dict(vid._redimnet_components, components, clear=True),
+            mock.patch.dict(vid.current_settings, {"redimnet_max_batch_size": 8}, clear=True),
+            mock.patch.object(vid, "resolve_local_device", return_value=torch.device("cuda:0")),
+            mock.patch.object(vid, "_warm_model_shapes") as warm,
+        ):
+            self.assertFalse(vid.apply_vid_settings())
+        warm.assert_not_called()
+
+    def test_changed_gpu_device_moves_the_loaded_model(self) -> None:
+        model = mock.Mock()
+        with (
+            mock.patch.dict(vid._redimnet_components, self._loaded_components(model), clear=True),
+            mock.patch.dict(vid.current_settings, {"redimnet_max_batch_size": 8}, clear=True),
+            mock.patch.object(vid, "resolve_local_device", return_value=torch.device("cuda:1")),
+            mock.patch.object(vid, "_release_cuda_pool") as release,
+            mock.patch.object(vid, "_warm_model_shapes", return_value=8),
+        ):
+            self.assertTrue(vid.apply_vid_settings())
+            self.assertEqual(vid._redimnet_components["device"], torch.device("cuda:1"))
+        model.to.assert_called_once_with(torch.device("cuda:1"))
+        release.assert_called_once_with()
+
+    def test_apply_settings_without_a_loaded_model_does_nothing(self) -> None:
+        with (
+            mock.patch.dict(vid._redimnet_components, {"model": None}, clear=True),
+            mock.patch.object(vid, "_warm_model_shapes") as warm,
+        ):
+            self.assertFalse(vid.apply_vid_settings())
+        warm.assert_not_called()
+
+    def test_local_device_follows_the_gpu_setting(self) -> None:
+        cases = {"cuda:1": "cuda:1", "cuda": "cuda:0", "auto": "cuda:0", "cpu": "cpu"}
+        for configured, expected in cases.items():
+            with (
+                self.subTest(configured=configured),
+                mock.patch.dict(vid.current_settings, {"local_gpu_device": configured}, clear=True),
+                mock.patch.object(vid.torch.cuda, "is_available", return_value=True),
+                mock.patch.object(vid.torch.cuda, "current_device", return_value=0),
+            ):
+                self.assertEqual(str(vid.resolve_local_device()), expected)
+        with (
+            mock.patch.dict(vid.current_settings, {"local_gpu_device": "cuda:1"}, clear=True),
+            mock.patch.object(vid.torch.cuda, "is_available", return_value=False),
+        ):
+            self.assertEqual(str(vid.resolve_local_device()), "cpu")
+
     def test_long_stream_runs_in_chunks_of_eight_with_padded_tail(self) -> None:
         calls: list[int] = []
 

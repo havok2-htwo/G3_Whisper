@@ -65,6 +65,46 @@ class BuiltinPresetTests(_PresetTestCase):
                     {key: normalized[key] for key in values}, values, "a built-in value would be clamped or rejected"
                 )
 
+    def test_tier_values_are_the_measured_ones(self) -> None:
+        # Measured on the RTX 5090 (2026-10-16): 400 s batches reach the 16-segment cap at +0 MB, ReDimNet batch 4
+        # saves 1.4 GB peak (9.7 -> 8.3 GB) on the 24 GB cards.
+        common = {
+            "local_model_precision": "fp16",
+            "cohere_cuda_graphs": True,
+            "batch_max_segments": 16,
+            "batch_max_audio_seconds": 400.0,
+            "cuda_memory_trim_after_batch": True,
+        }
+        expected = {"32GB VRAM": 8, "24GB VRAM": 4, "24+8 VRAM": 4}
+        for name, redimnet_batch in expected.items():
+            with self.subTest(name=name):
+                self.assertEqual(
+                    presets.BUILTIN_PRESETS[name]["values"], {**common, "redimnet_max_batch_size": redimnet_batch}
+                )
+
+    def test_tiers_leave_batch_wait_and_the_model_choice_alone(self) -> None:
+        # batch_wait_time_ms below the 500 ms default is an open recommendation, not measured yet.
+        for name in TIER_NAMES:
+            with self.subTest(name=name):
+                values = presets.BUILTIN_PRESETS[name]["values"]
+                self.assertNotIn("batch_wait_time_ms", values)
+                self.assertNotIn("local_model", values)
+                self.assertNotIn("local_gpu_device", values)
+
+    def test_tier_descriptions_state_the_measured_vram(self) -> None:
+        expected = {"32GB VRAM": "9.7 GB peak", "24GB VRAM": "8.3 GB peak", "24+8 VRAM": "8.3 GB peak"}
+        for name, peak in expected.items():
+            with self.subTest(name=name):
+                description = presets.BUILTIN_PRESETS[name]["description"]
+                self.assertIn("6.3 GB idle", description)
+                self.assertIn(peak, description)
+                self.assertIn("RTX 5090", description)
+
+    def test_redimnet_max_batch_is_a_preset_key(self) -> None:
+        self.assertIn("redimnet_max_batch_size", presets.PRESET_KEYS)
+        saved = presets.save_user_preset("small", {"redimnet_max_batch_size": 3})
+        self.assertEqual(saved["values"], {"redimnet_max_batch_size": 2})
+
     def test_preset_keys_hold_no_secrets_or_paths(self) -> None:
         for key in ("huggingface_token", "dia_api_key", "dia_server_base_url", "local_model_cache_path"):
             self.assertNotIn(key, presets.PRESET_KEYS)

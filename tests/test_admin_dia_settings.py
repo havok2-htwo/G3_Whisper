@@ -157,6 +157,50 @@ class AdminDiaSettingsTests(unittest.TestCase):
         persisted = json.loads(self.settings_file.read_text(encoding="utf-8"))
         self.assertTrue(persisted["cohere_cuda_graphs"])
 
+    def _request(self):
+        return types.SimpleNamespace(app=types.SimpleNamespace(state=types.SimpleNamespace(local_gpu_lock=asyncio.Lock())))
+
+    def test_redimnet_max_batch_is_saved_normalised_and_applied_without_restart(self) -> None:
+        endpoint = self._endpoint("/api/admin/settings", "PUT")
+        self.assertEqual(admin.current_settings["redimnet_max_batch_size"], 8)
+
+        with mock.patch.object(admin, "_apply_voice_model_settings", return_value={}) as apply:
+            response = asyncio.run(
+                endpoint(admin.AdminSettingsPayload(redimnet_max_batch_size=6), self._request(), {"username": "admin"})
+            )
+            self.assertEqual(response["settings"]["redimnet_max_batch_size"], 4)
+            self.assertFalse(response["model_reloaded"])
+            apply.assert_called_once_with()
+
+            asyncio.run(endpoint(admin.AdminSettingsPayload(batch_wait_time_ms=7), self._request(), {"username": "admin"}))
+            apply.assert_called_once_with()
+
+        persisted = json.loads(self.settings_file.read_text(encoding="utf-8"))
+        self.assertEqual(persisted["redimnet_max_batch_size"], 4)
+
+    def test_gpu_device_change_also_moves_the_voice_models(self) -> None:
+        endpoint = self._endpoint("/api/admin/settings", "PUT")
+        with (
+            mock.patch.object(admin, "_load_model_for_settings", return_value=True),
+            mock.patch.object(admin, "apply_vid_settings", return_value=True) as vid_apply,
+            mock.patch.object(admin, "apply_mms_device_setting", return_value=False) as mms_apply,
+        ):
+            response = asyncio.run(
+                endpoint(admin.AdminSettingsPayload(local_gpu_device="cuda:1"), self._request(), {"username": "admin"})
+            )
+        self.assertTrue(response["model_reloaded"])
+        vid_apply.assert_called_once_with()
+        mms_apply.assert_called_once_with()
+
+    def test_voice_model_reprepare_failure_does_not_fail_the_save(self) -> None:
+        endpoint = self._endpoint("/api/admin/settings", "PUT")
+        with mock.patch.object(admin, "_apply_voice_model_settings", side_effect=RuntimeError("CUDA out of memory")):
+            response = asyncio.run(
+                endpoint(admin.AdminSettingsPayload(redimnet_max_batch_size=2), self._request(), {"username": "admin"})
+            )
+        self.assertTrue(response["ok"])
+        self.assertEqual(admin.current_settings["redimnet_max_batch_size"], 2)
+
     def test_debug_history_audio_setting_defaults_off_is_strict_and_survives_partial_updates(self) -> None:
         endpoint = self._endpoint("/api/admin/settings", "PUT")
         self.assertFalse(storage.DEFAULT_SETTINGS["debug_retain_history_audio"])

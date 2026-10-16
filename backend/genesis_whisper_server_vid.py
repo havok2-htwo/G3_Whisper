@@ -26,6 +26,7 @@ from .genesis_whisper_server_globals import (
     settings_lock,
 )
 from .genesis_whisper_server_gpu import shared_gpu_lease
+from .genesis_whisper_server_storage import normalize_redimnet_max_batch_size
 
 
 REDIMNET_MODEL_NAME = "ReDimNet2-B6"
@@ -50,11 +51,14 @@ REDIMNET_WINDOW_SAMPLES = int(REDIMNET_SAMPLE_RATE * REDIMNET_WINDOW_SECONDS)
 REDIMNET_MIN_WINDOW_SECONDS = 0.5
 REDIMNET_MIN_WINDOW_SAMPLES = int(REDIMNET_SAMPLE_RATE * REDIMNET_MIN_WINDOW_SECONDS)
 # CUDA batches are padded to the next power of two up to this maximum (buckets
-# 1/2/4/8); longer window streams run in chunks of 8.  Measured on a shared RTX
-# 4090: the reserved pool is 2.8 GiB instead of 5.6 GiB for batch 16, bulk
-# throughput drops only ~10 % (B6 is already compute-bound at 8), and a short
-# 2-5 window call no longer pays for 16 padded windows.  OOM handling below
-# still halves the prepared maximum for constrained cards.
+# 1/2/4/8); longer window streams run in chunks of the maximum.  Measured on a
+# shared RTX 4090: the reserved pool is 2.8 GiB instead of 5.6 GiB for batch 16,
+# bulk throughput drops only ~10 % (B6 is already compute-bound at 8), and a
+# short 2-5 window call no longer pays for 16 padded windows.  OOM handling
+# below still halves the prepared maximum for constrained cards.
+# The maximum is the setting ``redimnet_max_batch_size`` (1/2/4/8, default 8);
+# this constant is only the default.  RTX 5090: 746 / 1442 / 2816 MiB reserved
+# for 2 / 4 / 8, 60-min diarization 23.2 s at 4 vs 19.6 s at 8.
 REDIMNET_MAX_BATCH_SIZE = 8
 REDIMNET_MIN_CUDA_BATCH_SIZE = 2
 _ENERGY_VAD_FRAME_MS = 30
@@ -92,6 +96,9 @@ _redimnet_components: Dict[str, Any] = {
     "dtype": None,
     "cache_root": None,
     "cuda_batch_size": None,
+    # The redimnet_max_batch_size the buckets were warmed for. cuda_batch_size can
+    # be lower after an OOM backoff; only a changed setting triggers a re-warm.
+    "max_batch_size": None,
 }
 
 
@@ -172,14 +179,45 @@ def _ensure_verified_checkpoint(hub_dir: Path) -> Path:
                 pass
 
 
-def _resolve_device() -> torch.device:
+def resolve_local_device() -> torch.device:
+    """The device the local ASR engine uses for ``local_gpu_device`` (always with a CUDA index).
+
+    ReDimNet and MMS_FA follow the same setting, so on a two-GPU box every
+    Whisper model lands on the card the operator picked, not on cuda:0.
+    """
+
     with settings_lock:
         configured = str(current_settings.get("local_gpu_device", "auto")).strip().lower()
     if torch.cuda.is_available() and configured != "cpu":
         if configured.startswith("cuda"):
-            return torch.device(configured)
+            device = torch.device(configured)
+            if device.index is None:
+                device = torch.device(f"cuda:{torch.cuda.current_device()}")
+            return device
         return torch.device(f"cuda:{torch.cuda.current_device()}")
     return torch.device("cpu")
+
+
+_resolve_device = resolve_local_device
+
+
+def configured_max_batch_size() -> int:
+    """``redimnet_max_batch_size`` from the live settings (1/2/4/8)."""
+
+    with settings_lock:
+        configured = current_settings.get("redimnet_max_batch_size", REDIMNET_MAX_BATCH_SIZE)
+    return normalize_redimnet_max_batch_size(configured)
+
+
+def _release_cuda_pool() -> None:
+    """Return the unused CUDA allocator pool after a re-prepare (old bucket sizes, old card)."""
+
+    import gc
+
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
 
 
 def _model_autocast(device: torch.device, dtype: torch.dtype):
@@ -232,8 +270,9 @@ def _warm_model_shapes(
     model: Any,
     device: torch.device,
     dtype: torch.dtype,
+    maximum: int = REDIMNET_MAX_BATCH_SIZE,
 ) -> int:
-    """Warm every CUDA batch bucket used in production: 1, 2, 4 and 8.
+    """Warm every CUDA batch bucket used in production: 1, 2, 4 ... ``maximum``.
 
     ReDimNet/PyTorch incurs roughly 2.5-4 seconds of one-time kernel preparation for
     every previously unseen batch dimension on the target stack. Running arbitrary
@@ -244,12 +283,13 @@ def _warm_model_shapes(
     once and the smaller buckets reuse it.
     """
 
-    if device.type != "cuda" or REDIMNET_MAX_BATCH_SIZE == 1:
+    maximum = max(1, int(maximum))
+    if device.type != "cuda" or maximum == 1:
         _run_model_warmup(model, device, dtype, 1)
-        return REDIMNET_MAX_BATCH_SIZE
+        return maximum
 
     prepared = 1
-    candidate = REDIMNET_MAX_BATCH_SIZE
+    candidate = maximum
     while candidate >= REDIMNET_MIN_CUDA_BATCH_SIZE:
         try:
             _run_model_warmup(model, device, dtype, candidate)
@@ -313,6 +353,11 @@ def load_vid_model() -> bool:
 
     with _redimnet_lock:
         if _redimnet_components.get("model") is not None:
+            try:
+                _reprepare_for_settings()
+            except Exception as exc:
+                # The model stays usable with its previous preparation.
+                print(f"[WARNUNG-VID] ReDimNet2 konnte nicht neu vorbereitet werden: {exc}", file=sys.stderr)
             return True
 
         try:
@@ -351,8 +396,9 @@ def load_vid_model() -> bool:
                 # FP32 while using CUDA autocast runs the neural backbone in
                 # FP16 without breaking the frontend's FP32 pre-emphasis buffer.
                 dtype = torch.float16 if device.type == "cuda" else torch.float32
+                max_batch_size = configured_max_batch_size()
                 warmup_started = time.monotonic()
-                cuda_batch_size = _warm_model_shapes(model, device, dtype)
+                cuda_batch_size = _warm_model_shapes(model, device, dtype, max_batch_size)
                 warmup_duration_ms = round((time.monotonic() - warmup_started) * 1000)
 
             _redimnet_components.update(
@@ -362,6 +408,7 @@ def load_vid_model() -> bool:
                     "dtype": dtype,
                     "cache_root": str(cache_root),
                     "cuda_batch_size": cuda_batch_size,
+                    "max_batch_size": max_batch_size,
                 }
             )
             memory_note = ""
@@ -387,10 +434,66 @@ def load_vid_model() -> bool:
                     "dtype": None,
                     "cache_root": None,
                     "cuda_batch_size": None,
+                    "max_batch_size": None,
                 }
             )
             print(f"[FEHLER-VID] ReDimNet2 konnte nicht geladen werden: {exc}", file=sys.stderr)
             return False
+
+
+def _reprepare_for_settings() -> bool:
+    """Follow a changed ``redimnet_max_batch_size`` or ``local_gpu_device`` on the loaded model.
+
+    Caller holds ``_redimnet_lock``. A smaller maximum alone would still leave the
+    large bucket's pool reserved, so the pool is released and the buckets are
+    warmed again for the new maximum (a larger maximum needs the new shapes
+    warmed anyway). A device change moves the weights and releases the old card's
+    pool. Returns True when something was re-prepared.
+    """
+
+    target_device = resolve_local_device()
+    target_maximum = configured_max_batch_size()
+    current_device = _redimnet_components.get("device")
+    device_changed = current_device is None or str(current_device) != str(target_device)
+    maximum_changed = _redimnet_components.get("max_batch_size") != target_maximum
+    if not device_changed and not maximum_changed:
+        return False
+
+    model = _redimnet_components["model"]
+    dtype = torch.float16 if target_device.type == "cuda" else torch.float32
+    print(
+        f"[INFO-VID] ReDimNet2 wird neu vorbereitet: Geraet {current_device} -> {target_device}, "
+        f"max. Batch {_redimnet_components.get('max_batch_size')} -> {target_maximum}.",
+        file=sys.stderr,
+    )
+    with shared_gpu_lease():
+        if device_changed:
+            model.to(target_device)
+        _release_cuda_pool()
+        cuda_batch_size = _warm_model_shapes(model, target_device, dtype, target_maximum)
+    _redimnet_components.update(
+        {
+            "device": target_device,
+            "dtype": dtype,
+            "cuda_batch_size": cuda_batch_size,
+            "max_batch_size": target_maximum,
+        }
+    )
+    return True
+
+
+def apply_vid_settings() -> bool:
+    """Admin hook: re-prepare a loaded ReDimNet for the saved settings right away.
+
+    Runs on the GPU phase thread after a settings save, so the next request does
+    not pay the re-warm. A not yet loaded model needs nothing: its first load
+    reads the settings itself.
+    """
+
+    with _redimnet_lock:
+        if _redimnet_components.get("model") is None:
+            return False
+        return _reprepare_for_settings()
 
 
 def _fit_window(audio: np.ndarray, target_samples: int = REDIMNET_WINDOW_SAMPLES) -> np.ndarray:
@@ -590,9 +693,10 @@ def _iter_concatenated_segment_windows(
 def embed_voice_windows(
     windows: Iterable[VoiceWindow],
     *,
-    batch_size: int = REDIMNET_MAX_BATCH_SIZE,
+    batch_size: int | None = None,
 ) -> list[EmbeddedVoiceWindow]:
-    effective_batch_size = max(1, int(batch_size))
+    # None = the configured redimnet_max_batch_size; the prepared CUDA maximum caps it below.
+    effective_batch_size = max(1, int(batch_size if batch_size is not None else configured_max_batch_size()))
     window_iterator = iter(windows)
     pending = list(itertools.islice(window_iterator, effective_batch_size))
     if not pending:
@@ -727,11 +831,14 @@ __all__ = [
     "REDIMNET_SAMPLE_RATE",
     "REDIMNET_WINDOW_SAMPLES",
     "VoiceWindow",
+    "apply_vid_settings",
+    "configured_max_batch_size",
     "embed_voice_windows",
     "embedding_model_metadata",
     "generate_voice_vector",
     "iter_windows_from_audio",
     "load_vid_model",
     "redimnet_batch_buckets",
+    "resolve_local_device",
     "windows_from_audio",
 ]

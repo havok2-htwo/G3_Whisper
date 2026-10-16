@@ -27,7 +27,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from . import genesis_whisper_server_globals as whisper_globals
 from .genesis_whisper_server_globals import LOGS_DIR
-from .genesis_whisper_server_storage import DEFAULT_SETTINGS, normalize_settings
+from .genesis_whisper_server_storage import normalize_settings
 
 PRESETS_FILE = os.path.join(LOGS_DIR, "genesis_whisper_presets.json")
 PRESET_NAME_MAX_LENGTH = 64
@@ -47,6 +47,7 @@ PRESET_KEYS: Tuple[str, ...] = (
     "scheduler_first_chunk_fast_path",
     "cuda_memory_trim_after_batch",
     "cohere_cuda_graphs",
+    "redimnet_max_batch_size",
 )
 
 # Tolerance when matching a preset's card size to a detected card (a "24 GB" card reports ~23.6-24.0 GiB).
@@ -54,29 +55,49 @@ CARD_MATCH_TOLERANCE_MIB = 2048
 
 # =====================================================================================================================
 # BUILT-IN TIER VALUES
-# Placeholder: every tier currently carries the service defaults (DEFAULT_SETTINGS) for the preset keys. The real
-# per-tier values come from VRAM/throughput measurements on each target machine in a later step and replace these.
+# Measured on the RTX 5090 (2026-10-16, in-process, Cohere Transcribe fp16 + ReDimNet2-B6 + MMS_FA), see
+# README.md "GPU Tier Presets" for the per-point numbers.
+# - batch_max_audio_seconds 400: 60-min transcription 393x real time vs 283x at the default 100 (200: 336x, 800: 398x,
+#   batches then hit the 16-segment cap); ASR peak +0 MB (6.56 GB at 200 s, 6.58 GB at 400 s). The cost is latency: a
+#   live request can wait about 0.9 s behind one bulk batch instead of about 0.37 s.
+# - cohere_cuda_graphs on: about +1.0 GB idle and peak for 2.8x faster 60-min ASR and about 10x lower clip latency.
+# - fp16: bf16 measured the same VRAM and speed within 2-3 %; fp16 is the measured default.
+# - redimnet_max_batch_size: the largest single VRAM item after the ASR weights. 8 reserves 2816 MiB, 4 1442 MiB; a
+#   60-min diarization takes 19.6 s at 8 vs 23.2 s at 4. Peak 9.7 GB at 8, 8.3 GB at 4.
+# - cuda_memory_trim_after_batch on: idle drops back to about 6.3 GB 5 s after the last GPU phase.
+# batch_wait_time_ms stays out: the 500 ms default adds up to 0.5 s to every fresh live request, a lower value was not
+# measured yet (see CHANGELOG).
 # local_gpu_device is never listed here: single-card tiers leave it alone, the two-card tier gets it from card matching.
+# Whisper does not fit the 8 GB 2070S (weights 4.4 + graphs 1.0 + ReDimNet + MMS_FA + context > 9 GB, no bf16), so
+# there is no "8+24 VRAM" tier.
 # =====================================================================================================================
-_TIER_DEFAULTS: Dict[str, Any] = {key: DEFAULT_SETTINGS[key] for key in PRESET_KEYS if key != "local_gpu_device"}
+# The model, batch_wait_time_ms and the scheduler keys stay as the operator set them (measured with their defaults).
+_TIER_COMMON: Dict[str, Any] = {
+    "local_model_precision": "fp16",
+    "cohere_cuda_graphs": True,
+    "batch_max_segments": 16,
+    "batch_max_audio_seconds": 400.0,
+    "cuda_memory_trim_after_batch": True,
+}
 BUILTIN_PRESETS: Dict[str, Dict[str, Any]] = {
     "32GB VRAM": {
-        "description": "RTX 5090, all G3 services on one card (whole-card peak <= 30 GB). "
-        "Values are the current defaults until measured.",
+        "description": "RTX 5090, all G3 services on one card (whole-card peak <= 30 GB). Cohere fp16 with CUDA graphs, "
+        "400 s ASR batches, ReDimNet batch 8: about 6.3 GB idle, 9.7 GB peak for this process (measured on the RTX 5090).",
         "target_vram_gb": None,
-        "values": dict(_TIER_DEFAULTS),
+        "values": {**_TIER_COMMON, "redimnet_max_batch_size": 8},
     },
     "24GB VRAM": {
-        "description": "RTX 4090, all G3 services on one card (whole-card peak <= 23 GB). "
-        "Values are the current defaults until measured.",
+        "description": "RTX 4090, all G3 services on one card (whole-card peak <= 23 GB). Cohere fp16 with CUDA graphs, "
+        "400 s ASR batches, ReDimNet batch 4: about 6.3 GB idle, 8.3 GB peak for this process (measured on the RTX 5090).",
         "target_vram_gb": None,
-        "values": dict(_TIER_DEFAULTS),
+        "values": {**_TIER_COMMON, "redimnet_max_batch_size": 4},
     },
     "24+8 VRAM": {
         "description": "3090 + 2070S box, Whisper on the 3090 (24 GB) with OmniVoice, EMBED and RERANK; DIA runs alone "
-        "on the 2070S. Values are the current defaults until measured.",
+        "on the 2070S. Same values as 24GB VRAM (ReDimNet batch 4): about 6.3 GB idle, 8.3 GB peak for this process "
+        "(measured on the RTX 5090).",
         "target_vram_gb": 24,
-        "values": dict(_TIER_DEFAULTS),
+        "values": {**_TIER_COMMON, "redimnet_max_batch_size": 4},
     },
 }
 

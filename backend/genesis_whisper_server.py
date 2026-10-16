@@ -23,17 +23,44 @@ from .genesis_whisper_server_v2 import create_v2_api
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 FRONTEND_DIST_DIR = PROJECT_ROOT / "frontend" / "dist"
 WARMUP_SAMPLE = PROJECT_ROOT / "testaudio" / "Testaudio_02.wav"
+# Without the sample file (testaudio/ is not shipped everywhere) the warmup runs on
+# a synthetic clip: a few seconds of quiet noise plus a low tone. The transcript is
+# irrelevant; what matters is that model load, Cohere graph capture and the first
+# inference kernels happen at startup instead of in the first real request.
+WARMUP_SYNTHETIC_SECONDS = 4.0
+WARMUP_SAMPLE_RATE = 16000
+
+
+def _synthetic_warmup_audio(seconds: float = WARMUP_SYNTHETIC_SECONDS, sample_rate: int = WARMUP_SAMPLE_RATE):
+    """Deterministic low-level noise + 220 Hz tone, float32 mono in [-1, 1] at the model rate."""
+    import numpy as np
+
+    samples = max(1, int(seconds * sample_rate))
+    rng = np.random.default_rng(0)
+    timeline = np.arange(samples, dtype=np.float32) / float(sample_rate)
+    tone = 0.05 * np.sin(2.0 * np.pi * 220.0 * timeline)
+    noise = 0.005 * rng.standard_normal(samples)
+    return (tone + noise).astype(np.float32)
+
+
+def _warmup_audio():
+    """(audio, label): the repo sample when present, otherwise the synthetic clip."""
+
+    if WARMUP_SAMPLE.is_file():
+        from .genesis_whisper_server_audio import load_audio_bytes
+
+        return load_audio_bytes(WARMUP_SAMPLE.read_bytes(), WARMUP_SAMPLE.name), WARMUP_SAMPLE.name
+    return _synthetic_warmup_audio(), f"synthetischem {WARMUP_SYNTHETIC_SECONDS:.0f}-s-Clip (kein {WARMUP_SAMPLE.name})"
 
 
 def _warmup_local_asr() -> None:
-    """Eager-load the configured ASR model and run one transcription on a sample clip so
+    """Eager-load the configured ASR model and run one transcription on a warmup clip so
     the first real request is already warm (model + cuDNN/compile kernels primed), then
     release the reserved CUDA cache pool so idle VRAM stays low. Best-effort: a warmup
     failure (e.g. an unsupported precision) must never block server startup."""
     import gc
 
     try:
-        from .genesis_whisper_server_audio import load_audio_bytes
         from .genesis_whisper_server_gpu import shared_gpu_lease
         from .genesis_whisper_server_local_asr_engine import (
             get_cohere_inference_patch_stats,
@@ -45,22 +72,18 @@ def _warmup_local_asr() -> None:
         if not model_id:
             print("[WARMUP] kein lokales ASR-Modell konfiguriert -> uebersprungen.", file=sys.stderr)
             return
-        if not WARMUP_SAMPLE.is_file():
-            print(f"[WARMUP] Testaudio nicht gefunden: {WARMUP_SAMPLE} -> uebersprungen.", file=sys.stderr)
-            return
-
         device = current_settings.get("local_gpu_device")
         cache = current_settings.get("local_model_cache_path")
         precision = current_settings.get("local_model_precision", "fp16")
         language = current_settings.get("transcription_language") or "auto"
+        audio, audio_label = _warmup_audio()
 
-        print(f"[WARMUP] Lade Modell '{model_id}' (precision={precision}) und waerme mit {WARMUP_SAMPLE.name} ...", file=sys.stderr)
+        print(f"[WARMUP] Lade Modell '{model_id}' (precision={precision}) und waerme mit {audio_label} ...", file=sys.stderr)
         with shared_gpu_lease():
             if not load_local_asr_model(model_id, device, cache, precision):
                 print("[WARMUP] Modell-Load fehlgeschlagen -> Warmup uebersprungen.", file=sys.stderr)
                 return
 
-            audio = load_audio_bytes(WARMUP_SAMPLE.read_bytes(), WARMUP_SAMPLE.name)
             text = transcribe_local_asr(audio, language=language)
         print(f"[WARMUP] fertig. Beispiel-Transkript: {str(text)[:80]!r}", file=sys.stderr)
         # Die CUDA-Graphen (Decoder B=1/2/4, Encoder B=1 alle Frame-Buckets) werden bereits in
@@ -133,8 +156,9 @@ async def startup_server(app: FastAPI):
     # Eager-load + warm the ASR model on a sample clip so the first real request is fast,
     # then trim the CUDA cache. Best-effort: a warmup failure must not block startup.
     await run_blocking_gpu_phase(_warmup_local_asr)
-    # ReDimNet is warmed after the ASR-only trim. Its two prepared CUDA shapes and
-    # allocator pool intentionally stay resident; normal queue cleanup never clears it.
+    # ReDimNet is warmed after the ASR-only trim. Its prepared CUDA shapes stay
+    # warm; the allocator pool its warmup reserved (2.8 GB at batch 8) is released
+    # by the batch worker's idle trim 5 s later, like after every other GPU phase.
     await run_blocking_gpu_phase(_warmup_redimnet)
 
 

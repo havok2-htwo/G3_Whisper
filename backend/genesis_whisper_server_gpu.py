@@ -23,6 +23,39 @@ T = TypeVar("T")
 # dedicated worker preserves that state without reducing real concurrency.
 _gpu_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="g3-whisper-gpu")
 
+# Every GPU phase (ASR batch, ReDimNet slice, MMS_FA alignment, embedding,
+# warmup, model reload) bumps this counter when it starts and when it ends. The
+# batch worker's idle trim compares it, so the reserved pool is also released
+# after diarization phases and embedding requests that never touch the ASR
+# queue, and never in the middle of one. Only read and written on the event loop.
+_gpu_activity_count = 0
+_gpu_activity_listeners: List[Callable[[], None]] = []
+
+
+def gpu_activity_count() -> int:
+    return _gpu_activity_count
+
+
+def add_gpu_activity_listener(listener: Callable[[], None]) -> None:
+    if listener not in _gpu_activity_listeners:
+        _gpu_activity_listeners.append(listener)
+
+
+def remove_gpu_activity_listener(listener: Callable[[], None]) -> None:
+    if listener in _gpu_activity_listeners:
+        _gpu_activity_listeners.remove(listener)
+
+
+def note_gpu_activity() -> None:
+    global _gpu_activity_count
+    _gpu_activity_count += 1
+    for listener in list(_gpu_activity_listeners):
+        try:
+            listener()
+        except Exception:
+            # A listener is housekeeping; it must never fail a GPU phase.
+            pass
+
 
 @contextmanager
 def shared_gpu_lease() -> Iterator[None]:
@@ -50,8 +83,18 @@ async def run_blocking_gpu_phase(function: Callable[..., T], *args: Any, **kwarg
     """Run every CUDA phase on one persistent host thread.
 
     Cancellation still waits for native work to finish before the caller can
-    release its asyncio GPU lock.
+    release its asyncio GPU lock. Counts as GPU activity for the idle trim.
     """
+
+    note_gpu_activity()
+    try:
+        return await run_gpu_housekeeping(function, *args, **kwargs)
+    finally:
+        note_gpu_activity()
+
+
+async def run_gpu_housekeeping(function: Callable[..., T], *args: Any, **kwargs: Any) -> T:
+    """``run_blocking_gpu_phase`` without counting as activity (the idle trim itself)."""
 
     loop = asyncio.get_running_loop()
     task = loop.run_in_executor(_gpu_executor, partial(function, *args, **kwargs))
@@ -95,4 +138,13 @@ async def run_sliced_gpu_phase(
     return results
 
 
-__all__ = ["run_blocking_gpu_phase", "run_sliced_gpu_phase", "shared_gpu_lease"]
+__all__ = [
+    "add_gpu_activity_listener",
+    "gpu_activity_count",
+    "note_gpu_activity",
+    "remove_gpu_activity_listener",
+    "run_blocking_gpu_phase",
+    "run_gpu_housekeeping",
+    "run_sliced_gpu_phase",
+    "shared_gpu_lease",
+]

@@ -867,6 +867,7 @@ Response shape:
     "batch_max_audio_seconds": 100.0,
     "cuda_memory_trim_after_batch": true,
     "cohere_cuda_graphs": true,
+    "redimnet_max_batch_size": 8,
     "debug_retain_history_audio": false,
     "huggingface_token": "hf_xxx",
     "dia_server_base_url": "http://dia:7864",
@@ -937,6 +938,7 @@ Request body:
   "batch_max_audio_seconds": 100.0,
   "cuda_memory_trim_after_batch": true,
   "cohere_cuda_graphs": true,
+  "redimnet_max_batch_size": 8,
   "debug_retain_history_audio": false,
   "huggingface_token": "hf_xxx",
   "dia_server_base_url": "http://dia:7864",
@@ -959,8 +961,10 @@ Notes:
 - `batch_max_segments` defaults to `16` and `batch_max_audio_seconds` to `100`; together they cap one worker batch. The audio cap bounds both the VRAM a Cohere batch needs and the time a live request waits for the running bulk batch (about 1 s at 100 s of audio on an RTX 4090/5090).
 - `scheduler_long_job_min_chunks` (default `5`) marks a request with at least that many chunks as a long job; `scheduler_max_parallel_long_jobs` (default `2`, `0` = unlimited) caps how many long jobs are scheduled at once, further ones wait FIFO. Short requests never wait for a slot.
 - `scheduler_first_chunk_fast_path` (default `true`) gives a request that has not been served yet a small batch of its own instead of a seat in a full batch of a long recording; batches are always shared round-robin between active requests.
-- `cuda_memory_trim_after_batch` defaults to `true`: once the ASR queue has been idle for 5 s, Whisper releases the unused process-wide CUDA allocator pool so the idle footprint stays near the model floor on a shared GPU; the next request re-reserves its pool (about +80 ms once for a ReDimNet batch). Disable it only on a dedicated GPU.
-- `cohere_cuda_graphs` defaults to `true`: for the Cohere model on CUDA in `fp16`/`bf16`, encoder and greedy decoder run as captured CUDA graphs (2 s clip ~270 -> 30 ms, 14 s file ~0.9 -> 0.12 s on an RTX 4090, identical transcripts) for ~0.55 GB of graph memory after warmup and a hard cap of 1.5 GB. Changing it does not reload the model (`model_reloaded` stays `false`); it applies on the next model load (server restart or a change of model, device, precision or cache path). Other precisions and Whisper models ignore it.
+- `cuda_memory_trim_after_batch` defaults to `true`: once every local GPU phase (ASR batches, ReDimNet clouds, MMS_FA alignment, verification, embeddings, startup warmups, model reloads) has been quiet for 5 s, Whisper releases the unused process-wide CUDA allocator pool so the idle footprint stays near the model floor on a shared GPU; the next request re-reserves its pool (about +80 ms once for a ReDimNet batch). Disable it only on a dedicated GPU.
+- `cohere_cuda_graphs` defaults to `true`: for the Cohere model on CUDA in `fp16`/`bf16`, encoder and greedy decoder run as captured CUDA graphs (2 s clip ~270 -> 30 ms, 14 s file ~0.9 -> 0.12 s on an RTX 4090, identical transcripts) for ~0.55 GB of graph memory after warmup and a hard cap of 1.5 GB. Changing it does not reload the model (`model_reloaded` stays `false`); it applies on the next model load (server restart or a change of model, device, precision or cache path). Other precisions and Whisper models ignore it. A snapshot without `generation_config.json` no longer disables the graphs: the missing eos/pad token ids are taken from the model config or the tokenizer (logged as a warning).
+- `redimnet_max_batch_size` (default `8`, allowed `1`/`2`/`4`/`8`; other numbers snap down to the next allowed value, a non-number falls back to `8`) is the largest ReDimNet CUDA batch for speaker clouds, verification and embeddings. The reserved pool scales with it (RTX 5090: 746 / 1442 / 2816 MiB for 2 / 4 / 8; 60-min diarization 23.2 s at 4 vs 19.6 s at 8). It applies on save without a restart: a loaded ReDimNet is re-warmed for the new buckets and its old pool released (`model_reloaded` stays `false`).
+- ReDimNet and MMS_FA alignment run on the `local_gpu_device` card like the ASR model; changing the device moves them on save.
 - `debug_retain_history_audio` defaults to `false`. When enabled, successful public API requests may retain their byte-identical original upload for the 25-row admin history; disabling it blocks access immediately and purges retained audio after active readers finish.
 - updates are partial merges; omitted fields keep their saved value, so older admin clients cannot remove newer settings
 - `local_gpu_device` `cuda:N` follows nvidia-smi numbering: the server sets `CUDA_DEVICE_ORDER=PCI_BUS_ID` (unless the environment sets it) before torch initialises CUDA; device options show index, name and memory size
@@ -992,16 +996,12 @@ Response shape:
       "target_vram_gb": 24,
       "note": null,
       "values": {
-        "local_model": "CohereLabs/cohere-transcribe-03-2026",
         "local_model_precision": "fp16",
-        "batch_wait_time_ms": 500,
-        "batch_max_segments": 16,
-        "batch_max_audio_seconds": 100.0,
-        "scheduler_long_job_min_chunks": 5,
-        "scheduler_max_parallel_long_jobs": 2,
-        "scheduler_first_chunk_fast_path": true,
-        "cuda_memory_trim_after_batch": true,
         "cohere_cuda_graphs": true,
+        "batch_max_segments": 16,
+        "batch_max_audio_seconds": 400.0,
+        "cuda_memory_trim_after_batch": true,
+        "redimnet_max_batch_size": 4,
         "local_gpu_device": "cuda:0"
       }
     },
@@ -1032,7 +1032,7 @@ Request body:
 
 Notes:
 
-- only the preset keys are stored: `local_model`, `local_gpu_device`, `local_model_precision`, `batch_wait_time_ms`, `batch_max_segments`, `batch_max_audio_seconds`, `scheduler_long_job_min_chunks`, `scheduler_max_parallel_long_jobs`, `scheduler_first_chunk_fast_path`, `cuda_memory_trim_after_batch`, `cohere_cuda_graphs`. Every other key (token, DIA URL/key, model cache path, language, debug audio) is dropped; the kept values are normalised exactly like saved settings.
+- only the preset keys are stored: `local_model`, `local_gpu_device`, `local_model_precision`, `batch_wait_time_ms`, `batch_max_segments`, `batch_max_audio_seconds`, `scheduler_long_job_min_chunks`, `scheduler_max_parallel_long_jobs`, `scheduler_first_chunk_fast_path`, `cuda_memory_trim_after_batch`, `cohere_cuda_graphs`, `redimnet_max_batch_size`. Every other key (token, DIA URL/key, model cache path, language, debug audio) is dropped; the kept values are normalised exactly like saved settings.
 - names are trimmed, inner whitespace collapsed, at most 64 characters
 - `400` for an empty or too long name, a built-in tier name, or values without any preset key
 - presets are stored in `logs/genesis_whisper_presets.json` next to the settings file (atomic write)
