@@ -212,7 +212,7 @@ def load_settings_seed() -> Dict[str, Any]:
     try:
         with open(SETTINGS_SEED_FILE, "r", encoding="utf-8") as file_obj:
             data = json.load(file_obj)
-    except (json.JSONDecodeError, IOError) as exc:
+    except (ValueError, OSError) as exc:  # ValueError covers JSONDecodeError and UnicodeDecodeError
         print(f"[FEHLER] Konnte Seed-Einstellungen nicht laden: {exc}", file=sys.stderr)
         return {}
     if not isinstance(data, dict):

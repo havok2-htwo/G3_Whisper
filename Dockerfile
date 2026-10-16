@@ -69,8 +69,9 @@ COPY backend/ ./backend/
 COPY testaudio/ ./testaudio/
 COPY --from=frontend /build/frontend/dist ./frontend/dist
 
-# Entrypoint seeds a Linux-correct settings file on first boot (the built-in default
-# cache path is the Windows literal ".\\models").
+# Entrypoint seeds the Linux cache path /app/models into the first-start seed file
+# (the built-in default is the Windows literal ".\\models"); the server applies the
+# "24GB VRAM" tier plus that seed on first boot and writes the settings file itself.
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 

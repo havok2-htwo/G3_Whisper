@@ -244,6 +244,14 @@ class FirstStartPresetTests(_PresetTestCase):
         self.assertTrue(applied)
         self.assertEqual(settings["redimnet_max_batch_size"], 4)
 
+    def test_undecodable_seed_file_still_applies_the_tier(self) -> None:
+        with open(storage.SETTINGS_SEED_FILE, "wb") as file_obj:
+            file_obj.write(b"\xff\xfe\x00garbage")
+        settings, applied = presets.load_settings_or_first_start_preset()
+        self.assertTrue(applied)
+        self.assertEqual(settings["redimnet_max_batch_size"], 4)
+        self.assertEqual(settings["local_model_cache_path"], storage.DEFAULT_SETTINGS["local_model_cache_path"])
+
     def test_saved_settings_are_kept_on_later_starts(self) -> None:
         storage.save_settings({**storage.DEFAULT_SETTINGS, "batch_max_audio_seconds": 100.0, "redimnet_max_batch_size": 8})
         with open(storage.SETTINGS_SEED_FILE, "w", encoding="utf-8") as file_obj:
