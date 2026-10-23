@@ -103,6 +103,20 @@ BUILTIN_PRESETS: Dict[str, Dict[str, Any]] = {
         "target_vram_gb": 24,
         "values": {**_TIER_COMMON, "redimnet_max_batch_size": 4},
     },
+    "Parakeet 8GB VRAM": {
+        "description": "Single 8 GB card (RTX 5070 Laptop), Parakeet TDT 0.6B v3 (ONNX). 100 s batches of at most 4 clips "
+        "(the measured fast range; 16-clip batches were 7x realtime vs 108x at 4), ReDimNet batch 2. Measured for the "
+        "Parakeet process alone: about 3.3 GB idle, 5.2 GB after batches, flat over repeated batches; ReDimNet and MMS_FA "
+        "on the same card are not measured yet.",
+        "target_vram_gb": None,
+        "values": {
+            **_TIER_COMMON,
+            "local_model": whisper_globals.PARAKEET_MODEL_ID,
+            "batch_max_segments": 4,
+            "batch_max_audio_seconds": 100.0,
+            "redimnet_max_batch_size": 2,
+        },
+    },
 }
 
 _lock = threading.RLock()

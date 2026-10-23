@@ -5,10 +5,11 @@
 ## Purpose
 
 `G3_WHISPER` is a local transcription server based on FastAPI + React/Vite.
-It provides a simple upload API for audio and video files, features a protected admin dashboard, and currently supports two local ASR paths:
+It provides a simple upload API for audio and video files, features a protected admin dashboard, and currently supports three local ASR paths:
 
 - Whisper models via Hugging Face `transformers`
 - `CohereLabs/cohere-transcribe-03-2026` (default on first start)
+- `istupakov/parakeet-tdt-0.6b-v3-onnx` (NVIDIA Parakeet TDT 0.6B v3 as ONNX, run through `onnx-asr`; see "Parakeet (ONNX)" below)
 
 Cohere Transcribe is a gated model: accept its license at [https://huggingface.co/CohereLabs/cohere-transcribe-03-2026](https://huggingface.co/CohereLabs/cohere-transcribe-03-2026) with the Hugging Face account whose token you configure, otherwise the download fails.
 
@@ -113,7 +114,7 @@ Core backend files:
   - protected admin endpoints
   - settings, stats, queue, benchmark
 - [backend/genesis_whisper_server_local_asr_engine.py](x:/dev/G3_WHISPER/backend/genesis_whisper_server_local_asr_engine.py)
-  - local loading and inference for Whisper and Cohere
+  - local loading and inference for Whisper, Cohere and Parakeet (ONNX via onnx-asr)
 - [backend/genesis_whisper_server_batching.py](x:/dev/G3_WHISPER/backend/genesis_whisper_server_batching.py)
   - queuing and batch processing for Whisper
 - [backend/genesis_whisper_server_chunking.py](x:/dev/G3_WHISPER/backend/genesis_whisper_server_chunking.py)
@@ -223,7 +224,7 @@ Behavior:
 - If `voice_ident=false`, the request is allowed to enter the Whisper batch worker.
 - If `voice_ident=true`, the request is intentionally processed serially under a GPU lock.
 - If the active model is a Whisper model, audio is split into speech segments prior to batch inference.
-- If the active model is Cohere, the local ASR path currently processes the audio as a single item.
+- If the active model is Cohere or Parakeet, the request is cut into superchunks (Silero regions merged to about 25 s) and queued like any other job, so live requests can run between the chunks of a long file.
 - For gated Cohere loads, the runtime path now completes an incomplete Hugging Face snapshot first and only then loads the model from the finished local snapshot.
 - Only the native `POST /transcribe/` route can return a `voice_vector`.
 - The legacy response keys remain unchanged, but `voice_vector` now contains exactly 192 ReDimNet2 values instead of the former 512 values.
@@ -412,6 +413,7 @@ The current ASR model list is maintained centrally in [backend/genesis_whisper_s
 Currently available:
 
 - `CohereLabs/cohere-transcribe-03-2026`
+- `istupakov/parakeet-tdt-0.6b-v3-onnx` (Parakeet TDT 0.6B v3, ONNX; label "Parakeet TDT 0.6B v3 (ONNX)")
 - `openai/whisper-large-v3-turbo`
 - `openai/whisper-large-v3`
 - `openai/whisper-medium`
@@ -429,6 +431,35 @@ Note:
 - No OpenAI Cloud API is used anymore.
 - The `engine` value `openai` is no longer supported.
 - There is no public embedding-model selection and no `embedding_space_id` request field.
+
+### Parakeet (ONNX)
+
+`istupakov/parakeet-tdt-0.6b-v3-onnx` is NVIDIA's multilingual Parakeet TDT 0.6B v3 exported to ONNX. It runs through
+[onnx-asr](https://github.com/istupakov/onnx-asr) on onnxruntime, not through PyTorch; the Hugging Face snapshot is kept in the
+configured model cache, like the other models.
+
+- Requirement: `onnx-asr[gpu]` (in `requirements.txt`). On Windows the CUDA 13 / cuDNN 9 runtime DLLs come from pip's
+  `nvidia-*` wheels (`nvidia-cublas`, `nvidia-cudnn-cu13`, `nvidia-cuda-runtime`); the server adds their folders to the DLL
+  search path itself. On Linux the libraries must be provided by the system or the container image.
+- Language: the model detects the language itself. The configured language and `auto` are not used.
+- Precision: the ONNX weights run as exported. The precision setting does not apply to this backend.
+- Batching: Parakeet uses the same fair scheduler and the same processing key as the other backends. One scheduler batch
+  becomes one `recognize()` call with a list of waveforms, which is a real batched encoder/decoder run.
+- Session option `arena_extend_strategy=kSameAsRequested` is set on the CUDA provider. Without it, a single large batch
+  leaves onnxruntime's GPU memory arena grown, and later batches of other shapes ran about 20x slower (measured: four
+  batches of four clips, 48 s without the option, 2.9 s with it).
+
+Measured on the RTX 5070 Laptop GPU (8 GB), 302 s of audio from the four files in `testaudio/`, after warm-up:
+
+| Scheme | Time | Realtime factor |
+| --- | --- | --- |
+| one clip per call | 5.3 s | about 57x |
+| batches of 4 clips | 2.8 s | about 108x |
+| batches of 16 clips | 43.6 s | about 7x |
+
+Batches of 16 long clips are slower than batches of 4 on this card, and the batch-16 runs were the heaviest GPU load in the
+measurements. The default `batch_max_audio_seconds` (100 s) keeps scheduler batches in the fast range, so leave it at the
+default for this backend. Only the 100 s bound is verified; larger values are untested.
 
 ## Optimizations
 
@@ -804,6 +835,7 @@ counter: 9672 vs 9671 MiB).
 | `32GB VRAM` | fp16, `cohere_cuda_graphs` on, `batch_max_segments` 16, `batch_max_audio_seconds` 400, trim on, `redimnet_max_batch_size` 8 | ~6.3 GB | 9.7 GB |
 | `24GB VRAM` | same, `redimnet_max_batch_size` 4 | ~6.3 GB | ~8.3 GB |
 | `24+8 VRAM` | same as `24GB VRAM`; `local_gpu_device` = the 24 GB card | ~6.3 GB | ~8.3 GB |
+| `Parakeet 8GB VRAM` | `local_model` Parakeet TDT 0.6B v3 (ONNX), `batch_max_segments` 4, `batch_max_audio_seconds` 100, `redimnet_max_batch_size` 2, trim on; no device pinning | ~3.3 GB (Parakeet alone) | ~5.2 GB (Parakeet alone; ReDimNet and MMS_FA on the same card not measured) |
 
 Why these values:
 

@@ -11,6 +11,7 @@ from huggingface_hub import snapshot_download
 
 from .genesis_whisper_server_globals import (
     LOCAL_ASR_MODEL_SPECS,
+    PARAKEET_MODEL_ID,
     current_settings,
     resolve_local_model_cache_path,
     settings_lock,
@@ -173,6 +174,16 @@ def _supported_model_specs() -> dict[str, dict[str, Any]]:
     specs["CohereLabs/cohere-transcribe-03-2026"]["required_any_groups"] = (
         ("model.safetensors", "model.safetensors.index.json", "pytorch_model.bin", "pytorch_model.bin.index.json"),
     )
+    # ONNX export: encoder/decoder graphs plus external weights and the mel preprocessor, no tokenizer json.
+    specs[PARAKEET_MODEL_ID]["required_files"] = (
+        "config.json",
+        "vocab.txt",
+        "encoder-model.onnx",
+        "encoder-model.onnx.data",
+        "decoder_joint-model.onnx",
+        "nemo128.onnx",
+    )
+    specs[PARAKEET_MODEL_ID]["required_any_groups"] = ()
     return specs
 
 

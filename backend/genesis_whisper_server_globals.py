@@ -25,6 +25,9 @@ COHERE_FALLBACK_LANGUAGE = "de"
 COHERE_MODEL_ID = "CohereLabs/cohere-transcribe-03-2026"
 # Gated repo: the license must be accepted here with the account whose token is configured.
 COHERE_MODEL_URL = f"https://huggingface.co/{COHERE_MODEL_ID}"
+# ONNX export of NVIDIA's Parakeet TDT 0.6B v3, run through onnx-asr (no PyTorch weights involved).
+PARAKEET_MODEL_ID = "istupakov/parakeet-tdt-0.6b-v3-onnx"
+PARAKEET_ONNX_MODEL_NAME = "nemo-parakeet-tdt-0.6b-v3"
 
 LOCAL_ASR_MODEL_SPECS: Dict[str, Dict[str, Any]] = {
     "Cohere Transcribe 03/2026": {
@@ -32,6 +35,12 @@ LOCAL_ASR_MODEL_SPECS: Dict[str, Dict[str, Any]] = {
         "backend": "cohere_transcribe",
         "default_language": COHERE_FALLBACK_LANGUAGE,
         "approx_size_gb": None,
+    },
+    "Parakeet TDT 0.6B v3 (ONNX)": {
+        "value": PARAKEET_MODEL_ID,
+        "backend": "parakeet",
+        "default_language": "auto",
+        "approx_size_gb": 2.5,
     },
     "Whisper Large v3 Turbo": {
         "value": "openai/whisper-large-v3-turbo",
@@ -119,6 +128,19 @@ def uses_whisper_backend(model_id: str) -> bool:
 
 def uses_cohere_backend(model_id: str) -> bool:
     return get_local_model_backend(model_id) == "cohere_transcribe"
+
+
+def uses_parakeet_backend(model_id: str) -> bool:
+    return get_local_model_backend(model_id) == "parakeet"
+
+
+def uses_whole_audio_backend(model_id: str) -> bool:
+    """Backends that take a whole recording per request (no 30 s Whisper windows).
+
+    Their long recordings are cut into scheduler-visible superchunks, so live requests can run
+    between the chunks of a bulk file.
+    """
+    return uses_cohere_backend(model_id) or uses_parakeet_backend(model_id)
 
 
 def get_effective_transcription_language(model_id: str, configured_language: str) -> str:

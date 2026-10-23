@@ -17,3 +17,4 @@ accelerate>=1.13,<2.0
 bitsandbytes>=0.49,<1.0
 sentencepiece>=0.2,<1.0
 protobuf>=5.0,<6.0
+onnx-asr[gpu]>=0.12,<1.0

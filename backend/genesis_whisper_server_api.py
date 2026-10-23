@@ -15,7 +15,7 @@ from .genesis_whisper_server_globals import (
     current_settings,
     get_effective_transcription_language,
     settings_lock,
-    uses_cohere_backend,
+    uses_whole_audio_backend,
 )
 from .genesis_whisper_server_history import append_history_entry, capture_history_audio
 from .genesis_whisper_server_local_asr_engine import (
@@ -114,7 +114,7 @@ def create_api(app: FastAPI) -> FastAPI:
         batch_manager = request.app.state.whisper_batch_manager
         request_id = uuid.uuid4().hex
         batch_start = time.monotonic()
-        if uses_cohere_backend(model_id):
+        if uses_whole_audio_backend(model_id):
             # Cohere accepts whole recordings, but a long one must still reach the
             # scheduler as chunks so live requests can run between them.
             segmented_audio = await asyncio.to_thread(split_audio_into_superchunks, audio_data)

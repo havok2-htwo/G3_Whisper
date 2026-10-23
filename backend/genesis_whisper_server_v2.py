@@ -29,7 +29,7 @@ from .genesis_whisper_server_globals import (
     current_settings,
     get_effective_transcription_language,
     settings_lock,
-    uses_cohere_backend,
+    uses_whole_audio_backend,
 )
 from .genesis_whisper_server_history import append_history_entry, capture_history_audio
 from .genesis_whisper_server_gpu import run_blocking_gpu_phase, run_sliced_gpu_phase
@@ -459,7 +459,7 @@ async def _transcribe_audio(
     batch_manager = request.app.state.whisper_batch_manager
     request_token = uuid.uuid4().hex
     started = time.monotonic()
-    if uses_cohere_backend(model_id):
+    if uses_whole_audio_backend(model_id):
         # Cohere accepts whole recordings, but a long one must still reach the
         # scheduler as chunks so live requests can run between them.
         segments = await asyncio.to_thread(split_audio_into_superchunks, audio)

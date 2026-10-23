@@ -234,6 +234,9 @@ function describeBenchmarkWorkflow(workflow: BenchmarkWorkflow) {
   if (workflow === "cohere_audio_batch") {
     return "Cohere Whole-Audio Batch";
   }
+  if (workflow === "parakeet_audio_batch") {
+    return "Parakeet Whole-Audio Batch";
+  }
   if (workflow === "whisper_chunk_queue") {
     return "Whisper Chunk-Queue";
   }
@@ -2730,7 +2733,7 @@ export default function App() {
                       <strong>{model.label}</strong>
                       <div className="muted mono model-id">{model.id}</div>
                     </td>
-                    <td>{model.backend === "cohere_transcribe" ? "Cohere" : "Whisper"}</td>
+                    <td>{model.backend === "cohere_transcribe" ? "Cohere" : model.backend === "parakeet" ? "Parakeet (ONNX)" : "Whisper"}</td>
                     <td>{formatModelSize(model)}</td>
                     <td className="model-status-cell">
                       <strong>{formatModelStatus(model.status)}</strong>

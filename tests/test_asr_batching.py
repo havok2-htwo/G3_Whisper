@@ -578,7 +578,7 @@ class SharedSchedulerAsyncPathTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             mock.patch.object(v2, "_processing_key", return_value=processing_key),
-            mock.patch.object(v2, "uses_cohere_backend", return_value=False),
+            mock.patch.object(v2, "uses_whole_audio_backend", return_value=False),
             mock.patch.object(v2, "split_audio_for_whisper", return_value=segments),
         ):
             text, _, segment_count, model_id = await v2._transcribe_audio(request, audio)
@@ -638,7 +638,7 @@ class SharedSchedulerAsyncPathTests(unittest.IsolatedAsyncioTestCase):
                 return_value={"peak_vram_reserved_mb": None, "peak_vram_allocated_mb": None},
             ),
             mock.patch.object(admin, "get_audio_duration_seconds", return_value=2.0),
-            mock.patch.object(admin, "uses_cohere_backend", return_value=False),
+            mock.patch.object(admin, "uses_whole_audio_backend", return_value=False),
             mock.patch.object(admin, "split_audio_for_whisper", return_value=segments),
             mock.patch.object(admin, "repetition_filter_enabled", return_value=False),
         ):

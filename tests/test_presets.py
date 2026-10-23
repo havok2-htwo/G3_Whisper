@@ -16,6 +16,20 @@ from backend import genesis_whisper_server_presets as presets
 from backend import genesis_whisper_server_storage as storage
 
 TIER_NAMES = ["32GB VRAM", "24GB VRAM", "24+8 VRAM"]
+PARAKEET_TIER = "Parakeet 8GB VRAM"
+ALL_BUILTIN_NAMES = TIER_NAMES + [PARAKEET_TIER]
+
+
+class ParakeetTierTests(unittest.TestCase):
+    def test_parakeet_tier_is_single_card_and_bounded_for_the_scheduler(self) -> None:
+        values = presets.BUILTIN_PRESETS[PARAKEET_TIER]["values"]
+        self.assertEqual(values["local_model"], "istupakov/parakeet-tdt-0.6b-v3-onnx")
+        self.assertIsNone(presets.BUILTIN_PRESETS[PARAKEET_TIER]["target_vram_gb"])
+        self.assertNotIn("local_gpu_device", values)
+        self.assertLessEqual(values["batch_max_segments"], 4)
+        self.assertEqual(values["batch_max_audio_seconds"], 100.0)
+        self.assertEqual(values["redimnet_max_batch_size"], 2)
+        self.assertIn("local_model", presets.PRESET_KEYS)
 
 
 class _PresetTestCase(unittest.TestCase):
@@ -201,12 +215,12 @@ class UserPresetTests(_PresetTestCase):
     def test_corrupt_presets_file_lists_only_builtins(self) -> None:
         with open(self.presets_file, "w", encoding="utf-8") as file_obj:
             file_obj.write("{not json")
-        self.assertEqual([preset["name"] for preset in presets.resolve_presets()], TIER_NAMES)
+        self.assertEqual([preset["name"] for preset in presets.resolve_presets()], ALL_BUILTIN_NAMES)
 
     def test_file_entry_under_a_builtin_name_is_ignored(self) -> None:
         with open(self.presets_file, "w", encoding="utf-8") as file_obj:
             file_obj.write('{"24GB VRAM": {"values": {"batch_max_segments": 2}}}')
-        self.assertEqual([preset["name"] for preset in presets.resolve_presets()], TIER_NAMES)
+        self.assertEqual([preset["name"] for preset in presets.resolve_presets()], ALL_BUILTIN_NAMES)
         self.assertEqual(self.tier("24GB VRAM")["values"], presets.BUILTIN_PRESETS["24GB VRAM"]["values"])
 
 
@@ -279,7 +293,7 @@ class AdminPresetRouteTests(_PresetTestCase):
     def test_admin_preset_routes(self) -> None:
         self.cards(32607)
         listed = self.client.get("/api/admin/settings/presets").json()["presets"]
-        self.assertEqual([preset["name"] for preset in listed], TIER_NAMES)
+        self.assertEqual([preset["name"] for preset in listed], ALL_BUILTIN_NAMES)
 
         response = self.client.put(
             "/api/admin/settings/presets/lab",

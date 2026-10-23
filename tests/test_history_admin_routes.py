@@ -401,7 +401,7 @@ class AdminHistoryRouteTests(unittest.TestCase):
                 with (
                     mock.patch.object(legacy_api, "authorize_api_key", return_value=None),
                     mock.patch.object(legacy_api, "load_audio_file", return_value=decoded),
-                    mock.patch.object(legacy_api, "uses_cohere_backend", return_value=True),
+                    mock.patch.object(legacy_api, "uses_whole_audio_backend", return_value=True),
                     mock.patch.object(legacy_api, "log_transcription"),
                     TestClient(self.app) as client,
                 ):

@@ -1,4 +1,5 @@
 import gc
+import glob
 import importlib.util
 import os
 import shutil
@@ -25,6 +26,7 @@ from .genesis_whisper_server_cohere_cuda_graphs import (
 )
 from .genesis_whisper_server_globals import (
     COHERE_MODEL_URL,
+    PARAKEET_ONNX_MODEL_NAME,
     current_settings,
     get_effective_transcription_language,
     get_local_model_backend,
@@ -33,9 +35,11 @@ from .genesis_whisper_server_globals import (
     resolve_local_model_cache_path,
     settings_lock,
     uses_cohere_backend,
+    uses_parakeet_backend,
 )
 
 COHERE_MAX_INFERENCE_BATCH_SIZE = 16
+PARAKEET_SAMPLE_RATE = 16000
 LAST_LOCAL_ASR_LOAD_ERROR: Optional[str] = None
 # Installierter Cohere-Inferenz-Patch des geladenen Modells: CohereCudaGraphs (Graphen +
 # cuDNN-freier eager Encoder) oder CohereCudnnFreeEncoder (nur eager). None = kein Patch.
@@ -715,6 +719,16 @@ def load_local_asr_model(model_id: str, device_selection: str, cache_path: str, 
 
             if resolved_cache_path:
                 os.makedirs(resolved_cache_path, exist_ok=True)
+            if uses_parakeet_backend(model_id):
+                # ONNX weights run in onnxruntime: precision and bitsandbytes settings do not apply.
+                model = _load_parakeet_model(model_id, use_gpu, resolved_cache_path, huggingface_token)
+                _store_local_model_components(model, None, target_identifier, model_backend)
+                LAST_LOCAL_ASR_LOAD_ERROR = None
+                print(
+                    f"[INFO] Modell '{model_id}' erfolgreich geladen (onnx-asr, {'CUDA' if use_gpu else 'CPU'}).",
+                    file=sys.stderr,
+                )
+                return True
             if uses_cohere_backend(model_id):
                 pretrained_source, pretrained_args = _resolve_cohere_pretrained_source(
                     model_id,
@@ -789,6 +803,69 @@ def load_local_asr_model(model_id: str, device_selection: str, cache_path: str, 
             _uninstall_cohere_inference_patch()
             _store_local_model_components(None, None, None, None)
             return False
+
+
+def _register_parakeet_cuda_libraries() -> None:
+    """Expose the CUDA/cuDNN DLLs of pip's ``nvidia-*`` wheels to onnxruntime on Windows.
+
+    onnxruntime-gpu loads its CUDA libraries by bare name, which on Windows only resolves when
+    their folder is on PATH. On Linux the libraries come from the system or the container image.
+    """
+    if os.name != "nt":
+        return
+    spec = importlib.util.find_spec("nvidia")
+    if spec is None or not spec.submodule_search_locations:
+        return
+    for nvidia_root in spec.submodule_search_locations:
+        for bin_dir in glob.glob(os.path.join(nvidia_root, "*", "bin", "x86_64")) + glob.glob(
+            os.path.join(nvidia_root, "*", "bin")
+        ):
+            os.add_dll_directory(bin_dir)
+            os.environ["PATH"] = bin_dir + os.pathsep + os.environ.get("PATH", "")
+
+
+def _load_parakeet_model(model_id: str, use_gpu: bool, cache_path: str, huggingface_token: Optional[str]):
+    """Load the Parakeet ONNX export through onnx-asr from the snapshot in the configured cache."""
+    # Imported lazily: only installations that select Parakeet need onnx-asr and onnxruntime-gpu.
+    import onnx_asr
+
+    if use_gpu:
+        _register_parakeet_cuda_libraries()
+    try:
+        snapshot_path = snapshot_download(
+            repo_id=model_id,
+            cache_dir=cache_path or None,
+            token=huggingface_token,
+            local_files_only=True,
+        )
+    except Exception:
+        snapshot_path = snapshot_download(repo_id=model_id, cache_dir=cache_path or None, token=huggingface_token)
+
+    # kSameAsRequested: without it, one large batch grows onnxruntime's GPU memory arena so that later
+    # batches of other lengths run ~20x slower (measured: 48 s vs 2.9 s for the same 4 x 4 batches).
+    providers = (
+        [("CUDAExecutionProvider", {"arena_extend_strategy": "kSameAsRequested"}), "CPUExecutionProvider"]
+        if use_gpu
+        else ["CPUExecutionProvider"]
+    )
+    return onnx_asr.load_model(PARAKEET_ONNX_MODEL_NAME, path=snapshot_path, providers=providers)
+
+
+def _transcribe_parakeet_batch(model, audio_batch: List[np.ndarray]) -> List[str]:
+    """One batched encoder/decoder run over the scheduler batch.
+
+    Parakeet detects the language itself, so the configured language is not used here.
+    Empty chunks have nothing to decode; they keep their slot so results line up with the input.
+    """
+    waveforms = [np.asarray(audio_data, dtype=np.float32).reshape(-1) for audio_data in audio_batch]
+    texts = [""] * len(waveforms)
+    decodable = [index for index, waveform in enumerate(waveforms) if waveform.size > 0]
+    if not decodable:
+        return texts
+    results = model.recognize([waveforms[index] for index in decodable], sample_rate=PARAKEET_SAMPLE_RATE)
+    for index, text in zip(decodable, results):
+        texts[index] = str(text).strip()
+    return texts
 
 
 def _build_whisper_input_features(processor, audio_batch: List[np.ndarray], model_device, model_dtype):
@@ -938,7 +1015,9 @@ def transcribe_local_asr(audio_data_np: np.ndarray, language: str) -> str:
 
 def transcribe_local_asr_batch(audio_batch: List[np.ndarray], language: str, batch_size: int) -> List[str]:
     components = local_model_components
-    if components.get("model") is None or components.get("processor") is None:
+    model_backend = components.get("model_backend")
+    # Parakeet (onnx-asr) has no separate processor object.
+    if components.get("model") is None or (model_backend != "parakeet" and components.get("processor") is None):
         raise RuntimeError("Lokales ASR-Modell wurde vor der Nutzung nicht geladen.")
 
     if not audio_batch:
@@ -946,8 +1025,9 @@ def transcribe_local_asr_batch(audio_batch: List[np.ndarray], language: str, bat
 
     processor = components["processor"]
     model = components["model"]
-    model_backend = components.get("model_backend")
 
+    if model_backend == "parakeet":
+        return _transcribe_parakeet_batch(model, audio_batch)
     if model_backend == "cohere_transcribe":
         return _transcribe_cohere_batch(processor, model, audio_batch, language=language, batch_size=batch_size)
     return _transcribe_whisper_batch(processor, model, audio_batch, language=language)

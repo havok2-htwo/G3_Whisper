@@ -37,6 +37,8 @@ from .genesis_whisper_server_globals import (
     settings_lock,
     transcription_history,
     uses_cohere_backend,
+    uses_parakeet_backend,
+    uses_whole_audio_backend,
 )
 from .genesis_whisper_server_history import (
     HistoryAudioLease,
@@ -214,6 +216,9 @@ def _get_loaded_model_cuda_index() -> int | None:
     model = local_model_components.get("model")
     if model is None:
         return None
+    if not isinstance(model, torch.nn.Module):
+        # onnx-asr sessions (Parakeet) keep their memory in onnxruntime, not in torch parameters.
+        return int(torch.cuda.current_device()) if torch.cuda.is_available() else None
     try:
         device = next(model.parameters()).device
     except StopIteration:
@@ -248,6 +253,14 @@ def _read_peak_vram_metrics(cuda_index: int | None) -> Dict[str, float | None]:
     }
 
 
+def _benchmark_workflow(model_id: str) -> str:
+    if uses_parakeet_backend(model_id):
+        return "parakeet_audio_batch"
+    if uses_cohere_backend(model_id):
+        return "cohere_audio_batch"
+    return "whisper_chunk_queue"
+
+
 async def _run_admin_benchmark(request: Request, audio_data, repeat_count: int) -> Dict[str, Any]:
     processing_key = _get_local_processing_key()
     model_id, _, _, configured_language, _ = processing_key
@@ -267,7 +280,7 @@ async def _run_admin_benchmark(request: Request, audio_data, repeat_count: int) 
     batch_started_at = time.perf_counter()
 
     audio_seconds = round(get_audio_duration_seconds(audio_data), 3)
-    if uses_cohere_backend(model_id):
+    if uses_whole_audio_backend(model_id):
         segments_per_run = [audio_data]
     else:
         segments_per_run = await asyncio.to_thread(split_audio_for_whisper, audio_data)
@@ -281,7 +294,7 @@ async def _run_admin_benchmark(request: Request, audio_data, repeat_count: int) 
         peak_metrics = _read_peak_vram_metrics(cuda_index)
         return {
             "ok": True,
-            "workflow": "whisper_chunk_queue" if not uses_cohere_backend(model_id) else "cohere_audio_batch",
+            "workflow": _benchmark_workflow(model_id),
             "model_id": model_id,
             "transcription_language": effective_language,
             "repeat_count": repeat_count,
@@ -343,7 +356,7 @@ async def _run_admin_benchmark(request: Request, audio_data, repeat_count: int) 
 
     return {
         "ok": True,
-        "workflow": "whisper_chunk_queue" if not uses_cohere_backend(model_id) else "cohere_audio_batch",
+        "workflow": _benchmark_workflow(model_id),
         "model_id": model_id,
         "transcription_language": effective_language,
         "repeat_count": repeat_count,
