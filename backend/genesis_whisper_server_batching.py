@@ -45,6 +45,18 @@ DEFAULT_MAX_PARALLEL_LONG_JOBS = 2
 class BatchTranscriptionResult:
     text: str
     batch_id: str
+    # Not always the model of the key a caller submitted, see fail_over_model.
+    model_id: Optional[str] = None
+
+
+class ModelFailoverError(RuntimeError):
+    """A job cannot move to the model that replaced a failed selection. The caller may send the request again."""
+
+
+def served_model_id(results: Sequence[Any], requested_model_id: str) -> str:
+    """The model that really produced ``results``, for what a response or the history reports."""
+
+    return (getattr(results[0], "model_id", None) if results else None) or requested_model_id
 
 
 class TranscriptionJob:
@@ -165,6 +177,8 @@ class WhisperBatchManager:
         # None = an ASR batch ran (also when a test replaces the GPU phase).
         self._settled_gpu_activity: Optional[int] = gpu_activity_count()
         self._idle_waiting = False
+        # Model id of a failed selection -> retarget(key, segments) until that model works again, see fail_over_model.
+        self._failovers: Dict[str, Callable[[Any, Sequence[np.ndarray]], Any]] = {}
 
     # ------------------------------------------------------------------ lifecycle
 
@@ -232,7 +246,7 @@ class WhisperBatchManager:
         limits = self._get_limits()
         job = TranscriptionJob(
             request_id=request_id,
-            processing_key=processing_key,
+            processing_key=self._failed_over_key(processing_key, segments),
             segments=segments,
             is_long=len(segments) >= limits["long_job_min_chunks"],
             loop=asyncio.get_running_loop(),
@@ -316,6 +330,45 @@ class WhisperBatchManager:
                 ),
                 "first_chunk_fast_path": current_settings.get("scheduler_first_chunk_fast_path", True) is not False,
             }
+
+    # ------------------------------------------------------------------ failover
+
+    def _failed_over_key(self, processing_key: Any, segments: Sequence[np.ndarray]) -> Any:
+        retarget = self._failovers.get(processing_key[0]) if processing_key else None
+        return retarget(processing_key, segments) if retarget else processing_key
+
+    def fail_over_model(self, model_id: str, retarget: Callable[[Any, Sequence[np.ndarray]], Any]) -> None:
+        """Keep work of a model that failed to load away from that model.
+
+        A job still carrying its key would repeat the failing load, answer with
+        an error and evict the restored model on the way. ``retarget(key,
+        segments)`` returns the key to use now, or raises ModelFailoverError for
+        a job that cannot move, which then ends with that error.
+
+        Call it on the event loop before the next await after the failed load:
+        the worker may already wait for the GPU lock with a reserved batch of
+        these jobs, and it reads the key only once it owns the lock. The
+        retarget stays registered because a request that read the key during the
+        selection may still be preparing its chunks; submit_job applies it too.
+        clear_failover ends that, jobs of any other model are never touched.
+        """
+
+        self._failovers[model_id] = retarget
+        for job in list(self._jobs.values()):
+            if not job.processing_key or job.processing_key[0] != model_id:
+                continue
+            try:
+                job.processing_key = retarget(job.processing_key, job.segments)
+            except ModelFailoverError as exc:
+                # Set first: a reserved batch re-checks this before it reaches the model.
+                job.cancel_requested = True
+                self._finish_job(job, error=exc, status="error")
+        self._wake.set()
+
+    def clear_failover(self, model_id: str) -> None:
+        """The model works again: jobs of its key are good, also after the next switch away from it."""
+
+        self._failovers.pop(model_id, None)
 
     # ------------------------------------------------------------------ job bookkeeping
 
@@ -619,7 +672,12 @@ class WhisperBatchManager:
             job = item.job
             if job.cancel_requested:
                 continue
-            job.results[item.segment_index] = BatchTranscriptionResult(text=text, batch_id=batch_id)
+            processing_key = job.processing_key
+            job.results[item.segment_index] = BatchTranscriptionResult(
+                text=text,
+                batch_id=batch_id,
+                model_id=processing_key[0] if processing_key else None,
+            )
             job.inflight.discard(item.segment_index)
             if job not in touched:
                 touched.append(job)
@@ -677,6 +735,10 @@ class WhisperBatchManager:
             if len(results) != len(batch_items):
                 raise RuntimeError(f"Batch-Transkription lieferte {len(results)} Ergebnisse für {len(batch_items)} Segmente.")
 
+            # Not every load goes through the admin routes: a batch loads its model too when a PUT left it unloaded.
+            processing_key = batch_items[0].job.processing_key
+            if processing_key:
+                self.clear_failover(processing_key[0])
             self._apply_batch_results(batch_items, results, batch_id)
 
             duration_ms = round((time.monotonic() - batch_started_at) * 1000)

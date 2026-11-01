@@ -1156,6 +1156,10 @@ button:disabled {
   margin-bottom: 16px;
 }
 
+.content-grid > .panel {
+  min-width: 0;
+}
+
 .section-heading {
   display: flex;
   align-items: start;

@@ -11,6 +11,7 @@ import threading
 import unittest
 from unittest import mock
 
+import numpy as np
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -20,6 +21,7 @@ from backend import genesis_whisper_server_api as api
 from backend import genesis_whisper_server_presets as presets
 from backend import genesis_whisper_server_storage as storage
 from backend import genesis_whisper_server_v2 as v2
+from backend.genesis_whisper_server_batching import ModelFailoverError, WhisperBatchManager
 from backend.genesis_whisper_server_globals import COHERE_MODEL_ID, LOCAL_ASR_MODEL_MAP, PARAKEET_MODEL_ID
 
 WHISPER_TURBO = "openai/whisper-large-v3-turbo"
@@ -152,6 +154,7 @@ class _AdminCase(unittest.TestCase):
 
         self.app = admin.create_admin_api(FastAPI())
         self.app.state.local_gpu_lock = asyncio.Lock()
+        self.app.state.whisper_batch_manager = WhisperBatchManager(mock.Mock(), self.app.state.local_gpu_lock)
         self.app.dependency_overrides[admin.require_admin] = lambda: {"username": "admin"}
         self.client = TestClient(self.app, raise_server_exceptions=True)
 
@@ -314,13 +317,36 @@ class SelectModelTests(_AdminCase):
         self.assertEqual(self.loaded, [])
         self.assertFalse(os.path.exists(self.settings_file))
 
-    def test_the_same_model_reports_when_it_is_not_loaded(self) -> None:
+    def test_the_active_model_loads_when_it_is_not_loaded(self) -> None:
         admin.local_model_components.update({"model": None, "model_identifier": None})
         self.load_error = "OSError: disk"
-        body = self.select(COHERE_MODEL_ID).json()
-        self.assertTrue(body["ok"])
-        self.assertFalse(body["model_loaded"])
-        self.assertEqual(body["load_error"], "OSError: disk")
+        response = self.select(COHERE_MODEL_ID)
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertTrue(body["ok"] and body["model_reloaded"] and body["model_loaded"])
+        self.assertIsNone(body["load_error"])
+        self.assertEqual(self.loaded, [COHERE_MODEL_ID])
+        self.assertEqual(admin.local_model_components["model_identifier"][0], COHERE_MODEL_ID)
+        self.assertFalse(os.path.exists(self.settings_file))
+
+    def test_a_retry_that_fails_reports_the_real_error_and_keeps_the_selection(self) -> None:
+        admin.local_model_components.update({"model": None, "model_identifier": None})
+        before = admin.current_settings.copy()
+        self.failing.add(COHERE_MODEL_ID)
+        response = self.select(COHERE_MODEL_ID)
+        self.assertEqual(response.status_code, 500)
+        self.assertIn(f"OSError: cannot load {COHERE_MODEL_ID}", response.json()["detail"])
+        self.assertEqual(self.loaded, [COHERE_MODEL_ID])
+        self.assertEqual(admin.current_settings, before)
+        self.assertFalse(os.path.exists(self.settings_file))
+
+        self.failing.clear()
+        self.assertTrue(self.select(COHERE_MODEL_ID).json()["model_loaded"])
+
+    def test_a_retry_of_a_model_that_is_gone_is_409_and_never_loaded(self) -> None:
+        admin.local_model_components.update({"model": None, "model_identifier": None})
+        self.statuses = status_rows(ready=())
+        self.assertEqual(self.select(COHERE_MODEL_ID).status_code, 409)
         self.assertEqual(self.loaded, [])
 
     def test_success_returns_the_put_shape(self) -> None:
@@ -574,6 +600,415 @@ class SelectModelTests(_AdminCase):
         self.app.dependency_overrides.clear()
         self.assertIn(self.select(WHISPER_TURBO).status_code, (401, 403))
         self.assertEqual(self.loaded, [])
+
+    def test_delete_is_refused_while_a_selection_runs(self) -> None:
+        delete_endpoint = next(
+            route.endpoint
+            for route in self.app.routes
+            if getattr(route, "path", None) == "/api/admin/models/delete"
+        )
+
+        async def scenario(task, release) -> None:
+            with mock.patch.object(admin, "delete_model_cache") as delete_cache:
+                for model_id in (WHISPER_TURBO, PARAKEET_MODEL_ID):
+                    with self.assertRaises(admin.HTTPException) as deleted:
+                        await delete_endpoint(admin.AdminModelActionPayload(model_id=model_id), {})
+                    self.assertEqual(deleted.exception.status_code, 409)
+            delete_cache.assert_not_called()
+            release.set()
+            await task
+
+        self._during_load(scenario)
+
+
+class FailedSelectionQueueTests(_AdminCase):
+    """Jobs accepted while a selection fails: a real scheduler on one loop with the select route."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.failing.add(WHISPER_TURBO)
+        self.use_settings(batch_wait_time_ms=0, transcription_language="fr", batch_max_segments=7)
+        self.served = []
+
+    def process(self, audio_batch, processing_key) -> list:
+        self.served.append(processing_key)
+        if not self.fake_load({"local_model": processing_key[0]}):
+            raise RuntimeError(self.load_error)
+        return ["text"] * len(audio_batch)
+
+    def run_failing_selection(self, scenario, target=WHISPER_TURBO, seconds=1.0) -> None:
+        """scenario(manager, audio, key) runs during the load of target, the function it returns after the 500."""
+        started = threading.Event()
+        release = threading.Event()
+        self.failing.add(target)
+
+        def blocking_load(settings):
+            started.set()
+            self.assertTrue(release.wait(timeout=5.0))
+            return self.fake_load(settings)
+
+        admin._load_model_for_settings.side_effect = blocking_load
+        endpoint = next(
+            route.endpoint
+            for route in self.app.routes
+            if getattr(route, "path", None) == "/api/admin/models/select"
+        )
+
+        async def run() -> None:
+            self.app.state.local_gpu_lock = asyncio.Lock()
+            manager = WhisperBatchManager(self.process, self.app.state.local_gpu_lock)
+            self.app.state.whisper_batch_manager = manager
+            await manager.start()
+            try:
+                request = mock.Mock(app=self.app)
+                select = asyncio.create_task(endpoint(admin.AdminModelSelectPayload(model_id=target), request, {}))
+                self.assertTrue(await asyncio.to_thread(started.wait, 2.0))
+                audio = [np.zeros(int(16000 * seconds), dtype=np.float32)]
+                after_failure = await scenario(manager, audio, admin._get_local_processing_key())
+                release.set()
+                with self.assertRaises(admin.HTTPException) as failed:
+                    await select
+                self.assertEqual(failed.exception.status_code, 500)
+                await after_failure()
+            finally:
+                release.set()
+                await manager.stop()
+
+        asyncio.run(run())
+
+    def test_a_queued_job_runs_on_the_restored_model_and_never_repeats_the_failed_load(self) -> None:
+        async def scenario(manager, audio, key):
+            self.assertEqual(key[0], WHISPER_TURBO)
+            job = asyncio.create_task(manager.submit_job(audio, "queued", key))
+            # The worker reserves the batch and waits behind the load for the GPU lock.
+            await asyncio.sleep(0.05)
+            self.assertEqual(len(manager._jobs), 1)
+            self.assertEqual(next(iter(manager._jobs.values())).batch_count, 1)
+
+            async def after_failure() -> None:
+                results = await job
+                self.assertEqual([result.text for result in results], ["text"])
+                self.assertEqual(results[0].model_id, COHERE_MODEL_ID)
+
+            return after_failure
+
+        self.run_failing_selection(scenario)
+        self.assertEqual(self.loaded, [WHISPER_TURBO, COHERE_MODEL_ID, COHERE_MODEL_ID])
+        self.assertEqual(self.served, [(COHERE_MODEL_ID, "auto", "cache", "fr", "fp16")])
+        self.assertEqual(admin.local_model_components["model_identifier"][0], COHERE_MODEL_ID)
+
+    def test_a_job_that_prepared_its_chunks_past_the_rollback_moves_too(self) -> None:
+        async def scenario(manager, audio, key):
+            async def after_failure() -> None:
+                await manager.submit_job(audio, "late", key)
+
+            return after_failure
+
+        self.run_failing_selection(scenario)
+        self.assertEqual([key[0] for key in self.served], [COHERE_MODEL_ID])
+
+    def test_a_cancelled_failing_selection_moves_the_jobs_too(self) -> None:
+        started = threading.Event()
+        release = threading.Event()
+
+        def blocking_load(settings):
+            started.set()
+            self.assertTrue(release.wait(timeout=5.0))
+            return self.fake_load(settings)
+
+        admin._load_model_for_settings.side_effect = blocking_load
+        endpoint = next(
+            route.endpoint
+            for route in self.app.routes
+            if getattr(route, "path", None) == "/api/admin/models/select"
+        )
+
+        async def run() -> None:
+            self.app.state.local_gpu_lock = asyncio.Lock()
+            manager = WhisperBatchManager(self.process, self.app.state.local_gpu_lock)
+            self.app.state.whisper_batch_manager = manager
+            await manager.start()
+            try:
+                request = mock.Mock(app=self.app)
+                select = asyncio.create_task(endpoint(admin.AdminModelSelectPayload(model_id=WHISPER_TURBO), request, {}))
+                self.assertTrue(await asyncio.to_thread(started.wait, 2.0))
+                job = asyncio.create_task(
+                    manager.submit_job([np.zeros(16000, dtype=np.float32)], "queued", admin._get_local_processing_key())
+                )
+                await asyncio.sleep(0)
+                select.cancel()
+                await asyncio.sleep(0.02)
+                release.set()
+                with self.assertRaises(asyncio.CancelledError):
+                    await select
+                await job
+            finally:
+                release.set()
+                await manager.stop()
+
+        asyncio.run(run())
+        self.assertEqual(admin.current_settings["local_model"], COHERE_MODEL_ID)
+        self.assertEqual([key[0] for key in self.served], [COHERE_MODEL_ID])
+
+    def test_a_per_request_language_survives_and_the_targets_language_does_not(self) -> None:
+        self.use_settings(
+            batch_wait_time_ms=0,
+            transcription_language="fr",
+            model_profiles={WHISPER_TURBO: {"transcription_language": "it"}},
+        )
+
+        async def scenario(manager, audio, key):
+            self.assertEqual(key[3], "it")
+            default = asyncio.create_task(manager.submit_job(audio, "default", key))
+            override = asyncio.create_task(manager.submit_job(audio, "override", (*key[:3], "en", key[4])))
+
+            async def after_failure() -> None:
+                await asyncio.gather(default, override)
+
+            return after_failure
+
+        self.run_failing_selection(scenario)
+        self.assertEqual({key[3] for key in self.served}, {"fr", "en"})
+
+    def test_a_chunk_whisper_would_cut_fails_retryably_instead_of_losing_its_tail(self) -> None:
+        self.use_settings(local_model=WHISPER_TURBO, batch_wait_time_ms=0)
+        self.mark_loaded(WHISPER_TURBO)
+        self.failing.discard(WHISPER_TURBO)
+
+        async def scenario(manager, audio, key):
+            self.assertEqual(key[0], COHERE_MODEL_ID)
+            queued = asyncio.create_task(manager.submit_job(audio, "queued", key))
+            await asyncio.sleep(0.05)
+
+            async def after_failure() -> None:
+                with self.assertRaises(ModelFailoverError):
+                    await queued
+                with self.assertRaises(ModelFailoverError):
+                    await manager.submit_job(audio, "late", key)
+
+            return after_failure
+
+        self.run_failing_selection(scenario, target=COHERE_MODEL_ID, seconds=31.0)
+        self.assertEqual(self.served, [])
+        self.assertEqual(self.loaded, [COHERE_MODEL_ID, WHISPER_TURBO])
+
+    def test_a_chunk_inside_the_whisper_window_moves_to_whisper(self) -> None:
+        self.use_settings(local_model=WHISPER_TURBO, batch_wait_time_ms=0)
+        self.mark_loaded(WHISPER_TURBO)
+        self.failing.discard(WHISPER_TURBO)
+
+        async def scenario(manager, audio, key):
+            job = asyncio.create_task(manager.submit_job(audio, "queued", key))
+
+            async def after_failure() -> None:
+                await job
+
+            return after_failure
+
+        self.run_failing_selection(scenario, target=COHERE_MODEL_ID, seconds=30.0)
+        self.assertEqual([key[0] for key in self.served], [WHISPER_TURBO])
+
+    def test_jobs_of_other_models_keep_their_key(self) -> None:
+        other_key = (PARAKEET_MODEL_ID, "auto", "cache", "de", "fp16")
+
+        async def scenario(manager, audio, key):
+            job = asyncio.create_task(manager.submit_job(audio, "other", other_key))
+
+            async def after_failure() -> None:
+                await job
+
+            return after_failure
+
+        self.run_failing_selection(scenario)
+        self.assertEqual(self.served, [other_key])
+
+    def test_the_failed_model_works_again_once_it_is_selected(self) -> None:
+        async def scenario(manager, audio, key):
+            async def after_failure() -> None:
+                self.failing.clear()
+                admin._load_model_for_settings.side_effect = self.fake_load
+                self.use_settings(batch_wait_time_ms=0, local_model=WHISPER_TURBO)
+                await manager.submit_job(audio, "next", admin._get_local_processing_key())
+
+            return after_failure
+
+        self.run_failing_selection(scenario)
+        self.assertEqual([key[0] for key in self.served], [WHISPER_TURBO])
+
+    def whisper_active(self, **values) -> None:
+        self.failing.clear()
+        self.use_settings(local_model=WHISPER_TURBO, batch_wait_time_ms=0, **values)
+        self.mark_loaded(WHISPER_TURBO)
+
+    def run_on_scheduler(self, scenario, process=None) -> None:
+        """scenario(manager, select) with a real scheduler, select(model_id) awaits the real route."""
+        endpoint = next(
+            route.endpoint
+            for route in self.app.routes
+            if getattr(route, "path", None) == "/api/admin/models/select"
+        )
+
+        async def run() -> None:
+            self.app.state.local_gpu_lock = asyncio.Lock()
+            manager = WhisperBatchManager(process or self.process, self.app.state.local_gpu_lock)
+            self.app.state.whisper_batch_manager = manager
+            await manager.start()
+            request = mock.Mock(app=self.app)
+
+            async def select(model_id):
+                return await endpoint(admin.AdminModelSelectPayload(model_id=model_id), request, {})
+
+            try:
+                await scenario(manager, select)
+            finally:
+                await manager.stop()
+
+        asyncio.run(run())
+
+    async def fail_then_select(self, select, model_id) -> None:
+        self.failing.add(model_id)
+        with self.assertRaises(admin.HTTPException) as failed:
+            await select(model_id)
+        self.assertEqual(failed.exception.status_code, 500)
+        self.failing.clear()
+        await select(model_id)
+
+    def test_a_model_that_loaded_again_keeps_late_jobs_after_the_next_switch(self) -> None:
+        self.whisper_active()
+
+        async def scenario(manager, select) -> None:
+            await self.fail_then_select(select, COHERE_MODEL_ID)
+            # This request read the Cohere key and still prepares a chunk Whisper would cut.
+            key = admin._get_local_processing_key()
+            await select(WHISPER_TURBO)
+            results = await manager.submit_job([np.zeros(16000 * 31, dtype=np.float32)], "late", key)
+            self.assertEqual(results[0].model_id, COHERE_MODEL_ID)
+
+        self.run_on_scheduler(scenario)
+        self.assertEqual([key[0] for key in self.served], [COHERE_MODEL_ID])
+
+    def test_a_failed_selection_leaves_a_queue_of_another_model_alone(self) -> None:
+        profile = {"batch_max_segments": 1, "batch_wait_time_ms": 0}
+        self.whisper_active(
+            batch_max_segments=1,
+            model_profiles={model: profile for model in (COHERE_MODEL_ID, PARAKEET_MODEL_ID, WHISPER_TURBO)},
+        )
+        gates = [threading.Event(), threading.Event()]
+
+        def process(audio_batch, processing_key) -> list:
+            number = len(self.served)
+            results = self.process(audio_batch, processing_key)
+            if number < len(gates):
+                self.assertTrue(gates[number].wait(timeout=5.0))
+            return results
+
+        async def wait_for_served(count) -> None:
+            while len(self.served) < count:
+                await asyncio.sleep(0.01)
+
+        async def scenario(manager, select) -> None:
+            await self.fail_then_select(select, COHERE_MODEL_ID)
+            chunks = [np.zeros(16000, dtype=np.float32) for _ in range(4)]
+            job = asyncio.create_task(manager.submit_job(chunks, "old-queue", admin._get_local_processing_key()))
+            await wait_for_served(1)
+            switch = asyncio.create_task(select(WHISPER_TURBO))
+            await asyncio.sleep(0.05)
+            gates[0].set()
+            await switch
+            await wait_for_served(2)
+
+            self.failing.add(PARAKEET_MODEL_ID)
+            failing = asyncio.create_task(select(PARAKEET_MODEL_ID))
+            await asyncio.sleep(0.05)
+            gates[1].set()
+            with self.assertRaises(admin.HTTPException):
+                await failing
+            results = await job
+            self.assertEqual([result.model_id for result in results], [COHERE_MODEL_ID] * 4)
+
+        try:
+            self.run_on_scheduler(scenario, process)
+        finally:
+            for gate in gates:
+                gate.set()
+        self.assertEqual([key[0] for key in self.served], [COHERE_MODEL_ID] * 4)
+
+    def test_a_failover_only_runs_the_retarget_of_the_model_that_failed(self) -> None:
+        async def scenario(manager, select) -> None:
+            still_selected = True
+
+            def older_retarget(key, segments):
+                return key if still_selected else ("moved", *key[1:])
+
+            def unrelated_retarget(key, segments):
+                self.fail(f"retarget of another model ran for {key}")
+
+            key = admin._get_local_processing_key()
+            manager.fail_over_model(key[0], older_retarget)
+            async with self.app.state.local_gpu_lock:
+                job = asyncio.create_task(manager.submit_job([np.zeros(16000, dtype=np.float32)], "queued", key))
+                await asyncio.sleep(0.01)
+                still_selected = False
+                manager.fail_over_model("another/model", unrelated_retarget)
+                self.assertEqual([queued.processing_key for queued in manager._jobs.values()], [key])
+            await job
+
+        self.whisper_active()
+        self.run_on_scheduler(scenario)
+        self.assertEqual([key[0] for key in self.served], [WHISPER_TURBO])
+
+    def test_a_retarget_goes_when_the_model_loads_again(self) -> None:
+        manager = self.app.state.whisper_batch_manager
+
+        self.assertEqual(self.select(WHISPER_TURBO).status_code, 500)
+        self.assertIn(WHISPER_TURBO, manager._failovers)
+        self.failing.clear()
+        self.assertEqual(self.select(WHISPER_TURBO).status_code, 200)
+        self.assertEqual(manager._failovers, {})
+
+        self.assertEqual(self.select(COHERE_MODEL_ID).status_code, 200)
+        self.failing.add(WHISPER_TURBO)
+        self.assertEqual(self.select(WHISPER_TURBO).status_code, 500)
+        self.assertIn(WHISPER_TURBO, manager._failovers)
+        self.failing.clear()
+        self.assertEqual(self.client.put("/api/admin/settings", json={"local_model": WHISPER_TURBO}).status_code, 200)
+        self.assertEqual(manager._failovers, {})
+
+    def test_a_save_whose_load_failed_keeps_the_retarget(self) -> None:
+        manager = self.app.state.whisper_batch_manager
+
+        self.assertEqual(self.select(WHISPER_TURBO).status_code, 500)
+        body = self.client.put("/api/admin/settings", json={"local_model": WHISPER_TURBO}).json()
+        self.assertIs(body["model_loaded"], False)
+        self.assertIn(WHISPER_TURBO, manager._failovers)
+
+    def test_a_retry_of_the_active_model_clears_its_retarget(self) -> None:
+        manager = self.app.state.whisper_batch_manager
+
+        self.assertEqual(self.select(WHISPER_TURBO).status_code, 500)
+        self.client.put("/api/admin/settings", json={"local_model": WHISPER_TURBO})
+        self.failing.clear()
+        self.assertEqual(self.select(WHISPER_TURBO).status_code, 200)
+        self.assertEqual(manager._failovers, {})
+
+    def test_a_batch_on_the_failed_model_clears_its_retarget(self) -> None:
+        self.whisper_active()
+
+        async def scenario(manager, audio, key):
+            async def after_failure() -> None:
+                # A PUT left this model selected unloaded, the worker's own load brought it back.
+                self.failing.clear()
+                admin._load_model_for_settings.side_effect = self.fake_load
+                self.use_settings(batch_wait_time_ms=0, local_model=COHERE_MODEL_ID)
+                await manager.submit_job(audio, "lazy", key)
+                self.use_settings(batch_wait_time_ms=0, local_model=WHISPER_TURBO)
+                results = await manager.submit_job(audio, "late", key)
+                self.assertEqual(results[0].model_id, COHERE_MODEL_ID)
+
+            return after_failure
+
+        self.run_failing_selection(scenario, target=COHERE_MODEL_ID, seconds=31.0)
+        self.assertEqual([key[0] for key in self.served], [COHERE_MODEL_ID, COHERE_MODEL_ID])
 
 
 class StaleFormTests(_AdminCase):

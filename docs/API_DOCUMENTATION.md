@@ -1060,7 +1060,6 @@ Purpose:
 - lists the named settings presets: the built-in GPU tiers first, in tier order, then the saved presets by name
 - built-in tiers (identical names across the G3 services): `32GB VRAM` (RTX 5090, every G3 service on one card), `24GB VRAM` (RTX 4090, every G3 service on one card) and `24+8 VRAM` (3090 + 2070S box, Whisper on the 24 GB card). Whisper has no `8+24 VRAM` tier; on the two-GPU box only DIA runs on the 8 GB card.
 - a tier with a `target_vram_gb` gets `local_gpu_device` set to the CUDA card whose total memory matches within 2 GiB (machines number their cards differently); if no card matches, `local_gpu_device` is left out and `note` explains why. Single-card tiers never set the GPU.
-- the built-in tier values are currently the service defaults; measured per-tier values replace them in a later step
 - `model_id` is derived for each item and never part of `values`: `32GB VRAM`, `24GB VRAM` and `24+8 VRAM` belong to Cohere, `Parakeet 8GB VRAM` to Parakeet, a saved preset to its `values.local_model`. `null` means usable for every model.
 
 Query params:
@@ -1233,14 +1232,17 @@ Behavior:
 - the language must not change for clients: a target without a profile takes the old model's effective language, so Cohere with `auto` hands `de` to the next model
 - device, cache path, token, DIA settings and the debug audio switch do not move
 - the settings are saved first, then the model loads under the GPU lock and ReDimNet and MMS_FA are re-prepared when needed, the same path as `PUT /api/admin/settings`
-- the same model is a no-op with `ok: true`, `model_reloaded: false` and the real `model_loaded`
+- the same model while it is loaded is a no-op with `ok: true` and `model_reloaded: false`
+- the same model while it is not loaded loads it: this is the retry after a failed load. No setting changes and `model_reloaded` is `true`; a load that fails again is a `500` and the selection stays.
+- requests that were accepted during a selection that failed run on the restored model instead of repeating the failing load. A request that named its own language keeps it, unless it equals the failed model's language. `models.asr.id` and the history name the restored model. Only one case cannot move: a chunk longer than 30 s made for Cohere or Parakeet when Whisper is restored, because Whisper would cut it. That request gets a retryable `503` (`/v2/audio/process`: `MODEL_UNAVAILABLE`).
+- after a successful selection requests already queued under the old model finish on the old model, also long ones. Their batches take turns with new requests, and each turn reloads the other model, so both are slower until the old queue is empty. The results are correct, and `loaded` can show `false` for the selected model in that time.
 
 Status codes:
 
 - `200`: the shape of `PUT /api/admin/settings` with `model_loaded: true`
 - `400`: unknown model id
 - `409`: the model is not downloaded (`status` is not `ready`), so a selection never blocks the GPU lock on a download; or another selection is running
-- `500`: the load failed. Selection and values are restored, the old model is reloaded and `detail` carries the real error text.
+- `500`: the load failed. On a switch selection and values are restored, the old model is reloaded and `detail` carries the real error text. On a retry of the active model only `detail` differs.
 
 ### `POST /api/admin/models/download`
 
@@ -1293,7 +1295,7 @@ Response fields:
 Status codes:
 
 - `400`: unsupported model id, or the model is still downloading
-- `409`: the model is the active one, select another model first
+- `409`: the model is the active one, select another model first; or a model selection is running
 
 ### `GET /api/admin/stats`
 

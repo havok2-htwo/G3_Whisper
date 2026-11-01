@@ -44,6 +44,7 @@ import {
   testDiaConnection,
   whoami,
 } from "./api";
+import { KeepEdits, mergeServerSettings } from "./settingsForm";
 
 type BatchEntry = {
   batch_id?: string;
@@ -523,18 +524,6 @@ async function copyTextToClipboard(value: string) {
   document.body.removeChild(textArea);
 }
 
-// Puts what the admin typed on top of fresh server values. A field counts as typed when it differs from what the
-// server sent last, so everything else follows the server. onlyFields limits which typed values survive.
-function keepUnsavedEdits(form: AdminSettings, baseline: AdminSettings, next: AdminSettings, onlyFields?: string[]) {
-  const merged: Record<string, unknown> = { ...next };
-  for (const key of Object.keys(form) as Array<keyof AdminSettings>) {
-    if (form[key] !== baseline[key] && (!onlyFields || onlyFields.includes(key))) {
-      merged[key] = form[key];
-    }
-  }
-  return merged as AdminSettings;
-}
-
 type ModelPickerProps = {
   models: ManagedModel[];
   locked: boolean;
@@ -660,6 +649,7 @@ export default function App() {
   const [dashboardHistory, setDashboardHistory] = useState<DashboardHistoryPoint[]>([]);
   const [saveBusy, setSaveBusy] = useState(false);
   const [saveMessage, setSaveMessage] = useState("");
+  const [saveFailed, setSaveFailed] = useState(false);
   const [presets, setPresets] = useState<SettingsPreset[]>([]);
   const [presetName, setPresetName] = useState("");
   const [presetBusy, setPresetBusy] = useState(false);
@@ -720,6 +710,7 @@ export default function App() {
       setApiKeys([]);
       setCreatedKey(null);
       setSaveMessage("");
+      setSaveFailed(false);
       setDiaActionBusy(null);
       setDiaActionMessage("");
       setDiaActionSucceeded(null);
@@ -767,7 +758,7 @@ export default function App() {
     return false;
   }
 
-  async function loadDashboard(keepEdits?: "all") {
+  async function loadDashboard(keepEdits?: KeepEdits) {
     try {
       const [settingsResponse, statsResponse, queueResponse, keysResponse] = await Promise.all([
         getSettings(),
@@ -775,8 +766,16 @@ export default function App() {
         getQueue(),
         listApiKeys(),
       ]);
+      const modelChanged = keepEdits && settingsResponse.settings.local_model !== settingsBaseline.current.local_model;
       startTransition(() => {
         applySettings(settingsResponse, keepEdits);
+        if (modelChanged) {
+          setSaveMessage(
+            `${describeSelectedModel(settingsResponse)} was selected in another session. The form now shows its `
+              + "settings, only service-wide edits were kept.",
+          );
+          setSaveFailed(false);
+        }
         setStats(statsResponse);
         setQueue(queueResponse);
         setApiKeys(keysResponse.keys);
@@ -873,15 +872,16 @@ export default function App() {
     }
   }
 
-  function applySettings(payload: SettingsResponse, keepEdits?: "all" | "service") {
+  function describeSelectedModel(payload: SettingsResponse) {
+    const selected = payload.options.models.find((option) => option.value === payload.settings.local_model);
+    return selected?.label ?? payload.settings.local_model;
+  }
+
+  function applySettings(payload: SettingsResponse, keepEdits?: KeepEdits) {
     const next = { ...emptySettings, ...payload.settings, dia_api_key: "" };
     const baseline = settingsBaseline.current;
     settingsBaseline.current = next;
-    setSettingsForm((current) =>
-      keepEdits
-        ? keepUnsavedEdits(current, baseline, next, keepEdits === "service" ? payload.service_fields : undefined)
-        : next,
-    );
+    setSettingsForm((current) => mergeServerSettings(current, baseline, next, keepEdits, payload.service_fields));
     setSettingsOptions(payload.options);
     setManagedModels(payload.models ?? []);
     setLoadedModelIdentifier(payload.loaded_model_identifier);
@@ -1146,12 +1146,14 @@ export default function App() {
     event.preventDefault();
     setSaveBusy(true);
     setSaveMessage("");
+    setSaveFailed(false);
 
     try {
       const response = await saveSettings(settingsForm);
       startTransition(() => {
         applySettings(response);
         setSaveMessage(describeSaveResult(response));
+        setSaveFailed(response.model_reloaded && !response.model_loaded);
       });
       await refreshOperationalData();
     } catch (error) {
@@ -1163,6 +1165,7 @@ export default function App() {
         return;
       }
       setSaveMessage(error instanceof Error ? error.message : "Saving settings failed.");
+      setSaveFailed(true);
     } finally {
       setSaveBusy(false);
     }
@@ -1171,20 +1174,21 @@ export default function App() {
   async function reloadFormForActiveModel() {
     try {
       const response = await getSettings();
-      const activeModel = response.options.models.find((option) => option.value === response.settings.local_model);
       startTransition(() => {
         // The model settings in the form belong to the old model, service-wide edits are not tied to a model.
         applySettings(response, "service");
         setSaveMessage(
-          `Nothing was saved: ${activeModel?.label ?? response.settings.local_model} was selected in another session. `
+          `Nothing was saved: ${describeSelectedModel(response)} was selected in another session. `
             + "The form now shows its settings, review them and save again.",
         );
+        setSaveFailed(true);
       });
     } catch (error) {
       if (handleApiError(error, "The settings could not be reloaded.")) {
         return;
       }
       setSaveMessage(error instanceof Error ? error.message : "The settings could not be reloaded.");
+      setSaveFailed(true);
     }
   }
 
@@ -1310,7 +1314,8 @@ export default function App() {
   }
 
   async function handleSelectModel(model: ManagedModel) {
-    const hasUnsavedModelEdits = (Object.keys(settingsForm) as Array<keyof AdminSettings>).some(
+    // Retrying the active model changes no setting, so the form keeps every edit.
+    const hasUnsavedModelEdits = !model.active && (Object.keys(settingsForm) as Array<keyof AdminSettings>).some(
       (key) => settingsForm[key] !== settingsBaseline.current[key] && !serviceFields.includes(key),
     );
     if (
@@ -1329,14 +1334,9 @@ export default function App() {
       const response = await selectModel(model.id);
       startTransition(() => {
         // The target's own values replace the model settings, service-wide edits are not tied to a model.
-        applySettings(response, "service");
-        // Selecting the active model again is a no-op on the server, so "not loaded" here means nothing was retried.
-        setModelSelectFailed(!response.model_loaded);
-        setModelSelectMessage(
-          response.model_loaded
-            ? `${model.label} is loaded.`
-            : `${model.label} is selected but not loaded. ${response.load_error ?? "It loads with the next request."}`,
-        );
+        applySettings(response, model.active ? "all" : "service");
+        // A load that failed comes back as an error, including a retry of the active model.
+        setModelSelectMessage(`${model.label} is loaded.`);
       });
       await refreshOperationalData();
     } catch (error) {
@@ -2833,7 +2833,7 @@ export default function App() {
                 <button type="submit" disabled={saveBusy}>
                   {saveBusy ? "Saving..." : "Save Settings"}
                 </button>
-                {saveMessage && <p className="message">{saveMessage}</p>}
+                {saveMessage && <p className={`message ${saveFailed ? "error" : ""}`.trim()}>{saveMessage}</p>}
               </div>
             </form>
           </fieldset>

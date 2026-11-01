@@ -7,6 +7,8 @@ import numpy as np
 
 
 TARGET_SAMPLE_RATE = 16000
+# The Whisper processor drops whatever a chunk holds beyond this window.
+WHISPER_MAX_CHUNK_SECONDS = 30.0
 
 
 def extract_speech_audio(
@@ -36,7 +38,7 @@ def extract_speech_audio(
 def split_audio_for_whisper(
     audio_data_np: np.ndarray,
     sample_rate: int = TARGET_SAMPLE_RATE,
-    max_chunk_seconds: float = 30.0,
+    max_chunk_seconds: float = WHISPER_MAX_CHUNK_SECONDS,
     padding_ms: int = 180,
     overlap_ms: int = 250,
 ) -> List[np.ndarray]:

@@ -532,6 +532,56 @@ class SharedSchedulerPathTests(unittest.TestCase):
         batch_manager.submit_job.assert_awaited_once()
         self.assertIs(batch_manager.submit_job.await_args.args[0], segments)
 
+    def _legacy_transcribe_with(self, batch_manager) -> tuple:
+        audio = np.full(16000, 0.1, dtype=np.float32)
+        settings = {
+            "local_model": "openai/whisper-tiny",
+            "local_gpu_device": "cpu",
+            "local_model_cache_path": "",
+            "transcription_language": "de",
+            "local_model_precision": "fp32",
+        }
+        with (
+            mock.patch.dict(legacy_api.current_settings, settings, clear=True),
+            mock.patch.object(legacy_api, "authorize_api_key", return_value=None),
+            mock.patch.object(legacy_api, "load_audio_file", return_value=audio),
+            mock.patch.object(legacy_api, "log_transcription"),
+            mock.patch.object(legacy_api, "append_history_entry") as history,
+        ):
+            with TestClient(self._legacy_app(batch_manager)) as client:
+                response = client.post(
+                    "/transcribe/",
+                    files={"file": ("short.wav", b"fixture", "audio/wav")},
+                    data={"engine": "local"},
+                )
+        return response, history
+
+    def test_legacy_transcribe_answers_503_when_a_job_cannot_fail_over(self) -> None:
+        failure = batching.ModelFailoverError("Send the request again.")
+        batch_manager = SimpleNamespace(submit_job=mock.AsyncMock(side_effect=failure))
+        response, _ = self._legacy_transcribe_with(batch_manager)
+        self.assertEqual(response.status_code, 503, response.text)
+        self.assertEqual(response.json()["detail"], "Send the request again.")
+
+    def test_legacy_history_names_the_model_that_really_transcribed(self) -> None:
+        results = [batching.BatchTranscriptionResult(text="Hallo", batch_id="batch", model_id="restored/model")]
+        batch_manager = SimpleNamespace(submit_job=mock.AsyncMock(return_value=results))
+        response, history = self._legacy_transcribe_with(batch_manager)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(history.call_args.args[0]["model_id"], "restored/model")
+
+    def test_v2_reports_the_model_that_really_transcribed(self) -> None:
+        results = [batching.BatchTranscriptionResult(text="Hallo", batch_id="batch", model_id="restored/model")]
+        manager = SimpleNamespace(submit_job=mock.AsyncMock(return_value=results))
+        request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(whisper_batch_manager=manager)))
+        audio = np.zeros(16000, dtype=np.float32)
+        with (
+            mock.patch.object(v2, "_processing_key", return_value=("openai/whisper-tiny", "cpu", "", "de", "fp32")),
+            mock.patch.object(v2, "split_audio_for_whisper", return_value=[audio]),
+        ):
+            *_, model_id = asyncio.run(v2._transcribe_audio(request, audio))
+        self.assertEqual(model_id, "restored/model")
+
     def test_legacy_transcribe_splits_long_cohere_audio_into_superchunks(self) -> None:
         audio = np.full(16000 * 90, 0.1, dtype=np.float32)
         segments = [audio[: 16000 * 45], audio[16000 * 45 :]]

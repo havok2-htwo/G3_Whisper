@@ -23,7 +23,13 @@ from .genesis_whisper_server_auth import (
     require_session,
     set_session_cookie,
 )
-from .genesis_whisper_server_chunking import combine_transcription_chunks, split_audio_for_whisper
+from .genesis_whisper_server_batching import ModelFailoverError
+from .genesis_whisper_server_chunking import (
+    TARGET_SAMPLE_RATE,
+    WHISPER_MAX_CHUNK_SECONDS,
+    combine_transcription_chunks,
+    split_audio_for_whisper,
+)
 from .genesis_whisper_server_globals import (
     AVAILABLE_DEVICES,
     DEVICE_MAP_UI_TO_INTERNAL,
@@ -254,6 +260,32 @@ def _restore_selection(previous_settings: Dict[str, Any]) -> Dict[str, Any]:
         return _store_settings({**current_settings, **restored})
 
 
+def _fail_over_queued_jobs(request: Request, failed_settings: Dict[str, Any]) -> None:
+    """Hand jobs of a failed selection to the model selected now. Synchronous, see fail_over_model."""
+
+    failed_model = failed_settings["local_model"]
+    failed_language = failed_settings["transcription_language"]
+
+    def retarget(processing_key: tuple[str, str, str, str, str], segments) -> tuple[str, str, str, str, str]:
+        model_id, device, cache_path, selected_language, precision = _get_local_processing_key()
+        # Selected again in the meantime: this key is good.
+        if processing_key[0] == model_id:
+            return processing_key
+        # Whisper would silently cut a chunk made for a whole-audio backend, an error is better than a lost tail.
+        if not uses_whole_audio_backend(model_id):
+            max_samples = int(WHISPER_MAX_CHUNK_SECONDS * TARGET_SAMPLE_RATE)
+            if any(len(segment) > max_samples for segment in segments):
+                raise ModelFailoverError(
+                    f"Model '{failed_model}' could not be loaded and this audio does not fit '{model_id}' as chunked. "
+                    "Send the request again."
+                )
+        # The failed model's own language goes back with it, a per-request language stays.
+        language = selected_language if processing_key[3] == failed_language else processing_key[3]
+        return model_id, device, cache_path, language, precision
+
+    request.app.state.whisper_batch_manager.fail_over_model(failed_model, retarget)
+
+
 def _load_model_for_settings(settings_snapshot: Dict[str, Any]) -> bool:
     model_id = settings_snapshot["local_model"]
     device = settings_snapshot["local_gpu_device"]
@@ -265,7 +297,10 @@ def _load_model_for_settings(settings_snapshot: Dict[str, Any]) -> bool:
 
 async def _reload_model(request: Request, settings_snapshot: Dict[str, Any]) -> bool:
     async with request.app.state.local_gpu_lock:
-        return await run_blocking_gpu_phase(_load_model_for_settings, settings_snapshot)
+        loaded = await run_blocking_gpu_phase(_load_model_for_settings, settings_snapshot)
+    if loaded:
+        request.app.state.whisper_batch_manager.clear_failover(settings_snapshot["local_model"])
+    return loaded
 
 
 async def _load_model_or_error(request: Request, settings_snapshot: Dict[str, Any]) -> str | None:
@@ -737,13 +772,13 @@ def create_admin_api(app: FastAPI) -> FastAPI:
 
         async with model_select_lock:
             previous_settings = _settings_snapshot()
-            if model_id == previous_settings["local_model"]:
-                model_loaded = is_local_model_loaded(model_id)
+            already_active = model_id == previous_settings["local_model"]
+            if already_active and is_local_model_loaded(model_id):
                 return {
                     "ok": True,
                     "model_reloaded": False,
-                    "model_loaded": model_loaded,
-                    "load_error": None if model_loaded else get_last_local_asr_load_error(),
+                    "model_loaded": True,
+                    "load_error": None,
                     **_settings_response(),
                 }
 
@@ -755,6 +790,19 @@ def create_admin_api(app: FastAPI) -> FastAPI:
                     status_code=409,
                     detail=f"Model '{model_id}' is not downloaded (status: {status}). Download it first.",
                 )
+
+            # The way to retry a failed load. The selection stays, so there is nothing to restore.
+            if already_active:
+                load_error = await _load_model_or_error(request, previous_settings)
+                if load_error:
+                    raise HTTPException(status_code=500, detail=f"Model '{model_id}' could not be loaded. Cause: {load_error}")
+                return {
+                    "ok": True,
+                    "model_reloaded": True,
+                    "model_loaded": True,
+                    "load_error": None,
+                    **_settings_response(),
+                }
 
             selected_settings = {
                 **previous_settings,
@@ -772,10 +820,12 @@ def create_admin_api(app: FastAPI) -> FastAPI:
                 # Nobody is left to report a failure to, so the broken selection must not stay saved.
                 if not is_local_model_loaded(model_id):
                     _restore_selection(previous_settings)
+                    _fail_over_queued_jobs(request, saved_settings)
                 raise
 
             if load_error:
                 restored_settings = _restore_selection(previous_settings)
+                _fail_over_queued_jobs(request, saved_settings)
                 restore_error = await _load_model_or_error(request, restored_settings)
                 detail = f"Model '{model_id}' could not be loaded, the previous selection was restored. Cause: {load_error}"
                 if restore_error:
@@ -808,6 +858,9 @@ def create_admin_api(app: FastAPI) -> FastAPI:
 
     @app.post("/api/admin/models/delete")
     async def admin_delete_model(payload: AdminModelActionPayload, _: dict[str, str] = Depends(require_admin)):
+        # The selection may be loading this model, or need it to roll back to.
+        if model_select_lock.locked():
+            raise HTTPException(status_code=409, detail="A model selection is running, delete again when it has finished.")
         if payload.model_id == _settings_snapshot()["local_model"]:
             raise HTTPException(
                 status_code=409,

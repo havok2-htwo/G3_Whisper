@@ -158,7 +158,11 @@ class AdminDiaSettingsTests(unittest.TestCase):
         self.assertTrue(persisted["cohere_cuda_graphs"])
 
     def _request(self):
-        return types.SimpleNamespace(app=types.SimpleNamespace(state=types.SimpleNamespace(local_gpu_lock=asyncio.Lock())))
+        return types.SimpleNamespace(
+            app=types.SimpleNamespace(
+                state=types.SimpleNamespace(local_gpu_lock=asyncio.Lock(), whisper_batch_manager=mock.Mock())
+            )
+        )
 
     def test_redimnet_max_batch_is_saved_normalised_and_applied_without_restart(self) -> None:
         endpoint = self._endpoint("/api/admin/settings", "PUT")
@@ -461,7 +465,9 @@ class AdminDiaSettingsTests(unittest.TestCase):
         async def scenario() -> None:
             local_gpu_lock = asyncio.Lock()
             request = types.SimpleNamespace(
-                app=types.SimpleNamespace(state=types.SimpleNamespace(local_gpu_lock=local_gpu_lock))
+                app=types.SimpleNamespace(
+                    state=types.SimpleNamespace(local_gpu_lock=local_gpu_lock, whisper_batch_manager=mock.Mock())
+                )
             )
             with mock.patch.object(admin, "_load_model_for_settings", side_effect=blocking_model_load):
                 task = asyncio.create_task(
@@ -512,7 +518,9 @@ class AdminDiaSettingsTests(unittest.TestCase):
 
         async def scenario() -> None:
             request = types.SimpleNamespace(
-                app=types.SimpleNamespace(state=types.SimpleNamespace(local_gpu_lock=asyncio.Lock()))
+                app=types.SimpleNamespace(
+                    state=types.SimpleNamespace(local_gpu_lock=asyncio.Lock(), whisper_batch_manager=mock.Mock())
+                )
             )
             with mock.patch.object(admin, "_load_model_for_settings", side_effect=blocking_model_load):
                 first = asyncio.create_task(

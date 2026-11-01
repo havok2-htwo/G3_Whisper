@@ -10,6 +10,7 @@ from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 
 from .genesis_whisper_server_audio import get_audio_duration_seconds, load_audio_file
 from .genesis_whisper_server_auth import authorize_api_key, get_auth_store
+from .genesis_whisper_server_batching import ModelFailoverError, served_model_id
 from .genesis_whisper_server_chunking import combine_transcription_chunks, split_audio_for_whisper
 from .genesis_whisper_server_globals import (
     current_settings,
@@ -126,7 +127,11 @@ def create_api(app: FastAPI) -> FastAPI:
             transcription_text = ""
             transcription_duration_ms = 0
         else:
-            batch_results = await batch_manager.submit_job(segmented_audio, request_id, local_processing_key)
+            try:
+                batch_results = await batch_manager.submit_job(segmented_audio, request_id, local_processing_key)
+            except ModelFailoverError as exc:
+                raise HTTPException(status_code=503, detail=str(exc)) from exc
+            model_id = served_model_id(batch_results, model_id)
             transcription_text = combine_transcription_chunks([result.text for result in batch_results])
             batch_ids = sorted({result.batch_id for result in batch_results})
             transcription_duration_ms = round((time.monotonic() - batch_start) * 1000)

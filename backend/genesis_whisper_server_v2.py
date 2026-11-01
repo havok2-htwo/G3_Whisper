@@ -22,6 +22,7 @@ from starlette.formparsers import MultiPartException, MultiPartParser
 
 from .genesis_whisper_server_audio import get_audio_duration_seconds, load_audio_file
 from .genesis_whisper_server_auth import authorize_api_key, get_auth_store, require_admin
+from .genesis_whisper_server_batching import served_model_id
 from .genesis_whisper_server_chunking import combine_transcription_chunks, split_audio_for_whisper
 from .genesis_whisper_server_dia_client import DiaClientError, dia_is_configured, diarize_v2
 from .genesis_whisper_server_globals import (
@@ -474,6 +475,7 @@ async def _transcribe_audio(
         return "", 0, 0, model_id
     results = await batch_manager.submit_job(segments, request_token, processing_key)
     text = combine_transcription_chunks([result.text for result in results])
+    model_id = served_model_id(results, model_id)
     return text, round((time.monotonic() - started) * 1000), len(segments), model_id
 
 
@@ -581,7 +583,7 @@ async def _transcribe_turns(
         if disposition == "asr_failure":
             segment["asr_failure"] = True
         transcript_segments.append(segment)
-    return transcript_segments, round((time.monotonic() - started) * 1000), model_id
+    return transcript_segments, round((time.monotonic() - started) * 1000), served_model_id(batch_results, model_id)
 
 
 async def _wxc_transcribe_segments(
@@ -664,7 +666,7 @@ async def _wxc_transcribe_segments(
         "words_aligned": len(words),
         "verification": verification,
     }
-    return transcript_segments, timings, diagnostics, processing_key[0]
+    return transcript_segments, timings, diagnostics, served_model_id(results, processing_key[0])
 
 
 class WxcNoSpeechError(RuntimeError):

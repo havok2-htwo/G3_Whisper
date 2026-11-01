@@ -825,7 +825,9 @@ order in the admin is: pick the model, then its presets, then its settings.
   `PUT /api/admin/settings` return them as `model_fields` and `service_fields`.
 - `POST /api/admin/models/select` is the switch. It answers `409` for a model that is not
   downloaded, keeps the tuned values of each model in `model_profiles`, and on a failed load
-  restores the previous selection and model and returns the real error with HTTP 500.
+  restores the previous selection and model and returns the real error with HTTP 500. Requests
+  accepted during that failed selection run on the restored model. Selecting the active model
+  while it is not loaded retries the load.
 - A model selected for the first time starts from the tier it owns (Cohere `24GB VRAM`,
   Parakeet `Parakeet 8GB VRAM`), a Whisper size keeps the current values. In both cases it
   takes the old model's effective language, so clients keep getting the same language:
@@ -835,7 +837,8 @@ order in the admin is: pick the model, then its presets, then its settings.
 - The admin form sends `expected_local_model` with `PUT`. When another model became active
   since the form was loaded, nothing is saved and the answer is `409`, so the old model's values
   never land on the new one. Callers that omit the field are not checked.
-- `POST /api/admin/models/delete` refuses the active model with `409`.
+- `POST /api/admin/models/delete` refuses the active model with `409`, and any model while a
+  selection runs.
 - Language validation stays global: a language a model does not use is still a valid request.
 
 Settings presets: the admin settings panel offers the built-in GPU tiers `32GB VRAM`
