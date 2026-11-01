@@ -607,6 +607,46 @@ Opt out for one request with:
 X-G3-Repetition-Filter: off
 ```
 
+### `GET /v2/capabilities`
+
+Purpose:
+
+- tells a client what the service does right now, without sending audio
+- needs no API key, like `GET /v1/models`, and returns no secret and no DIA URL
+
+Response shape:
+
+```json
+{
+  "schema_version": "2.0",
+  "service": "asr",
+  "model": {
+    "id": "CohereLabs/cohere-transcribe-03-2026",
+    "label": "Cohere Transcribe 03/2026",
+    "backend": "cohere_transcribe",
+    "loaded": true
+  },
+  "language": {
+    "configured": "auto",
+    "effective": "de",
+    "applied": true,
+    "options": ["auto", "de", "en"]
+  },
+  "modes": ["embedding", "transcript", "transcript_embedding", "diarization"],
+  "embedding": { "id": "ReDimNet2-B6" },
+  "diarization": { "configured": true }
+}
+```
+
+Notes:
+
+- `model` is the admin's selection. `loaded` is false while another model or no model is resident, the next request then loads it.
+- `language.effective` is what `auto` means on this model: `de` on Cohere, detection (`auto`) on Whisper.
+- `language.applied` is false on Parakeet: that engine detects the language itself and ignores the setting and a v2 `language`.
+- `language.options` is the global list `POST /v2/audio/process` validates against, it does not change with the model.
+- `diarization.configured` means a usable DIA URL exists, the built-in default counts. It does not test that the DIA server is up, `POST /api/admin/dia/test` does.
+- Older servers answer this path with the HTML landing page and status 200, not with 404. A client must treat a non-JSON answer as "not available".
+
 ## Public Transcription API
 
 ### `POST /transcribe/`
@@ -676,8 +716,10 @@ Purpose:
 
 Behavior:
 
-- returns the currently active local model
+- returns the currently active local model as the first entry; clients store `data[0].id`, so this order is a contract
 - also returns the alias `whisper-1`
+- needs no API key
+- reports only ids; backend, language and load state are on `GET /v2/capabilities`
 
 Example response:
 
@@ -851,6 +893,8 @@ Purpose:
 - returns current saved settings
 - returns UI options for models, devices, precisions, and languages
 - returns the currently loaded model identifier if a model is already in memory
+- `model_fields` lists the fields of each backend, `service_fields` the service-wide ones; these two lists drive the admin form
+- `settings.model_profiles` holds the tuned values per model id (see `POST /api/admin/models/select`), read-only here
 
 Response shape:
 
@@ -875,11 +919,20 @@ Response shape:
     "dia_server_base_url_source": "settings",
     "dia_api_key": "",
     "dia_api_key_configured": true,
-    "dia_api_key_source": "settings"
+    "dia_api_key_source": "settings",
+    "model_profiles": {
+      "openai/whisper-large-v3-turbo": { "batch_max_segments": 16, "transcription_language": "de" }
+    }
   },
   "options": {
     "models": [
-      { "label": "Whisper Large v3 Turbo", "value": "openai/whisper-large-v3-turbo" }
+      {
+        "label": "Whisper Large v3 Turbo",
+        "value": "openai/whisper-large-v3-turbo",
+        "backend": "whisper",
+        "active": true,
+        "loaded": true
+      }
     ],
     "devices": [
       { "label": "Auto (Empfohlen)", "value": "auto" },
@@ -905,7 +958,9 @@ Response shape:
       "approx_size_gb": null,
       "size_on_disk_gb": 0.0,
       "error": null,
-      "updated_at": null
+      "updated_at": null,
+      "active": false,
+      "loaded": false
     }
   ],
   "loaded_model_identifier": [
@@ -913,9 +968,23 @@ Response shape:
     "auto",
     ".\\models",
     "fp16"
+  ],
+  "model_fields": {
+    "whisper": ["local_gpu_device", "batch_wait_time_ms", "local_model_precision", "transcription_language"],
+    "cohere_transcribe": ["local_gpu_device", "local_model_precision", "transcription_language", "cohere_cuda_graphs"],
+    "parakeet": ["local_gpu_device", "batch_wait_time_ms"]
+  },
+  "service_fields": [
+    "local_model_cache_path",
+    "huggingface_token",
+    "dia_server_base_url",
+    "dia_api_key",
+    "debug_retain_history_audio"
   ]
 }
 ```
+
+`model_fields` is shortened here; the full lists are `MODEL_SETTINGS_FIELDS` in `backend/genesis_whisper_server_storage.py`.
 
 ### `PUT /api/admin/settings`
 
@@ -952,11 +1021,19 @@ Response fields:
 - `settings`
 - `model_reloaded`
 - `model_loaded`
+- `load_error`: the real load error when `model_loaded` is `false`, otherwise `null`
 - `options`
 - `models`
+- `loaded_model_identifier`
+- `model_fields`
+- `service_fields`
 
 Notes:
 
+- every successful PUT also stores the tuned values under the current `local_model` in `model_profiles`. The values themselves stay top-level keys, provisioning scripts keep editing those directly.
+- `local_model` stays accepted here: it changes the model with the sent values, applies no profile or tier, and a failed load keeps the saved selection (`ok: true`, `model_loaded: false`, `load_error` set). The admin UI uses `POST /api/admin/models/select` instead.
+- `409` while a model selection is running
+- optional `expected_local_model` names the model the sent values were loaded for. It is not stored. When another model is active by now the PUT saves nothing and answers `409` with `detail: "active_model_changed"`, so a form opened before a switch cannot put the old model's values, its language included, onto the new model. The admin UI sends it and reloads the form. Callers that omit it are not checked.
 - `huggingface_token` can be stored via this route and is then reused by later manual cache downloads and runtime model loads.
 - `batch_max_segments` defaults to `16` and `batch_max_audio_seconds` to `100`; together they cap one worker batch. The audio cap bounds both the VRAM a Cohere batch needs and the time a live request waits for the running bulk batch (about 1 s at 100 s of audio on an RTX 4090/5090).
 - `scheduler_long_job_min_chunks` (default `5`) marks a request with at least that many chunks as a long job; `scheduler_max_parallel_long_jobs` (default `2`, `0` = unlimited) caps how many long jobs are scheduled at once, further ones wait FIFO. Short requests never wait for a slot.
@@ -984,6 +1061,11 @@ Purpose:
 - built-in tiers (identical names across the G3 services): `32GB VRAM` (RTX 5090, every G3 service on one card), `24GB VRAM` (RTX 4090, every G3 service on one card) and `24+8 VRAM` (3090 + 2070S box, Whisper on the 24 GB card). Whisper has no `8+24 VRAM` tier; on the two-GPU box only DIA runs on the 8 GB card.
 - a tier with a `target_vram_gb` gets `local_gpu_device` set to the CUDA card whose total memory matches within 2 GiB (machines number their cards differently); if no card matches, `local_gpu_device` is left out and `note` explains why. Single-card tiers never set the GPU.
 - the built-in tier values are currently the service defaults; measured per-tier values replace them in a later step
+- `model_id` is derived for each item and never part of `values`: `32GB VRAM`, `24GB VRAM` and `24+8 VRAM` belong to Cohere, `Parakeet 8GB VRAM` to Parakeet, a saved preset to its `values.local_model`. `null` means usable for every model.
+
+Query params:
+
+- `model_id` (optional): only the presets of that model plus the ones with `model_id: null`
 
 Response shape:
 
@@ -996,6 +1078,7 @@ Response shape:
       "description": "3090 + 2070S box, Whisper on the 3090 (24 GB) ...",
       "target_vram_gb": 24,
       "note": null,
+      "model_id": "CohereLabs/cohere-transcribe-03-2026",
       "values": {
         "local_model_precision": "fp16",
         "cohere_cuda_graphs": true,
@@ -1013,6 +1096,7 @@ Response shape:
       "target_vram_gb": null,
       "created_at": "2026-10-16T12:00:00",
       "note": null,
+      "model_id": null,
       "values": { "batch_max_segments": 8 }
     }
   ]
@@ -1108,11 +1192,15 @@ Response shape:
       "approx_size_gb": null,
       "size_on_disk_gb": 0.0,
       "error": null,
-      "updated_at": null
+      "updated_at": null,
+      "active": false,
+      "loaded": false
     }
   ]
 }
 ```
+
+`active` marks the selected model, `loaded` the model resident in memory.
 
 Status values currently used:
 
@@ -1125,6 +1213,34 @@ Status values currently used:
 Notes:
 
 - A gated Cohere snapshot is only considered `ready` if the required remote-code files, tokenizer assets including `tokenizer.model`, and model weights are all present locally.
+
+### `POST /api/admin/models/select`
+
+Purpose:
+
+- selects the active ASR model (`local_model`) and loads it; what the admin UI's "Load model" button calls
+
+Request body:
+
+```json
+{ "model_id": "openai/whisper-large-v3-turbo" }
+```
+
+Behavior:
+
+- the tuned values of the old model go to its profile in `model_profiles`, the target's profile applies. Tuned are the preset keys without `local_model` and `local_gpu_device`, plus `transcription_language`.
+- a target without a profile starts from the tier it owns (Cohere `24GB VRAM`, Parakeet `Parakeet 8GB VRAM`), a Whisper size keeps the current values
+- the language must not change for clients: a target without a profile takes the old model's effective language, so Cohere with `auto` hands `de` to the next model
+- device, cache path, token, DIA settings and the debug audio switch do not move
+- the settings are saved first, then the model loads under the GPU lock and ReDimNet and MMS_FA are re-prepared when needed, the same path as `PUT /api/admin/settings`
+- the same model is a no-op with `ok: true`, `model_reloaded: false` and the real `model_loaded`
+
+Status codes:
+
+- `200`: the shape of `PUT /api/admin/settings` with `model_loaded: true`
+- `400`: unknown model id
+- `409`: the model is not downloaded (`status` is not `ready`), so a selection never blocks the GPU lock on a download; or another selection is running
+- `500`: the load failed. Selection and values are restored, the old model is reloaded and `detail` carries the real error text.
 
 ### `POST /api/admin/models/download`
 
@@ -1173,6 +1289,11 @@ Response fields:
 - `removed_path`
 - `storage_root`
 - `models`
+
+Status codes:
+
+- `400`: unsupported model id, or the model is still downloading
+- `409`: the model is the active one, select another model first
 
 ### `GET /api/admin/stats`
 

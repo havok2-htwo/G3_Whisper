@@ -29,7 +29,9 @@ from .genesis_whisper_server_globals import (
     DEVICE_MAP_UI_TO_INTERNAL,
     current_settings,
     get_effective_transcription_language,
+    get_local_model_backend,
     history_lock,
+    is_local_model_loaded,
     local_model_components,
     LOCAL_ASR_MODEL_MAP,
     SUPPORTED_LANGUAGE_OPTIONS,
@@ -62,13 +64,31 @@ from .genesis_whisper_server_repetition import (
     repetition_filter_enabled,
 )
 from .genesis_whisper_server_dia_client import dia_unreachable_hint
-from .genesis_whisper_server_presets import delete_user_preset, resolve_presets, save_user_preset
-from .genesis_whisper_server_storage import normalize_settings, resolve_dia_server_config, save_settings
+from .genesis_whisper_server_presets import (
+    delete_user_preset,
+    model_selection_values,
+    resolve_presets,
+    save_user_preset,
+)
+from .genesis_whisper_server_storage import (
+    MODEL_SETTINGS_FIELDS,
+    MODEL_TUNED_KEYS,
+    SERVICE_SETTINGS_FIELDS,
+    normalize_settings,
+    resolve_dia_server_config,
+    save_settings,
+    with_model_profiles,
+)
 from .genesis_whisper_server_vid import apply_vid_settings
 from .genesis_whisper_server_wxc import apply_mms_device_setting
 
 
+ACTIVE_MODEL_CHANGED = "active_model_changed"
+
+
 class AdminSettingsPayload(BaseModel):
+    # Not a setting: the model the sent form was loaded for. Callers that omit it are not checked.
+    expected_local_model: str | None = None
     local_model: str | None = None
     local_gpu_device: str | None = None
     local_model_precision: str | None = None
@@ -117,6 +137,10 @@ class AdminModelActionPayload(BaseModel):
     model_id: str
     storage_path: str | None = None
     huggingface_token: str | None = None
+
+
+class AdminModelSelectPayload(BaseModel):
+    model_id: str
 
 
 class LoginPayload(BaseModel):
@@ -173,12 +197,61 @@ def _validate_dia_server_base_url(value: str) -> str:
     return normalized
 
 
-def _settings_options() -> Dict[str, List[Dict[str, str]]]:
-    models = [{"label": label, "value": model_id} for label, model_id in LOCAL_ASR_MODEL_MAP.items()]
+def _settings_options() -> Dict[str, List[Dict[str, Any]]]:
+    active_model = _settings_snapshot()["local_model"]
+    models = [
+        {
+            "label": label,
+            "value": model_id,
+            "backend": get_local_model_backend(model_id),
+            "active": model_id == active_model,
+            "loaded": is_local_model_loaded(model_id),
+        }
+        for label, model_id in LOCAL_ASR_MODEL_MAP.items()
+    ]
     devices = [{"label": label, "value": DEVICE_MAP_UI_TO_INTERNAL[label]} for label in AVAILABLE_DEVICES]
     languages = [{"label": label, "value": value} for label, value in SUPPORTED_LANGUAGE_OPTIONS.items()]
     precisions = [{"label": label, "value": value} for label, value in SUPPORTED_MODEL_PRECISION_OPTIONS.items()]
     return {"models": models, "devices": devices, "languages": languages, "precisions": precisions}
+
+
+def _model_rows(storage_path: str) -> List[Dict[str, Any]]:
+    """Cache status of every model plus what the service does with it right now."""
+
+    active_model = _settings_snapshot()["local_model"]
+    return [
+        {**row, "active": row["id"] == active_model, "loaded": is_local_model_loaded(row["id"])}
+        for row in list_model_statuses(storage_path)
+    ]
+
+
+def _settings_response() -> Dict[str, Any]:
+    settings_snapshot = _serialize_settings()
+    return {
+        "settings": settings_snapshot,
+        "options": _settings_options(),
+        "models": _model_rows(settings_snapshot.get("local_model_cache_path", "")),
+        "loaded_model_identifier": list(local_model_components.get("model_identifier") or []) or None,
+        "model_fields": {backend: list(fields) for backend, fields in MODEL_SETTINGS_FIELDS.items()},
+        "service_fields": list(SERVICE_SETTINGS_FIELDS),
+    }
+
+
+def _store_settings(settings: Dict[str, Any]) -> Dict[str, Any]:
+    """Save and publish settings. The caller holds settings_lock."""
+
+    saved_settings = save_settings(settings)
+    current_settings.clear()
+    current_settings.update(saved_settings)
+    return saved_settings
+
+
+def _restore_selection(previous_settings: Dict[str, Any]) -> Dict[str, Any]:
+    """Undo a model selection. Only its own keys, a token saved meanwhile must survive."""
+
+    restored = {key: previous_settings[key] for key in ("local_model", "model_profiles", *MODEL_TUNED_KEYS)}
+    with settings_lock:
+        return _store_settings({**current_settings, **restored})
 
 
 def _load_model_for_settings(settings_snapshot: Dict[str, Any]) -> bool:
@@ -190,10 +263,48 @@ def _load_model_for_settings(settings_snapshot: Dict[str, Any]) -> bool:
         return load_local_asr_model(model_id, device, cache_path, precision)
 
 
+async def _reload_model(request: Request, settings_snapshot: Dict[str, Any]) -> bool:
+    async with request.app.state.local_gpu_lock:
+        return await run_blocking_gpu_phase(_load_model_for_settings, settings_snapshot)
+
+
+async def _load_model_or_error(request: Request, settings_snapshot: Dict[str, Any]) -> str | None:
+    """Load the model and return None, or the real reason it failed."""
+
+    try:
+        if await _reload_model(request, settings_snapshot):
+            return None
+    except Exception as exc:
+        return f"{type(exc).__name__}: {exc}"
+    return get_last_local_asr_load_error() or "The model could not be loaded."
+
+
 def _apply_voice_model_settings() -> Dict[str, bool]:
     """Move/re-warm the loaded ReDimNet and MMS_FA models for the saved settings (GPU thread)."""
 
     return {"redimnet": apply_vid_settings(), "mms_fa": apply_mms_device_setting()}
+
+
+async def _reprepare_voice_models(
+    request: Request,
+    previous_settings: Dict[str, Any],
+    saved_settings: Dict[str, Any],
+) -> None:
+    """ReDimNet and MMS_FA follow local_gpu_device, ReDimNet also its max batch. Re-prepare loaded
+    models now, so the old card / the larger bucket pool is released and the next request is warm."""
+
+    voice_settings_changed = any(
+        previous_settings.get(key) != saved_settings.get(key)
+        for key in ("local_gpu_device", "redimnet_max_batch_size")
+    )
+    if not voice_settings_changed:
+        return
+    try:
+        async with request.app.state.local_gpu_lock:
+            await run_blocking_gpu_phase(_apply_voice_model_settings)
+    except Exception as exc:
+        # Not fatal: the next ReDimNet/MMS_FA use re-prepares lazily from the same settings.
+        print(f"[WARNUNG] ReDimNet/MMS_FA konnten nicht neu vorbereitet werden: {exc}", file=sys.stderr)
 
 
 def _get_local_processing_key() -> tuple[str, str, str, str, str]:
@@ -375,6 +486,9 @@ async def _run_admin_benchmark(request: Request, audio_data, repeat_count: int) 
 
 
 def create_admin_api(app: FastAPI) -> FastAPI:
+    # A failed selection rolls the settings back, so nothing else may change them while one runs.
+    model_select_lock = asyncio.Lock()
+
     # --- Auth: username/password login backed by an httpOnly session cookie ---
     @app.post("/api/admin/auth/login")
     async def admin_login(payload: LoginPayload, request: Request, response: Response):
@@ -430,14 +544,7 @@ def create_admin_api(app: FastAPI) -> FastAPI:
 
     @app.get("/api/admin/settings")
     async def admin_get_settings(_: dict[str, str] = Depends(require_admin)):
-        model_identifier = local_model_components.get("model_identifier")
-        settings_snapshot = _serialize_settings()
-        return {
-            "settings": settings_snapshot,
-            "options": _settings_options(),
-            "models": list_model_statuses(settings_snapshot.get("local_model_cache_path", "")),
-            "loaded_model_identifier": list(model_identifier) if model_identifier else None,
-        }
+        return _settings_response()
 
     @app.put("/api/admin/settings")
     async def admin_update_settings(
@@ -445,6 +552,9 @@ def create_admin_api(app: FastAPI) -> FastAPI:
         request: Request,
         _: dict[str, str] = Depends(require_admin),
     ):
+        if model_select_lock.locked():
+            raise HTTPException(status_code=409, detail="A model selection is running, save again when it has finished.")
+
         if hasattr(payload, "model_dump"):
             payload_data = payload.model_dump(exclude_unset=True, exclude_none=True)
         else:
@@ -463,13 +573,17 @@ def create_admin_api(app: FastAPI) -> FastAPI:
         if not str(payload_data.get("dia_api_key", "") or "").strip():
             payload_data.pop("dia_api_key", None)
 
+        expected_local_model = payload_data.pop("expected_local_model", None)
+
         with settings_lock:
             previous_settings = current_settings.copy()
-            merged_settings = previous_settings.copy()
-            merged_settings.update(payload_data)
-            saved_settings = save_settings(merged_settings)
-            current_settings.clear()
-            current_settings.update(saved_settings)
+            # A form of another model holds that model's tuned values, its language included. /transcribe/ and
+            # /v1/audio/transcriptions cannot send a language, so saving it would silently move those clients.
+            if expected_local_model is not None and expected_local_model != previous_settings["local_model"]:
+                raise HTTPException(status_code=409, detail=ACTIVE_MODEL_CHANGED)
+            merged_settings = normalize_settings({**previous_settings, **payload_data})
+            # The previous settings too: when this PUT changes local_model they are what the old model ran with.
+            saved_settings = _store_settings(with_model_profiles(merged_settings, previous_settings, merged_settings))
 
         set_history_audio_enabled(saved_settings.get("debug_retain_history_audio", False) is True)
 
@@ -479,37 +593,23 @@ def create_admin_api(app: FastAPI) -> FastAPI:
         )
         model_loaded = None
         if model_settings_changed:
-            async with request.app.state.local_gpu_lock:
-                model_loaded = await run_blocking_gpu_phase(_load_model_for_settings, saved_settings)
+            model_loaded = await _reload_model(request, saved_settings)
+        load_error = get_last_local_asr_load_error() if model_loaded is False else None
 
-        # ReDimNet and MMS_FA follow local_gpu_device, ReDimNet also its max batch. Re-prepare loaded
-        # models now, so the old card / the larger bucket pool is released and the next request is warm.
-        voice_settings_changed = any(
-            previous_settings.get(key) != saved_settings.get(key)
-            for key in ("local_gpu_device", "redimnet_max_batch_size")
-        )
-        if voice_settings_changed:
-            try:
-                async with request.app.state.local_gpu_lock:
-                    await run_blocking_gpu_phase(_apply_voice_model_settings)
-            except Exception as exc:
-                # Not fatal: the next ReDimNet/MMS_FA use re-prepares lazily from the same settings.
-                print(f"[WARNUNG] ReDimNet/MMS_FA konnten nicht neu vorbereitet werden: {exc}", file=sys.stderr)
+        await _reprepare_voice_models(request, previous_settings, saved_settings)
 
         return {
             "ok": True,
-            "settings": _serialize_settings(),
             "model_reloaded": model_settings_changed,
             "model_loaded": model_loaded,
-            "options": _settings_options(),
-            "models": list_model_statuses(saved_settings.get("local_model_cache_path", "")),
-            "loaded_model_identifier": list(local_model_components.get("model_identifier") or []) or None,
+            "load_error": load_error,
+            **_settings_response(),
         }
 
     # --- Settings presets (built-in GPU tiers + saved ones; loading fills the form, Save applies) ---
     @app.get("/api/admin/settings/presets")
-    async def admin_list_presets(_: dict[str, str] = Depends(require_admin)):
-        return {"presets": await asyncio.to_thread(resolve_presets)}
+    async def admin_list_presets(model_id: str | None = None, _: dict[str, str] = Depends(require_admin)):
+        return {"presets": await asyncio.to_thread(resolve_presets, model_id)}
 
     @app.put("/api/admin/settings/presets/{name}")
     async def admin_save_preset(name: str, payload: PresetPayload, _: dict[str, str] = Depends(require_admin)):
@@ -535,19 +635,14 @@ def create_admin_api(app: FastAPI) -> FastAPI:
             merged_settings = current_settings.copy()
             removed = bool(str(merged_settings.get("dia_api_key", "") or "").strip())
             merged_settings["dia_api_key"] = ""
-            saved_settings = save_settings(merged_settings)
-            current_settings.clear()
-            current_settings.update(saved_settings)
+            saved_settings = _store_settings(merged_settings)
 
         effective_dia = resolve_dia_server_config(saved_settings)
         return {
             "ok": True,
             "removed": removed,
             "environment_fallback_active": effective_dia["api_key_source"] == "environment",
-            "settings": _serialize_settings(),
-            "options": _settings_options(),
-            "models": list_model_statuses(saved_settings.get("local_model_cache_path", "")),
-            "loaded_model_identifier": list(local_model_components.get("model_identifier") or []) or None,
+            **_settings_response(),
         }
 
     @app.post("/api/admin/dia/test")
@@ -626,7 +721,75 @@ def create_admin_api(app: FastAPI) -> FastAPI:
 
     @app.get("/api/admin/models")
     async def admin_get_models(storage_path: str | None = None, _: dict[str, str] = Depends(require_admin)):
-        return {"models": list_model_statuses(_effective_model_storage_path(storage_path))}
+        return {"models": _model_rows(_effective_model_storage_path(storage_path))}
+
+    @app.post("/api/admin/models/select")
+    async def admin_select_model(
+        payload: AdminModelSelectPayload,
+        request: Request,
+        _: dict[str, str] = Depends(require_admin),
+    ):
+        model_id = payload.model_id
+        if model_id not in LOCAL_ASR_MODEL_MAP.values():
+            raise HTTPException(status_code=400, detail=f"Unsupported model id '{model_id}'.")
+        if model_select_lock.locked():
+            raise HTTPException(status_code=409, detail="Another model selection is still running.")
+
+        async with model_select_lock:
+            previous_settings = _settings_snapshot()
+            if model_id == previous_settings["local_model"]:
+                model_loaded = is_local_model_loaded(model_id)
+                return {
+                    "ok": True,
+                    "model_reloaded": False,
+                    "model_loaded": model_loaded,
+                    "load_error": None if model_loaded else get_last_local_asr_load_error(),
+                    **_settings_response(),
+                }
+
+            # A load would fetch a missing model while holding the GPU lock and stall every request behind it.
+            rows = list_model_statuses(previous_settings["local_model_cache_path"])
+            status = next((row["status"] for row in rows if row["id"] == model_id), "missing")
+            if status != "ready":
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Model '{model_id}' is not downloaded (status: {status}). Download it first.",
+                )
+
+            selected_settings = {
+                **previous_settings,
+                **model_selection_values(previous_settings, model_id),
+                "local_model": model_id,
+            }
+            with settings_lock:
+                saved_settings = _store_settings(
+                    with_model_profiles(selected_settings, previous_settings, selected_settings)
+                )
+
+            try:
+                load_error = await _load_model_or_error(request, saved_settings)
+            except asyncio.CancelledError:
+                # Nobody is left to report a failure to, so the broken selection must not stay saved.
+                if not is_local_model_loaded(model_id):
+                    _restore_selection(previous_settings)
+                raise
+
+            if load_error:
+                restored_settings = _restore_selection(previous_settings)
+                restore_error = await _load_model_or_error(request, restored_settings)
+                detail = f"Model '{model_id}' could not be loaded, the previous selection was restored. Cause: {load_error}"
+                if restore_error:
+                    detail = f"{detail} Reloading '{restored_settings['local_model']}' failed too: {restore_error}"
+                raise HTTPException(status_code=500, detail=detail)
+
+            await _reprepare_voice_models(request, previous_settings, saved_settings)
+            return {
+                "ok": True,
+                "model_reloaded": True,
+                "model_loaded": True,
+                "load_error": None,
+                **_settings_response(),
+            }
 
     @app.post("/api/admin/models/download")
     async def admin_download_model(payload: AdminModelActionPayload, _: dict[str, str] = Depends(require_admin)):
@@ -640,18 +803,23 @@ def create_admin_api(app: FastAPI) -> FastAPI:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return {
             "job": job,
-            "models": list_model_statuses(_effective_model_storage_path(payload.storage_path)),
+            "models": _model_rows(_effective_model_storage_path(payload.storage_path)),
         }
 
     @app.post("/api/admin/models/delete")
     async def admin_delete_model(payload: AdminModelActionPayload, _: dict[str, str] = Depends(require_admin)):
+        if payload.model_id == _settings_snapshot()["local_model"]:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Model '{payload.model_id}' is the active model. Select another model before deleting it.",
+            )
         try:
             result = delete_model_cache(payload.model_id, _effective_model_storage_path(payload.storage_path))
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return {
             **result,
-            "models": list_model_statuses(_effective_model_storage_path(payload.storage_path)),
+            "models": _model_rows(_effective_model_storage_path(payload.storage_path)),
         }
 
     @app.get("/api/admin/stats")

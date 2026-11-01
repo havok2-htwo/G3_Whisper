@@ -343,6 +343,73 @@ button:disabled {
   margin-top: 8px;
 }
 
+.settings-lock {
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.service-settings {
+  margin-bottom: 0;
+}
+
+.model-picker-group {
+  display: grid;
+  gap: 10px;
+  margin-top: 18px;
+}
+
+.model-picker-group h3 {
+  margin: 0;
+  color: #f7f4ea;
+  font-size: 1.1rem;
+}
+
+.model-picker-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 14px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.model-picker-row.active {
+  border-color: rgba(149, 242, 199, 0.3);
+  background: rgba(149, 242, 199, 0.07);
+}
+
+.model-picker-name {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.model-picker-markers {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.model-picker .message {
+  margin-top: 16px;
+}
+
+.loaded-model-detail {
+  display: block;
+  margin-top: 0.3rem;
+  color: var(--text-dim);
+  font-size: 0.82rem;
+}
+
+.model-active-marker {
+  display: inline-block;
+  margin-left: 0.6rem;
+}
+
 .dia-settings {
   margin: 6px 0 2px;
   padding: 20px;
@@ -1360,6 +1427,14 @@ tbody tr:nth-child(even) {
 
   .pipeline-heading {
     flex-direction: column;
+  }
+
+  .model-picker-row {
+    grid-template-columns: 1fr;
+  }
+
+  .model-picker-markers {
+    justify-content: flex-start;
   }
 
   .pipeline-json-field,

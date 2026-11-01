@@ -3,6 +3,12 @@ export type AdminOption = {
   value: string;
 };
 
+export type ModelOption = AdminOption & {
+  backend: string;
+  active: boolean;
+  loaded: boolean;
+};
+
 export type AdminSettings = {
   local_model: string;
   local_gpu_device: string;
@@ -26,6 +32,7 @@ export type AdminSettings = {
   dia_api_key_source: "settings" | "environment" | "none";
   dia_server_base_url_effective: string;
   dia_server_base_url_source: "settings" | "environment" | "default";
+  model_profiles?: Record<string, Partial<AdminSettings>>;
 };
 
 export type HistoryRetryMode = "transcript" | "transcript_embedding" | null;
@@ -80,6 +87,8 @@ export type ManagedModel = {
   id: string;
   label: string;
   backend: string;
+  active: boolean;
+  loaded: boolean;
   status: string;
   local_path: string | null;
   cache_path: string | null;
@@ -93,13 +102,22 @@ export type ManagedModel = {
 export type SettingsResponse = {
   settings: AdminSettings;
   options: {
-    models: AdminOption[];
+    models: ModelOption[];
     devices: AdminOption[];
     precisions: AdminOption[];
     languages: AdminOption[];
   };
   models: ManagedModel[];
   loaded_model_identifier: string[] | null;
+  model_fields: Record<string, string[]>;
+  service_fields: string[];
+};
+
+export type SettingsSaveResponse = SettingsResponse & {
+  ok: boolean;
+  model_reloaded: boolean;
+  model_loaded: boolean | null;
+  load_error: string | null;
 };
 
 export type StatsResponse = {
@@ -396,30 +414,42 @@ export async function getSettings() {
   return requestJson<SettingsResponse>("/api/admin/settings", { method: "GET" });
 }
 
+export const ACTIVE_MODEL_CHANGED = "active_model_changed";
+
+// local_model stays out: only selectModel changes the model, a form opened before a switch must not switch it back.
+// expected_local_model stops that form from writing the old model's values onto the new one: the save then fails with
+// ACTIVE_MODEL_CHANGED.
 export async function saveSettings(settings: AdminSettings) {
   const {
+    local_model: _localModel,
+    model_profiles: _modelProfiles,
     dia_api_key_configured: _diaApiKeyConfigured,
     dia_api_key_source: _diaApiKeySource,
     dia_server_base_url_effective: _diaServerBaseUrlEffective,
     dia_server_base_url_source: _diaServerBaseUrlSource,
     ...editableSettings
   } = settings;
-  const payload: Record<string, unknown> = { ...editableSettings };
+  const payload: Record<string, unknown> = { ...editableSettings, expected_local_model: settings.local_model };
   if (!settings.dia_api_key.trim()) {
     delete payload.dia_api_key;
   }
 
-  return requestJson<SettingsResponse & { ok: boolean; model_reloaded: boolean; model_loaded: boolean | null }>(
-    "/api/admin/settings",
-    {
-      method: "PUT",
-      body: JSON.stringify(payload),
-    },
-  );
+  return requestJson<SettingsSaveResponse>("/api/admin/settings", {
+    method: "PUT",
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function selectModel(modelId: string) {
+  return requestJson<SettingsSaveResponse>("/api/admin/models/select", {
+    method: "POST",
+    body: JSON.stringify({ model_id: modelId }),
+  });
 }
 
 // Built-in GPU tiers ("32GB VRAM", "24GB VRAM", "24+8 VRAM") plus saved presets. Loading one fills the settings form;
 // Save Settings applies it through the normal PUT. A preset only carries runtime/VRAM keys, never tokens or paths.
+// model_id names the model a preset belongs to, null means it fits every model.
 export type SettingsPreset = {
   name: string;
   built_in: boolean;
@@ -427,6 +457,7 @@ export type SettingsPreset = {
   target_vram_gb?: number | null;
   note?: string | null;
   created_at?: string | null;
+  model_id: string | null;
   values: Partial<AdminSettings>;
 };
 

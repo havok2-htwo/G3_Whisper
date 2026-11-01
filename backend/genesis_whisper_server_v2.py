@@ -23,12 +23,17 @@ from starlette.formparsers import MultiPartException, MultiPartParser
 from .genesis_whisper_server_audio import get_audio_duration_seconds, load_audio_file
 from .genesis_whisper_server_auth import authorize_api_key, get_auth_store, require_admin
 from .genesis_whisper_server_chunking import combine_transcription_chunks, split_audio_for_whisper
-from .genesis_whisper_server_dia_client import DiaClientError, diarize_v2
+from .genesis_whisper_server_dia_client import DiaClientError, dia_is_configured, diarize_v2
 from .genesis_whisper_server_globals import (
+    SUPPORTED_LANGUAGE_OPTIONS,
     SUPPORTED_LANGUAGE_VALUES,
     current_settings,
     get_effective_transcription_language,
+    get_local_model_backend,
+    get_local_model_label,
+    is_local_model_loaded,
     settings_lock,
+    uses_parakeet_backend,
     uses_whole_audio_backend,
 )
 from .genesis_whisper_server_history import append_history_entry, capture_history_audio
@@ -48,7 +53,7 @@ from .genesis_whisper_server_speaker_matching import (
 )
 from .genesis_whisper_server_speaker_audio import build_unknown_speaker_audio_assets
 from .genesis_whisper_server_speaker_refinement import refine_speaker_turns
-from .genesis_whisper_server_storage import log_transcription
+from .genesis_whisper_server_storage import log_transcription, normalize_settings
 from .genesis_whisper_server_turn_gate import finalize_segment_text, prefilter_turns
 from .genesis_whisper_server_wxc import (
     align_chunk_slice,
@@ -68,7 +73,7 @@ from .genesis_whisper_server_vid import EmbeddedVoiceWindow, VoiceWindow, embed_
 
 V2_SCHEMA_VERSION = "2.0"
 V2_REQUEST_JSON_MAX_BYTES = 16 * 1024 * 1024
-V2_MODES = {"embedding", "transcript", "transcript_embedding", "diarization"}
+V2_MODES = ("embedding", "transcript", "transcript_embedding", "diarization")
 SPEAKER_REFINEMENT_MODES = {"off", "shadow", "conservative"}
 MAX_EXPECTED_SPEAKERS = 64
 MAX_TURN_CHUNK_SECONDS = 30.0
@@ -1022,6 +1027,39 @@ async def _process_diarization(
     return result, timings, models, warnings, transcript_text
 
 
+def create_v2_capabilities_api(app: FastAPI) -> FastAPI:
+    @app.get("/v2/capabilities")
+    async def capabilities_v2():
+        with settings_lock:
+            settings_snapshot = current_settings.copy()
+        settings_snapshot = normalize_settings(settings_snapshot)
+        model_id = settings_snapshot["local_model"]
+        configured_language = settings_snapshot["transcription_language"]
+        return {
+            "schema_version": V2_SCHEMA_VERSION,
+            "service": "asr",
+            "model": {
+                "id": model_id,
+                "label": get_local_model_label(model_id),
+                "backend": get_local_model_backend(model_id),
+                "loaded": is_local_model_loaded(model_id),
+            },
+            "language": {
+                "configured": configured_language,
+                "effective": get_effective_transcription_language(model_id, configured_language),
+                "applied": not uses_parakeet_backend(model_id),
+                # The list a request is validated against. It stays global, per-model lists would turn requests
+                # that work today into 422.
+                "options": list(SUPPORTED_LANGUAGE_OPTIONS.values()),
+            },
+            "modes": list(V2_MODES),
+            "embedding": {"id": embedding_model_metadata()["id"]},
+            "diarization": {"configured": dia_is_configured()},
+        }
+
+    return app
+
+
 def create_v2_api(app: FastAPI) -> FastAPI:
     @app.post(
         "/v2/audio/process",
@@ -1232,4 +1270,4 @@ def create_v2_api(app: FastAPI) -> FastAPI:
     return app
 
 
-__all__ = ["create_v2_api"]
+__all__ = ["create_v2_api", "create_v2_capabilities_api"]

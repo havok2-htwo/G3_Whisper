@@ -238,7 +238,7 @@ The server also exposes:
 
 Compatibility notes:
 
-- `GET /v1/models` returns the currently active local model plus the compatibility alias `whisper-1`.
+- `GET /v1/models` returns the currently active local model first, then the compatibility alias `whisper-1`. It needs no key. Clients store `data[0].id`, so the order must not change. Backend, language and load state are on `GET /v2/capabilities`.
 - `POST /v1/audio/transcriptions` routes through the same local transcription backend as `POST /transcribe/`.
 - `response_format` currently changes the output shape (`json`, `text`, `verbose_json`).
 - `model`, `language`, `prompt`, and `temperature` are accepted for client compatibility, but the current implementation does not yet apply them independently from the saved server settings.
@@ -799,6 +799,7 @@ Active admin routes:
 - `DELETE /api/admin/settings/dia-api-key`
 - `POST /api/admin/dia/test`
 - `GET /api/admin/models`
+- `POST /api/admin/models/select`
 - `POST /api/admin/models/download`
 - `POST /api/admin/models/delete`
 - `GET /api/admin/stats`
@@ -814,6 +815,29 @@ fallbacks. The key is write-only in responses, a blank update preserves it, and 
 `DELETE /api/admin/settings/dia-api-key` removes the saved value explicitly. The
 connection test calls the configured DIA `GET /v2/capabilities` endpoint.
 
+### Model Selection
+
+A model selection is the setting `local_model`, one ASR model is resident at a time. The
+order in the admin is: pick the model, then its presets, then its settings.
+
+- `MODEL_SETTINGS_FIELDS` (`backend/genesis_whisper_server_storage.py`) lists the fields each
+  backend really reads, `SERVICE_SETTINGS_FIELDS` the service-wide ones. `GET` and
+  `PUT /api/admin/settings` return them as `model_fields` and `service_fields`.
+- `POST /api/admin/models/select` is the switch. It answers `409` for a model that is not
+  downloaded, keeps the tuned values of each model in `model_profiles`, and on a failed load
+  restores the previous selection and model and returns the real error with HTTP 500.
+- A model selected for the first time starts from the tier it owns (Cohere `24GB VRAM`,
+  Parakeet `Parakeet 8GB VRAM`), a Whisper size keeps the current values. In both cases it
+  takes the old model's effective language, so clients keep getting the same language:
+  `/transcribe/` and `/v1/audio/transcriptions` cannot send one, and Cohere's `auto` means `de`.
+- `model_profiles` is one extra key in the settings file. All other keys stay top-level, so
+  provisioning scripts keep editing them directly, and `PUT` with `local_model` keeps working.
+- The admin form sends `expected_local_model` with `PUT`. When another model became active
+  since the form was loaded, nothing is saved and the answer is `409`, so the old model's values
+  never land on the new one. Callers that omit the field are not checked.
+- `POST /api/admin/models/delete` refuses the active model with `409`.
+- Language validation stays global: a language a model does not use is still a valid request.
+
 Settings presets: the admin settings panel offers the built-in GPU tiers `32GB VRAM`
 (RTX 5090) and `24GB VRAM` (RTX 4090), both with every G3 service on one card, and
 `24+8 VRAM` (Whisper on the 24 GB card of a 3090 + 2070S box; the GPU is picked by card
@@ -821,7 +845,9 @@ size), plus presets saved from the current form. Loading a preset only fills the
 Save Settings applies it. Presets hold only model, device, precision, batching, scheduler
 and VRAM settings, never the token, the DIA connection, the language or the model cache
 path; saved presets live in `logs/genesis_whisper_presets.json`. The tier values were
-measured on the RTX 5090 (see "GPU Tier Presets" below).
+measured on the RTX 5090 (see "GPU Tier Presets" below). A preset belongs to a model: the
+listing derives `model_id` (the three GPU tiers Cohere, `Parakeet 8GB VRAM` Parakeet, saved
+presets their `local_model`, `null` fits every model) and `?model_id=` filters by it.
 
 ### GPU Tier Presets
 
@@ -878,6 +904,7 @@ Active open routes:
 
 - `POST /transcribe/`
 - `POST /v2/audio/process`
+- `GET /v2/capabilities`
 - `GET /v1/models`
 - `POST /v1/audio/transcriptions`
 - `GET /docs`

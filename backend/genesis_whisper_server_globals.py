@@ -122,6 +122,18 @@ def get_local_model_backend(model_id: str) -> str:
     return get_local_model_spec(model_id)["backend"]
 
 
+def get_local_model_label(model_id: str) -> str:
+    for label, spec in LOCAL_ASR_MODEL_SPECS.items():
+        if spec["value"] == model_id:
+            return label
+    return model_id
+
+
+def is_local_model_loaded(model_id: str) -> bool:
+    identifier = local_model_components.get("model_identifier")
+    return bool(identifier) and identifier[0] == model_id and local_model_components.get("model") is not None
+
+
 def uses_whisper_backend(model_id: str) -> bool:
     return get_local_model_backend(model_id) == "whisper"
 

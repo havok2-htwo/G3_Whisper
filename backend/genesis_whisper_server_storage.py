@@ -1,7 +1,7 @@
 import json
 import os
 import sys
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 from dotenv import load_dotenv
 
@@ -47,7 +47,57 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "huggingface_token": "",
     "dia_server_base_url": "",
     "dia_api_key": "",
+    "model_profiles": {},
 }
+
+# Keys a preset may set: model choice, device, precision, batching, scheduler and VRAM behaviour. Machine-specific
+# values (local_model_cache_path), secrets (huggingface_token, dia_api_key), the DIA URL, the transcription language
+# and the debug audio switch stay out, so loading a preset never touches them.
+PRESET_KEYS: Tuple[str, ...] = (
+    "local_model",
+    "local_gpu_device",
+    "local_model_precision",
+    "batch_wait_time_ms",
+    "batch_max_segments",
+    "batch_max_audio_seconds",
+    "scheduler_long_job_min_chunks",
+    "scheduler_max_parallel_long_jobs",
+    "scheduler_first_chunk_fast_path",
+    "cuda_memory_trim_after_batch",
+    "cohere_cuda_graphs",
+    "redimnet_max_batch_size",
+)
+
+# What each model remembers in model_profiles. The device stays out: it belongs to the machine, not to the model.
+MODEL_TUNED_KEYS: Tuple[str, ...] = tuple(
+    key for key in PRESET_KEYS if key not in ("local_model", "local_gpu_device")
+) + ("transcription_language",)
+
+# The admin form per backend, a field is listed only where the code of that backend really reads it. Parakeet's ONNX
+# weights ignore the precision and the engine ignores the language.
+_COMMON_MODEL_FIELDS: Tuple[str, ...] = (
+    "local_gpu_device",
+    "batch_wait_time_ms",
+    "batch_max_segments",
+    "batch_max_audio_seconds",
+    "scheduler_long_job_min_chunks",
+    "scheduler_max_parallel_long_jobs",
+    "scheduler_first_chunk_fast_path",
+    "cuda_memory_trim_after_batch",
+    "redimnet_max_batch_size",
+)
+MODEL_SETTINGS_FIELDS: Dict[str, Tuple[str, ...]] = {
+    "whisper": _COMMON_MODEL_FIELDS + ("local_model_precision", "transcription_language"),
+    "cohere_transcribe": _COMMON_MODEL_FIELDS + ("local_model_precision", "transcription_language", "cohere_cuda_graphs"),
+    "parakeet": _COMMON_MODEL_FIELDS,
+}
+SERVICE_SETTINGS_FIELDS: Tuple[str, ...] = (
+    "local_model_cache_path",
+    "huggingface_token",
+    "dia_server_base_url",
+    "dia_api_key",
+    "debug_retain_history_audio",
+)
 
 
 def resolve_dia_server_config(settings: Optional[Dict[str, Any]] = None) -> Dict[str, str]:
@@ -91,6 +141,34 @@ def normalize_redimnet_max_batch_size(value: Any) -> int:
         return DEFAULT_SETTINGS["redimnet_max_batch_size"]
     allowed = [size for size in REDIMNET_MAX_BATCH_SIZE_VALUES if size <= configured]
     return max(allowed) if allowed else REDIMNET_MAX_BATCH_SIZE_VALUES[0]
+
+
+def model_profile_values(settings: Dict[str, Any]) -> Dict[str, Any]:
+    return {key: settings[key] for key in MODEL_TUNED_KEYS if key in settings}
+
+
+def with_model_profiles(settings: Dict[str, Any], *sources: Dict[str, Any]) -> Dict[str, Any]:
+    """settings with the tuned values of each source stored under that source's local_model, later sources win."""
+    profiles = dict(settings.get("model_profiles") or {})
+    for source in sources:
+        profiles[source["local_model"]] = model_profile_values(source)
+    return {**settings, "model_profiles": profiles}
+
+
+def _normalize_model_profiles(profiles: Any) -> Dict[str, Dict[str, Any]]:
+    """Known model ids only, each value checked exactly like a saved setting."""
+    if not isinstance(profiles, dict):
+        return {}
+    valid_models = set(LOCAL_ASR_MODEL_MAP.values())
+    normalized: Dict[str, Dict[str, Any]] = {}
+    for model_id, values in profiles.items():
+        if model_id not in valid_models or not isinstance(values, dict):
+            continue
+        sent = model_profile_values(values)
+        checked = normalize_settings(sent)
+        if sent:
+            normalized[model_id] = {key: checked[key] for key in sent}
+    return normalized
 
 
 def normalize_settings(settings: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -188,6 +266,8 @@ def normalize_settings(settings: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         if isinstance(configured_history_audio_debug, bool)
         else DEFAULT_SETTINGS["debug_retain_history_audio"]
     )
+
+    normalized["model_profiles"] = _normalize_model_profiles(source.get("model_profiles"))
 
     return normalized
 

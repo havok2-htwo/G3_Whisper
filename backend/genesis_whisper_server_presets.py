@@ -14,6 +14,9 @@ local_gpu_device when the list is built: the CUDA device whose memory matches (m
 differently), see resolve_presets.
 
 User presets live in logs/genesis_whisper_presets.json next to the settings file; they cannot reuse a built-in name.
+
+A preset belongs to a model selection: built-ins through BUILTIN_PRESET_MODELS, user presets through values.local_model,
+without one it fits every model. The listing derives this as model_id, the stored format does not change.
 """
 from __future__ import annotations
 
@@ -27,32 +30,14 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from . import genesis_whisper_server_globals as whisper_globals
 from . import genesis_whisper_server_storage as storage
-from .genesis_whisper_server_globals import LOGS_DIR
-from .genesis_whisper_server_storage import normalize_settings
+from .genesis_whisper_server_globals import LOGS_DIR, get_effective_transcription_language
+from .genesis_whisper_server_storage import MODEL_TUNED_KEYS, PRESET_KEYS, normalize_settings
 
 PRESETS_FILE = os.path.join(LOGS_DIR, "genesis_whisper_presets.json")
 # A fresh install (no saved settings yet) starts with this tier; the same in every G3 service. It is a single-card
 # tier, so it never sets local_gpu_device; the two-card tier is never applied automatically.
 FIRST_START_PRESET = "24GB VRAM"
 PRESET_NAME_MAX_LENGTH = 64
-
-# Keys a preset may set: model choice, device, precision, batching, scheduler and VRAM behaviour. Machine-specific
-# values (local_model_cache_path), secrets (huggingface_token, dia_api_key), the DIA URL, the transcription language
-# and the debug audio switch stay out, so loading a preset never touches them.
-PRESET_KEYS: Tuple[str, ...] = (
-    "local_model",
-    "local_gpu_device",
-    "local_model_precision",
-    "batch_wait_time_ms",
-    "batch_max_segments",
-    "batch_max_audio_seconds",
-    "scheduler_long_job_min_chunks",
-    "scheduler_max_parallel_long_jobs",
-    "scheduler_first_chunk_fast_path",
-    "cuda_memory_trim_after_batch",
-    "cohere_cuda_graphs",
-    "redimnet_max_batch_size",
-)
 
 # Tolerance when matching a preset's card size to a detected card (a "24 GB" card reports ~23.6-24.0 GiB).
 CARD_MATCH_TOLERANCE_MIB = 2048
@@ -117,6 +102,20 @@ BUILTIN_PRESETS: Dict[str, Dict[str, Any]] = {
             "redimnet_max_batch_size": 2,
         },
     },
+}
+
+# The model a built-in was measured on. A map, not a key in `values`: loading a tier fills the form, and the three GPU
+# tiers must keep leaving the model choice alone.
+BUILTIN_PRESET_MODELS: Dict[str, str] = {
+    "32GB VRAM": whisper_globals.COHERE_MODEL_ID,
+    "24GB VRAM": whisper_globals.COHERE_MODEL_ID,
+    "24+8 VRAM": whisper_globals.COHERE_MODEL_ID,
+    "Parakeet 8GB VRAM": whisper_globals.PARAKEET_MODEL_ID,
+}
+# The tier a model starts from the first time it is selected. The two-card tier never applies by itself.
+MODEL_START_PRESETS: Dict[str, str] = {
+    whisper_globals.COHERE_MODEL_ID: FIRST_START_PRESET,
+    whisper_globals.PARAKEET_MODEL_ID: "Parakeet 8GB VRAM",
 }
 
 _lock = threading.RLock()
@@ -197,8 +196,11 @@ def _match_card(target_gb: Optional[int], cards_mib: List[int]) -> Tuple[Optiona
     return None, f"No {target_gb} GB card detected (cards: {detected}); the GPU setting is left unchanged."
 
 
-def resolve_presets() -> List[Dict[str, Any]]:
-    """Built-ins first (in tier order), then user presets by name. Built-ins with a card size get local_gpu_device."""
+def resolve_presets(model_id: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Built-ins first (in tier order), then user presets by name. Built-ins with a card size get local_gpu_device.
+
+    With model_id only the presets of that model plus those without a model (usable for every model).
+    """
     cards_mib = _cuda_cards_mib()
     result: List[Dict[str, Any]] = []
     for name, preset in BUILTIN_PRESETS.items():
@@ -213,6 +215,7 @@ def resolve_presets() -> List[Dict[str, Any]]:
                 "description": preset.get("description", ""),
                 "target_vram_gb": preset.get("target_vram_gb"),
                 "note": note,
+                "model_id": BUILTIN_PRESET_MODELS.get(name),
                 "values": values,
             }
         )
@@ -228,10 +231,29 @@ def resolve_presets() -> List[Dict[str, Any]]:
                 "target_vram_gb": None,
                 "created_at": entry.get("created_at"),
                 "note": None,
+                "model_id": entry["values"].get("local_model"),
                 "values": entry["values"],
             }
         )
+    if model_id:
+        return [preset for preset in result if preset["model_id"] in (None, model_id)]
     return result
+
+
+def model_selection_values(settings: Dict[str, Any], model_id: str) -> Dict[str, Any]:
+    """Tuned values for model_id replacing the model of settings: its profile, else its start tier, else nothing.
+
+    Clients cannot send a language on /transcribe/ and /v1, so without a saved language the new model takes the one
+    the old model really used: Cohere with "auto" runs German, a Whisper model must not start detecting instead.
+    """
+    start_preset = BUILTIN_PRESETS.get(MODEL_START_PRESETS.get(model_id, ""), {})
+    source = settings.get("model_profiles", {}).get(model_id) or start_preset.get("values", {})
+    values = {key: source[key] for key in MODEL_TUNED_KEYS if key in source}
+    values.setdefault(
+        "transcription_language",
+        get_effective_transcription_language(settings["local_model"], settings["transcription_language"]),
+    )
+    return values
 
 
 def save_user_preset(name: str, values: Dict[str, Any]) -> Dict[str, Any]:
@@ -253,6 +275,7 @@ def save_user_preset(name: str, values: Dict[str, Any]) -> Dict[str, Any]:
         "target_vram_gb": None,
         "created_at": created,
         "note": None,
+        "model_id": cleaned.get("local_model"),
         "values": cleaned,
     }
 

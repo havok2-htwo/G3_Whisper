@@ -175,6 +175,15 @@ def _effective_config() -> tuple[str, str]:
     return base_url, api_key
 
 
+def dia_is_configured() -> bool:
+    """A usable DIA URL exists, the same check a diarization request makes. Says nothing about that server being up."""
+    try:
+        _effective_config()
+    except DiaClientError:
+        return False
+    return True
+
+
 async def diarize_v2(
     audio_file: BinaryIO,
     filename: str,

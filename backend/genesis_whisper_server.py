@@ -18,7 +18,7 @@ from .genesis_whisper_server_globals import current_settings
 from .genesis_whisper_server_history import reset_history_audio_store, shutdown_history_audio_store
 from .genesis_whisper_server_gpu import run_blocking_gpu_phase
 from .genesis_whisper_server_presets import FIRST_START_PRESET, load_settings_or_first_start_preset
-from .genesis_whisper_server_v2 import create_v2_api
+from .genesis_whisper_server_v2 import create_v2_api, create_v2_capabilities_api
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 FRONTEND_DIST_DIR = PROJECT_ROOT / "frontend" / "dist"
@@ -187,6 +187,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="GENESIS Transcription Server API", lifespan=lifespan)
 app = create_api(app)
 app = create_v2_api(app)
+app = create_v2_capabilities_api(app)
 app = create_admin_api(app)
 
 

@@ -1,6 +1,7 @@
-import { FormEvent, startTransition, useEffect, useState } from "react";
+import { FormEvent, startTransition, useEffect, useRef, useState } from "react";
 
 import {
+  ACTIVE_MODEL_CHANGED,
   AdminOption,
   AdminSettings,
   AudioProcessMode,
@@ -14,6 +15,7 @@ import {
   QueueResponse,
   SettingsPreset,
   SettingsResponse,
+  SettingsSaveResponse,
   SpeakerRefinementMode,
   StatsResponse,
   UnknownSpeakerAudio,
@@ -38,6 +40,7 @@ import {
   runBenchmark,
   savePreset,
   saveSettings,
+  selectModel,
   testDiaConnection,
   whoami,
 } from "./api";
@@ -224,6 +227,13 @@ function formatModelStatus(status: string) {
     return "Error";
   }
   return "Missing";
+}
+
+function formatBackendLabel(backend: string) {
+  if (backend === "cohere_transcribe") {
+    return "Cohere";
+  }
+  return backend === "parakeet" ? "Parakeet (ONNX)" : "Whisper";
 }
 
 function resolveModelPath(model: ManagedModel) {
@@ -513,6 +523,103 @@ async function copyTextToClipboard(value: string) {
   document.body.removeChild(textArea);
 }
 
+// Puts what the admin typed on top of fresh server values. A field counts as typed when it differs from what the
+// server sent last, so everything else follows the server. onlyFields limits which typed values survive.
+function keepUnsavedEdits(form: AdminSettings, baseline: AdminSettings, next: AdminSettings, onlyFields?: string[]) {
+  const merged: Record<string, unknown> = { ...next };
+  for (const key of Object.keys(form) as Array<keyof AdminSettings>) {
+    if (form[key] !== baseline[key] && (!onlyFields || onlyFields.includes(key))) {
+      merged[key] = form[key];
+    }
+  }
+  return merged as AdminSettings;
+}
+
+type ModelPickerProps = {
+  models: ManagedModel[];
+  locked: boolean;
+  selectingModelId: string | null;
+  startingDownloadId: string | null;
+  message: string;
+  messageFailed: boolean;
+  onLoad: (model: ManagedModel) => void;
+  onDownload: (model: ManagedModel) => void;
+};
+
+function ModelPicker({
+  models,
+  locked,
+  selectingModelId,
+  startingDownloadId,
+  message,
+  messageFailed,
+  onLoad,
+  onDownload,
+}: ModelPickerProps) {
+  const backends = Array.from(new Set(models.map((model) => model.backend)));
+  return (
+    <div className="preset-settings model-picker">
+      <span className="eyebrow">Step 1: Model</span>
+      <p className="field-note preset-copy">
+        The service runs one ASR model. Load model switches it right away and brings that model's saved settings
+        along; the presets and settings below always belong to the active model.
+      </p>
+      {backends.map((backend) => (
+        <div className="model-picker-group" key={backend}>
+          <h3>{formatBackendLabel(backend)}</h3>
+          {models
+            .filter((model) => model.backend === backend)
+            .map((model) => {
+              const isDownloading = model.status === "downloading";
+              const isSelecting = selectingModelId === model.id;
+              return (
+                <div className={`model-picker-row ${model.active ? "active" : ""}`} key={model.id}>
+                  <div className="model-picker-name">
+                    <strong>{model.label}</strong>
+                    <div className="muted mono model-id">{model.id}</div>
+                    {model.error && <span className="model-status-error">{model.error}</span>}
+                  </div>
+                  <div className="model-picker-markers">
+                    <span className="connection-status">{formatModelStatus(model.status)}</span>
+                    {model.active && <span className="connection-status configured">Active</span>}
+                    {model.loaded && <span className="connection-status configured">Loaded</span>}
+                    {model.active && !model.loaded && <span className="connection-status">Not loaded</span>}
+                  </div>
+                  {model.status === "ready" ? (
+                    !(model.active && model.loaded) && (
+                      <button
+                        type="button"
+                        className="secondary-button"
+                        onClick={() => onLoad(model)}
+                        disabled={locked}
+                      >
+                        {isSelecting ? "Loading..." : "Load model"}
+                      </button>
+                    )
+                  ) : (
+                    <button
+                      type="button"
+                      className="secondary-button"
+                      onClick={() => onDownload(model)}
+                      disabled={isDownloading || startingDownloadId === model.id}
+                    >
+                      {isDownloading
+                        ? "Downloading..."
+                        : startingDownloadId === model.id
+                          ? "Starting..."
+                          : "Download"}
+                    </button>
+                  )}
+                </div>
+              );
+            })}
+        </div>
+      ))}
+      {message && <p className={`message ${messageFailed ? "error" : ""}`}>{message}</p>}
+    </div>
+  );
+}
+
 export default function App() {
   const [authState, setAuthState] = useState<AuthState>("loading");
   const [currentUser, setCurrentUser] = useState("");
@@ -536,12 +643,16 @@ export default function App() {
   const [actionMessage, setActionMessage] = useState("");
   const [globalError, setGlobalError] = useState("");
   const [settingsForm, setSettingsForm] = useState<AdminSettings>(emptySettings);
-  const [settingsOptions, setSettingsOptions] = useState<{ models: AdminOption[]; devices: AdminOption[]; precisions: AdminOption[]; languages: AdminOption[] }>({
+  // What the server sent last. The form differs from it exactly where the admin has unsaved edits.
+  const settingsBaseline = useRef<AdminSettings>(emptySettings);
+  const [settingsOptions, setSettingsOptions] = useState<SettingsResponse["options"]>({
     models: [],
     devices: [],
     precisions: [],
     languages: [],
   });
+  const [modelFields, setModelFields] = useState<Record<string, string[]>>({});
+  const [serviceFields, setServiceFields] = useState<string[]>([]);
   const [managedModels, setManagedModels] = useState<ManagedModel[]>([]);
   const [loadedModelIdentifier, setLoadedModelIdentifier] = useState<string[] | null>(null);
   const [stats, setStats] = useState<StatsResponse | null>(null);
@@ -576,16 +687,26 @@ export default function App() {
   const [pipelineJsonExpanded, setPipelineJsonExpanded] = useState(false);
   const [modelActionId, setModelActionId] = useState<string | null>(null);
   const [modelActionKind, setModelActionKind] = useState<"refresh" | "download" | "delete" | null>(null);
+  const [selectingModelId, setSelectingModelId] = useState<string | null>(null);
+  const [modelSelectMessage, setModelSelectMessage] = useState("");
+  const [modelSelectFailed, setModelSelectFailed] = useState(false);
   const [historyActions, setHistoryActions] = useState<Record<string, HistoryActionKind>>({});
   const [historyActionErrors, setHistoryActionErrors] = useState<Record<string, string>>({});
   const hasDownloadingModels = managedModels.some((model) => model.status === "downloading");
   const isReady = authState === "ready";
+  const modelSelectRunning = selectingModelId !== null;
+  const activeModelOption = settingsOptions.models.find((option) => option.value === settingsForm.local_model);
+  const activeModelFields = activeModelOption ? (modelFields[activeModelOption.backend] ?? []) : [];
+  const modelPresets = presets.filter(
+    (preset) => preset.model_id == null || preset.model_id === settingsForm.local_model,
+  );
 
   function resetDashboardState() {
     startTransition(() => {
       setStats(null);
       setQueue(null);
       setDashboardHistory([]);
+      settingsBaseline.current = emptySettings;
       setSettingsForm(emptySettings);
       setPresets([]);
       setPresetName("");
@@ -594,6 +715,8 @@ export default function App() {
       setManagedModels([]);
       setLoadedModelIdentifier(null);
       setSettingsOptions({ models: [], devices: [], precisions: [], languages: [] });
+      setModelFields({});
+      setServiceFields([]);
       setApiKeys([]);
       setCreatedKey(null);
       setSaveMessage("");
@@ -617,6 +740,9 @@ export default function App() {
       setPipelineJsonExpanded(false);
       setModelActionId(null);
       setModelActionKind(null);
+      setSelectingModelId(null);
+      setModelSelectMessage("");
+      setModelSelectFailed(false);
       setHistoryActions({});
       setHistoryActionErrors({});
       setActionMessage("");
@@ -641,7 +767,7 @@ export default function App() {
     return false;
   }
 
-  async function loadDashboard() {
+  async function loadDashboard(keepEdits?: "all") {
     try {
       const [settingsResponse, statsResponse, queueResponse, keysResponse] = await Promise.all([
         getSettings(),
@@ -650,7 +776,7 @@ export default function App() {
         listApiKeys(),
       ]);
       startTransition(() => {
-        applySettings(settingsResponse);
+        applySettings(settingsResponse, keepEdits);
         setStats(statsResponse);
         setQueue(queueResponse);
         setApiKeys(keysResponse.keys);
@@ -676,7 +802,7 @@ export default function App() {
   }
 
   function handleLoadPreset() {
-    const preset = presets.find((entry) => entry.name === presetName);
+    const preset = modelPresets.find((entry) => entry.name === presetName);
     if (!preset) {
       return;
     }
@@ -693,6 +819,12 @@ export default function App() {
   async function handleSavePreset() {
     const name = presetName.trim();
     if (!name) {
+      return;
+    }
+    // Presets of other models are not listed here, saving would silently take that preset over.
+    if (presets.some((entry) => entry.name === name && !modelPresets.includes(entry))) {
+      setPresetMessage(`The name "${name}" is already used by a preset of another model.`);
+      setPresetFailed(true);
       return;
     }
     setPresetBusy(true);
@@ -715,7 +847,7 @@ export default function App() {
   }
 
   async function handleDeletePreset() {
-    const preset = presets.find((entry) => entry.name === presetName);
+    const preset = modelPresets.find((entry) => entry.name === presetName);
     if (!preset || preset.built_in) {
       return;
     }
@@ -741,11 +873,20 @@ export default function App() {
     }
   }
 
-  function applySettings(payload: SettingsResponse) {
-    setSettingsForm({ ...emptySettings, ...payload.settings, dia_api_key: "" });
+  function applySettings(payload: SettingsResponse, keepEdits?: "all" | "service") {
+    const next = { ...emptySettings, ...payload.settings, dia_api_key: "" };
+    const baseline = settingsBaseline.current;
+    settingsBaseline.current = next;
+    setSettingsForm((current) =>
+      keepEdits
+        ? keepUnsavedEdits(current, baseline, next, keepEdits === "service" ? payload.service_fields : undefined)
+        : next,
+    );
     setSettingsOptions(payload.options);
     setManagedModels(payload.models ?? []);
     setLoadedModelIdentifier(payload.loaded_model_identifier);
+    setModelFields(payload.model_fields ?? {});
+    setServiceFields(payload.service_fields ?? []);
   }
 
   async function refreshOperationalData() {
@@ -864,6 +1005,12 @@ export default function App() {
     }, DASHBOARD_POLL_SECONDS * 1000);
     return () => window.clearInterval(intervalId);
   }, [authState]);
+
+  useEffect(() => {
+    setPresetName("");
+    setPresetMessage("");
+    setPresetFailed(false);
+  }, [settingsForm.local_model]);
 
   useEffect(() => {
     if (!isReady || !stats || !queue) {
@@ -985,6 +1132,16 @@ export default function App() {
     }
   }
 
+  function describeSaveResult(response: SettingsSaveResponse) {
+    if (!response.model_reloaded) {
+      return "Settings saved.";
+    }
+    if (response.model_loaded) {
+      return "Settings saved. Model reload succeeded.";
+    }
+    return `Settings saved. Model reload failed: ${response.load_error ?? "no cause reported."}`;
+  }
+
   async function handleSaveSettings(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setSaveBusy(true);
@@ -994,20 +1151,40 @@ export default function App() {
       const response = await saveSettings(settingsForm);
       startTransition(() => {
         applySettings(response);
-        setSaveMessage(
-          response.model_reloaded
-            ? `Settings saved. Model reload ${response.model_loaded ? "succeeded" : "failed"}.`
-            : "Settings saved.",
-        );
+        setSaveMessage(describeSaveResult(response));
       });
       await refreshOperationalData();
     } catch (error) {
+      if (error instanceof Error && error.message === ACTIVE_MODEL_CHANGED) {
+        await reloadFormForActiveModel();
+        return;
+      }
       if (handleApiError(error, "Saving settings failed.")) {
         return;
       }
       setSaveMessage(error instanceof Error ? error.message : "Saving settings failed.");
     } finally {
       setSaveBusy(false);
+    }
+  }
+
+  async function reloadFormForActiveModel() {
+    try {
+      const response = await getSettings();
+      const activeModel = response.options.models.find((option) => option.value === response.settings.local_model);
+      startTransition(() => {
+        // The model settings in the form belong to the old model, service-wide edits are not tied to a model.
+        applySettings(response, "service");
+        setSaveMessage(
+          `Nothing was saved: ${activeModel?.label ?? response.settings.local_model} was selected in another session. `
+            + "The form now shows its settings, review them and save again.",
+        );
+      });
+    } catch (error) {
+      if (handleApiError(error, "The settings could not be reloaded.")) {
+        return;
+      }
+      setSaveMessage(error instanceof Error ? error.message : "The settings could not be reloaded.");
     }
   }
 
@@ -1129,6 +1306,55 @@ export default function App() {
     } finally {
       setModelActionId(null);
       setModelActionKind(null);
+    }
+  }
+
+  async function handleSelectModel(model: ManagedModel) {
+    const hasUnsavedModelEdits = (Object.keys(settingsForm) as Array<keyof AdminSettings>).some(
+      (key) => settingsForm[key] !== settingsBaseline.current[key] && !serviceFields.includes(key),
+    );
+    if (
+      hasUnsavedModelEdits
+      && !window.confirm(`Loading ${model.label} discards the unsaved model settings in the form. Continue?`)
+    ) {
+      return;
+    }
+
+    setSelectingModelId(model.id);
+    setModelSelectMessage("");
+    setModelSelectFailed(false);
+    setSaveMessage("");
+
+    try {
+      const response = await selectModel(model.id);
+      startTransition(() => {
+        // The target's own values replace the model settings, service-wide edits are not tied to a model.
+        applySettings(response, "service");
+        // Selecting the active model again is a no-op on the server, so "not loaded" here means nothing was retried.
+        setModelSelectFailed(!response.model_loaded);
+        setModelSelectMessage(
+          response.model_loaded
+            ? `${model.label} is loaded.`
+            : `${model.label} is selected but not loaded. ${response.load_error ?? "It loads with the next request."}`,
+        );
+      });
+      await refreshOperationalData();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "The model could not be loaded.";
+      if (message === "unauthorized" || message === "password_change_required") {
+        handleApiError(error, message);
+        return;
+      }
+      setModelSelectMessage(message);
+      setModelSelectFailed(true);
+      // On a failed load the server restored the old selection, the picker has to show what really runs now.
+      try {
+        applySettings(await getSettings(), "all");
+      } catch {
+        // The selection error above is the one the admin needs.
+      }
+    } finally {
+      setSelectingModelId(null);
     }
   }
 
@@ -1400,10 +1626,30 @@ export default function App() {
   const recentJobs = (queue?.recent_jobs ?? []) as JobEntry[];
   const queueJobs = queue?.jobs ?? [];
   const latestBatchRealtime = computeBatchRealtime(recentBatches[0]);
-  const selectedPreset = presets.find((preset) => preset.name === presetName);
+  const selectedPreset = modelPresets.find((preset) => preset.name === presetName);
   const configuredDeviceLabel = resolveOptionLabel(settingsOptions.devices, settingsForm.local_gpu_device, "Auto");
-  const configuredLanguageLabel = resolveOptionLabel(settingsOptions.languages, settingsForm.transcription_language, "Auto");
-  const loadedModelLabel = loadedModelIdentifier ? loadedModelIdentifier.join(" | ") : "No model loaded";
+  const configuredLanguageLabel =
+    activeModelOption && !activeModelFields.includes("transcription_language")
+      ? "Not used by this model"
+      : resolveOptionLabel(settingsOptions.languages, settingsForm.transcription_language, "Auto");
+  // The server identifies a loaded model as (model id, device, cache path, precision).
+  const [loadedModelId, loadedDevice, , loadedPrecision] = loadedModelIdentifier ?? [];
+  const loadedModelOption = settingsOptions.models.find((option) => option.value === loadedModelId);
+  const loadedModelLabel = loadedModelId ? (loadedModelOption?.label ?? loadedModelId) : "No model loaded";
+  const loadedModelUsesPrecision = loadedModelOption
+    && modelFields[loadedModelOption.backend]?.includes("local_model_precision");
+  const loadedModelDetails = loadedModelId && (
+    <>
+      <small className="loaded-model-detail">
+        Device: {resolveOptionLabel(settingsOptions.devices, loadedDevice, "Auto")}
+      </small>
+      {loadedModelUsesPrecision && (
+        <small className="loaded-model-detail">
+          Precision: {resolveOptionLabel(settingsOptions.precisions, loadedPrecision)}
+        </small>
+      )}
+    </>
+  );
 
   return (
     <main className="shell">
@@ -1416,7 +1662,12 @@ export default function App() {
             private Whisper control surface.
           </p>
           <div className="hero-actions">
-            <button type="button" className="secondary-button" onClick={() => void loadDashboard()}>
+            <button
+              type="button"
+              className="secondary-button"
+              onClick={() => void loadDashboard("all")}
+              disabled={modelSelectRunning}
+            >
               Refresh
             </button>
             <button type="button" className="ghost-button" onClick={() => void handleLogout()}>
@@ -1429,6 +1680,7 @@ export default function App() {
           <div className="status-pill">
             <span>Loaded Model</span>
             <strong>{loadedModelLabel}</strong>
+            {loadedModelDetails}
           </div>
           <div className="status-pill">
             <span>GPU</span>
@@ -2144,388 +2396,447 @@ export default function App() {
           <div className="section-heading">
             <div>
               <span className="eyebrow">Settings</span>
-              <h2>ASR, DIA, Language, and Batch Limits</h2>
+              <h2>ASR Model, Presets, and Settings</h2>
             </div>
             <div className="loaded-model">
               <span>Loaded Model</span>
               <strong>{loadedModelLabel}</strong>
+              {loadedModelDetails}
             </div>
           </div>
 
-          <div className="settings-form preset-settings">
-            <div className="full-width">
-              <span className="eyebrow">Presets</span>
-              <p className="field-note preset-copy">
-                Built-in GPU tiers: 32GB VRAM (RTX 5090) and 24GB VRAM (RTX 4090) with every G3 service on one card;
-                24+8 VRAM runs Whisper on the 24 GB card of a two-GPU box (the GPU is picked by card size). Loading
-                fills the form below; Save Settings applies it.
+          <ModelPicker
+            models={managedModels}
+            locked={modelSelectRunning || saveBusy}
+            selectingModelId={selectingModelId}
+            startingDownloadId={modelActionKind === "download" ? modelActionId : null}
+            message={modelSelectMessage}
+            messageFailed={modelSelectFailed}
+            onLoad={(model) => void handleSelectModel(model)}
+            onDownload={(model) => void handleDownloadModel(model)}
+          />
+
+          <fieldset className="settings-lock" disabled={modelSelectRunning}>
+            <div className="settings-form preset-settings">
+              <div className="full-width">
+                <span className="eyebrow">Step 2: Presets</span>
+                <p className="field-note preset-copy">
+                  Only presets of the active model are listed. Cohere Transcribe has the built-in GPU tiers 32GB VRAM
+                  (RTX 5090) and 24GB VRAM (RTX 4090) with every G3 service on one card, and 24+8 VRAM on the 24 GB
+                  card of a two-GPU box (the GPU is picked by card size). Parakeet has Parakeet 8GB VRAM. Whisper
+                  models have no built-in tier. Loading fills the form below; Save Settings applies it.
+                </p>
+              </div>
+              <label>
+                <span>Preset</span>
+                <select value={selectedPreset ? presetName : ""} onChange={(event) => setPresetName(event.target.value)}>
+                  <option value="">(choose)</option>
+                  {modelPresets.map((preset) => (
+                    <option key={preset.name} value={preset.name}>
+                      {preset.built_in ? `${preset.name} (built-in)` : preset.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                <span>Save the Current Form As</span>
+                <input
+                  value={presetName}
+                  maxLength={64}
+                  placeholder="preset name"
+                  onChange={(event) => setPresetName(event.target.value)}
+                />
+              </label>
+              {selectedPreset?.description && <p className="field-note full-width">{selectedPreset.description}</p>}
+              {selectedPreset?.note && <p className="message error full-width">{selectedPreset.note}</p>}
+              <p className="field-note full-width">
+                Built-in names cannot be overwritten. A saved preset belongs to the active model. It stores only model,
+                device, precision, batching and VRAM settings; the model cache path, the language, the Hugging Face
+                token and the DIA connection are never stored in a preset.
               </p>
+              <div className="button-row full-width">
+                <button
+                  type="button"
+                  className="secondary-button"
+                  onClick={handleLoadPreset}
+                  disabled={!selectedPreset || presetBusy || saveBusy}
+                >
+                  Load into Form
+                </button>
+                <button
+                  type="button"
+                  className="secondary-button"
+                  onClick={() => void handleSavePreset()}
+                  disabled={!presetName.trim() || selectedPreset?.built_in === true || presetBusy}
+                >
+                  {presetBusy ? "Working..." : "Save as Preset"}
+                </button>
+                <button
+                  type="button"
+                  className="ghost-button danger-button"
+                  onClick={() => void handleDeletePreset()}
+                  disabled={!selectedPreset || selectedPreset.built_in || presetBusy}
+                >
+                  Delete Preset
+                </button>
+              </div>
+              {presetMessage && <p className={`message full-width ${presetFailed ? "error" : ""}`}>{presetMessage}</p>}
             </div>
-            <label>
-              <span>Preset</span>
-              <select value={selectedPreset ? presetName : ""} onChange={(event) => setPresetName(event.target.value)}>
-                <option value="">(choose)</option>
-                {presets.map((preset) => (
-                  <option key={preset.name} value={preset.name}>
-                    {preset.built_in ? `${preset.name} (built-in)` : preset.name}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <label>
-              <span>Save the Current Form As</span>
-              <input
-                value={presetName}
-                maxLength={64}
-                placeholder="preset name"
-                onChange={(event) => setPresetName(event.target.value)}
-              />
-            </label>
-            {selectedPreset?.description && <p className="field-note full-width">{selectedPreset.description}</p>}
-            {selectedPreset?.note && <p className="message error full-width">{selectedPreset.note}</p>}
-            <p className="field-note full-width">
-              Built-in names cannot be overwritten. A preset stores only model, device, precision, batching and VRAM
-              settings; the model cache path, the language, the Hugging Face token and the DIA connection are never
-              stored in a preset.
-            </p>
-            <div className="button-row full-width">
-              <button
-                type="button"
-                className="secondary-button"
-                onClick={handleLoadPreset}
-                disabled={!selectedPreset || presetBusy || saveBusy}
-              >
-                Load into Form
-              </button>
-              <button
-                type="button"
-                className="secondary-button"
-                onClick={() => void handleSavePreset()}
-                disabled={!presetName.trim() || selectedPreset?.built_in === true || presetBusy}
-              >
-                {presetBusy ? "Working..." : "Save as Preset"}
-              </button>
-              <button
-                type="button"
-                className="ghost-button danger-button"
-                onClick={() => void handleDeletePreset()}
-                disabled={!selectedPreset || selectedPreset.built_in || presetBusy}
-              >
-                Delete Preset
-              </button>
-            </div>
-            {presetMessage && <p className={`message full-width ${presetFailed ? "error" : ""}`}>{presetMessage}</p>}
-          </div>
 
-          <form className="settings-form" onSubmit={handleSaveSettings}>
-            <label>
-              <span>ASR Model</span>
-              <select
-                value={settingsForm.local_model}
-                onChange={(event) => updateSetting("local_model", event.target.value)}
-              >
-                {settingsOptions.models.map((option) => (
-                  <option key={option.value} value={option.value}>
-                    {option.label}
-                  </option>
-                ))}
-              </select>
-            </label>
-
-            <label>
-              <span>Device</span>
-              <select
-                value={settingsForm.local_gpu_device}
-                onChange={(event) => updateSetting("local_gpu_device", event.target.value)}
-              >
-                {settingsOptions.devices.map((option) => (
-                  <option key={option.value} value={option.value}>
-                    {option.label}
-                  </option>
-                ))}
-              </select>
-            </label>
-
-            <label>
-              <span>Language</span>
-              <select
-                value={settingsForm.transcription_language}
-                onChange={(event) => updateSetting("transcription_language", event.target.value)}
-              >
-                {settingsOptions.languages.map((option) => (
-                  <option key={option.value} value={option.value}>
-                    {option.label}
-                  </option>
-                ))}
-              </select>
-            </label>
-
-            <label>
-              <span>Precision</span>
-              <select
-                value={settingsForm.local_model_precision}
-                onChange={(event) => updateSetting("local_model_precision", event.target.value)}
-              >
-                {settingsOptions.precisions.map((option) => (
-                  <option key={option.value} value={option.value}>
-                    {option.label}
-                  </option>
-                ))}
-              </select>
-            </label>
-
-            <label className="full-width">
-              <span>Cache Path</span>
-              <input
-                value={settingsForm.local_model_cache_path}
-                onChange={(event) => updateSetting("local_model_cache_path", event.target.value)}
-              />
-            </label>
-
-            <label className="full-width">
-              <span>Hugging Face Token</span>
-              <input
-                type="password"
-                placeholder="hf_... (optional)"
-                value={settingsForm.huggingface_token}
-                onChange={(event) => updateSetting("huggingface_token", event.target.value)}
-              />
-            </label>
-            <p className="field-note full-width">
-              Used for gated ASR models such as Cohere Transcribe (the default model). Accept its license on{" "}
-              <a href="https://huggingface.co/CohereLabs/cohere-transcribe-03-2026" target="_blank" rel="noreferrer">
-                Hugging Face
-              </a>{" "}
-              with the account that owns this token. Save the settings to persist it; the current typed value is also
-              sent with manual model downloads from the Cache Manager.
-            </p>
-
-            <div className="dia-settings full-width">
-              <div className="settings-subheading">
-                <div>
-                  <span className="eyebrow">DIA Integration</span>
-                  <h3>Diarization Server</h3>
-                </div>
-                <span className={`connection-status ${settingsForm.dia_api_key_configured ? "configured" : ""}`}>
-                  {settingsForm.dia_api_key_configured
-                    ? `API key: ${settingsForm.dia_api_key_source}`
-                    : "No API key configured"}
-                </span>
+            <form className="settings-form" onSubmit={handleSaveSettings}>
+              <div className="full-width">
+                <span className="eyebrow">Step 3: Settings</span>
+                <p className="field-note preset-copy">
+                  Settings of {activeModelOption?.label ?? "the active model"}. Each model keeps its own values.
+                </p>
               </div>
 
-              <div className="dia-settings-grid">
-                <label className="full-width">
-                  <span>DIA Server URL</span>
-                  <input
-                    type="url"
-                    placeholder={settingsForm.dia_server_base_url_effective || "http://127.0.0.1:7864"}
-                    value={settingsForm.dia_server_base_url}
-                    onChange={(event) => updateSetting("dia_server_base_url", event.target.value)}
-                  />
-                </label>
-                {settingsForm.dia_server_base_url_source === "environment" && !settingsForm.dia_server_base_url && (
-                  <p className="field-note full-width">
-                    Using <code>{settingsForm.dia_server_base_url_effective}</code> from <code>DIA_SERVER_BASE_URL</code>.
-                  </p>
-                )}
-                {settingsForm.dia_server_base_url_source === "default" && !settingsForm.dia_server_base_url && (
-                  <p className="field-note full-width">
-                    Empty: using the default <code>{settingsForm.dia_server_base_url_effective || "http://127.0.0.1:7864"}</code>{" "}
-                    (G3_DIA on this machine). <code>DIA_SERVER_BASE_URL</code> overrides the default, a URL entered
-                    here overrides both.
-                  </p>
-                )}
-
-                <label className="full-width">
-                  <span>DIA API Key</span>
-                  <input
-                    type="password"
-                    autoComplete="new-password"
-                    placeholder={settingsForm.dia_api_key_configured ? "Enter a new key to replace the configured key" : "Optional"}
-                    value={settingsForm.dia_api_key}
-                    onChange={(event) => updateSetting("dia_api_key", event.target.value)}
-                  />
-                </label>
-                <p className="field-note full-width">
-                  Write-only: the server never returns the saved key. Leaving this field empty preserves the current
-                  key. Environment keys remain managed through <code>DIA_SERVER_API_KEY</code>.
-                </p>
-
-                <label className="full-width">
-                  <span>ReDimNet Max Batch (voice ID)</span>
+              {activeModelFields.includes("local_gpu_device") && (
+                <label>
+                  <span>Device</span>
                   <select
-                    value={settingsForm.redimnet_max_batch_size}
-                    onChange={(event) => updateSetting("redimnet_max_batch_size", Number(event.target.value))}
+                    value={settingsForm.local_gpu_device}
+                    onChange={(event) => updateSetting("local_gpu_device", event.target.value)}
                   >
-                    {[8, 4, 2, 1].map((size) => (
-                      <option key={size} value={size}>
-                        {size}
+                    {settingsOptions.devices.map((option) => (
+                      <option key={option.value} value={option.value}>
+                        {option.label}
                       </option>
                     ))}
                   </select>
                 </label>
-                <p className="field-note full-width">
-                  Largest CUDA batch of 3 s windows for speaker clouds, sentence verification and embeddings. The
-                  reserved pool scales with it (RTX 5090: about 2.8 GB at 8, 1.4 GB at 4, 0.75 GB at 2); a 60-min
-                  diarization took 19.6 s at 8 and 23.2 s at 4. Applies on save, no restart needed.
-                </p>
+              )}
 
-                <div className="dia-actions full-width">
-                  <button
-                    type="button"
-                    className="secondary-button"
-                    disabled={diaActionBusy !== null}
-                    onClick={() => void handleTestDiaConnection()}
+              {activeModelFields.includes("transcription_language") && (
+                <label>
+                  <span>Language</span>
+                  <select
+                    value={settingsForm.transcription_language}
+                    onChange={(event) => updateSetting("transcription_language", event.target.value)}
                   >
-                    {diaActionBusy === "test" ? "Testing..." : "Test DIA Connection"}
-                  </button>
-                  <button
-                    type="button"
-                    className="ghost-button danger-button"
-                    disabled={
-                      diaActionBusy !== null
-                      || (!settingsForm.dia_api_key && settingsForm.dia_api_key_source !== "settings")
-                    }
-                    onClick={() => void handleClearDiaApiKey()}
+                    {settingsOptions.languages.map((option) => (
+                      <option key={option.value} value={option.value}>
+                        {option.label}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              )}
+
+              {activeModelFields.includes("local_model_precision") && (
+                <label>
+                  <span>Precision</span>
+                  <select
+                    value={settingsForm.local_model_precision}
+                    onChange={(event) => updateSetting("local_model_precision", event.target.value)}
                   >
-                    {diaActionBusy === "clear"
-                      ? "Deleting..."
-                      : settingsForm.dia_api_key
-                        ? "Discard Entered Key"
-                        : "Delete Saved Key"}
-                  </button>
-                  {diaActionMessage && (
-                    <p className={`message dia-message ${diaActionSucceeded === false ? "error" : ""}`}>
-                      {diaActionMessage}
-                    </p>
-                  )}
+                    {settingsOptions.precisions.map((option) => (
+                      <option key={option.value} value={option.value}>
+                        {option.label}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              )}
+
+              {activeModelFields.includes("batch_wait_time_ms") && (
+                <label>
+                  <span>Wait Time (ms)</span>
+                  <input
+                    type="number"
+                    min={0}
+                    value={settingsForm.batch_wait_time_ms}
+                    onChange={(event) => updateSetting("batch_wait_time_ms", Number(event.target.value))}
+                  />
+                </label>
+              )}
+
+              {activeModelFields.includes("batch_max_segments") && (
+                <label>
+                  <span>Max Segments</span>
+                  <input
+                    type="number"
+                    min={1}
+                    value={settingsForm.batch_max_segments}
+                    onChange={(event) => updateSetting("batch_max_segments", Number(event.target.value))}
+                  />
+                </label>
+              )}
+
+              {activeModelFields.includes("batch_max_audio_seconds") && (
+                <label>
+                  <span>Max Audio (s)</span>
+                  <input
+                    type="number"
+                    min={1}
+                    step="0.5"
+                    value={settingsForm.batch_max_audio_seconds}
+                    onChange={(event) => updateSetting("batch_max_audio_seconds", Number(event.target.value))}
+                  />
+                </label>
+              )}
+
+              {activeModelFields.includes("scheduler_long_job_min_chunks") && (
+                <label>
+                  <span>Long Job Min Chunks</span>
+                  <input
+                    type="number"
+                    min={1}
+                    value={settingsForm.scheduler_long_job_min_chunks}
+                    onChange={(event) => updateSetting("scheduler_long_job_min_chunks", Number(event.target.value))}
+                  />
+                </label>
+              )}
+
+              {activeModelFields.includes("scheduler_max_parallel_long_jobs") && (
+                <label>
+                  <span>Max Parallel Long Jobs (0 = unlimited)</span>
+                  <input
+                    type="number"
+                    min={0}
+                    value={settingsForm.scheduler_max_parallel_long_jobs}
+                    onChange={(event) => updateSetting("scheduler_max_parallel_long_jobs", Number(event.target.value))}
+                  />
+                </label>
+              )}
+
+              {activeModelFields.includes("redimnet_max_batch_size") && (
+                <>
+                  <label className="full-width">
+                    <span>ReDimNet Max Batch (voice ID)</span>
+                    <select
+                      value={settingsForm.redimnet_max_batch_size}
+                      onChange={(event) => updateSetting("redimnet_max_batch_size", Number(event.target.value))}
+                    >
+                      {[8, 4, 2, 1].map((size) => (
+                        <option key={size} value={size}>
+                          {size}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <p className="field-note full-width">
+                    Largest CUDA batch of 3 s windows for speaker clouds, sentence verification and embeddings. The
+                    reserved pool scales with it (RTX 5090: about 2.8 GB at 8, 1.4 GB at 4, 0.75 GB at 2); a 60-min
+                    diarization took 19.6 s at 8 and 23.2 s at 4. Applies on save, no restart needed.
+                  </p>
+                </>
+              )}
+
+              {activeModelFields.includes("scheduler_first_chunk_fast_path") && (
+                <label className="settings-checkbox full-width">
+                  <input
+                    type="checkbox"
+                    checked={settingsForm.scheduler_first_chunk_fast_path}
+                    onChange={(event) => updateSetting("scheduler_first_chunk_fast_path", event.target.checked)}
+                  />
+                  <span>
+                    First-chunk fast path
+                    <small>
+                      A request that has not been served yet gets its first chunk into a small batch of its own instead
+                      of riding along in a full batch of a long recording. Batches are always shared round-robin between
+                      active requests; short requests (below "Long Job Min Chunks") never wait for a long-job slot.
+                    </small>
+                  </span>
+                </label>
+              )}
+
+              {activeModelFields.includes("cuda_memory_trim_after_batch") && (
+                <label className="settings-checkbox full-width">
+                  <input
+                    type="checkbox"
+                    checked={settingsForm.cuda_memory_trim_after_batch}
+                    onChange={(event) => updateSetting("cuda_memory_trim_after_batch", event.target.checked)}
+                  />
+                  <span>
+                    Auto VRAM trim after batch
+                    <small>
+                      Releases the process-wide CUDA allocator pool once every local GPU phase (ASR batches,
+                      diarization, embeddings, startup warmup) has been idle for 5 s, so the idle footprint stays near
+                      the model floor on a shared GPU (RTX 5090: about 6.3 GB). The next request re-reserves its pool
+                      (measured: about +80 ms once for a ReDimNet batch). Disable only on a GPU this server has to itself.
+                    </small>
+                  </span>
+                </label>
+              )}
+
+              {activeModelFields.includes("cohere_cuda_graphs") && (
+                <label className="settings-checkbox full-width">
+                  <input
+                    type="checkbox"
+                    checked={settingsForm.cohere_cuda_graphs}
+                    onChange={(event) => updateSetting("cohere_cuda_graphs", event.target.checked)}
+                  />
+                  <span>
+                    Cohere CUDA graphs
+                    <small>
+                      Replays the Cohere encoder and greedy decoder as captured CUDA graphs (measured on an RTX 4090:
+                      2 s clip 270 to 30 ms, 14 s file 0.9 to 0.12 s, identical transcripts) for about +0.55 GB VRAM
+                      (hard cap 1.5 GB) and about 5 s of extra warmup. fp16/bf16 on CUDA only. Takes effect on the next
+                      model (re)load: restart the server or change model, device, precision or cache path.
+                    </small>
+                  </span>
+                </label>
+              )}
+
+              <div className="settings-form preset-settings service-settings full-width">
+                <div className="full-width">
+                  <span className="eyebrow">Service-wide</span>
+                  <p className="field-note preset-copy">
+                    These apply to the whole service, whichever model is active. Save Settings below saves them too.
+                  </p>
                 </div>
+
+                {serviceFields.includes("local_model_cache_path") && (
+                  <label className="full-width">
+                    <span>Cache Path</span>
+                    <input
+                      value={settingsForm.local_model_cache_path}
+                      onChange={(event) => updateSetting("local_model_cache_path", event.target.value)}
+                    />
+                  </label>
+                )}
+
+                {serviceFields.includes("huggingface_token") && (
+                  <>
+                    <label className="full-width">
+                      <span>Hugging Face Token</span>
+                      <input
+                        type="password"
+                        placeholder="hf_... (optional)"
+                        value={settingsForm.huggingface_token}
+                        onChange={(event) => updateSetting("huggingface_token", event.target.value)}
+                      />
+                    </label>
+                    <p className="field-note full-width">
+                      Used for gated ASR models such as Cohere Transcribe (the default model). Accept its license on{" "}
+                      <a href="https://huggingface.co/CohereLabs/cohere-transcribe-03-2026" target="_blank" rel="noreferrer">
+                        Hugging Face
+                      </a>{" "}
+                      with the account that owns this token. Save the settings to persist it; the current typed value is
+                      also sent with manual model downloads.
+                    </p>
+                  </>
+                )}
+
+                {(serviceFields.includes("dia_server_base_url") || serviceFields.includes("dia_api_key")) && (
+                  <div className="dia-settings full-width">
+                    <div className="settings-subheading">
+                      <div>
+                        <span className="eyebrow">DIA Integration</span>
+                        <h3>Diarization Server</h3>
+                      </div>
+                      <span className={`connection-status ${settingsForm.dia_api_key_configured ? "configured" : ""}`}>
+                        {settingsForm.dia_api_key_configured
+                          ? `API key: ${settingsForm.dia_api_key_source}`
+                          : "No API key configured"}
+                      </span>
+                    </div>
+
+                    <div className="dia-settings-grid">
+                      {serviceFields.includes("dia_server_base_url") && (
+                        <label className="full-width">
+                          <span>DIA Server URL</span>
+                          <input
+                            type="url"
+                            placeholder={settingsForm.dia_server_base_url_effective || "http://127.0.0.1:7864"}
+                            value={settingsForm.dia_server_base_url}
+                            onChange={(event) => updateSetting("dia_server_base_url", event.target.value)}
+                          />
+                        </label>
+                      )}
+                      {settingsForm.dia_server_base_url_source === "environment" && !settingsForm.dia_server_base_url && (
+                        <p className="field-note full-width">
+                          Using <code>{settingsForm.dia_server_base_url_effective}</code> from <code>DIA_SERVER_BASE_URL</code>.
+                        </p>
+                      )}
+                      {settingsForm.dia_server_base_url_source === "default" && !settingsForm.dia_server_base_url && (
+                        <p className="field-note full-width">
+                          Empty: using the default <code>{settingsForm.dia_server_base_url_effective || "http://127.0.0.1:7864"}</code>{" "}
+                          (G3_DIA on this machine). <code>DIA_SERVER_BASE_URL</code> overrides the default, a URL entered
+                          here overrides both.
+                        </p>
+                      )}
+
+                      {serviceFields.includes("dia_api_key") && (
+                        <>
+                          <label className="full-width">
+                            <span>DIA API Key</span>
+                            <input
+                              type="password"
+                              autoComplete="new-password"
+                              placeholder={settingsForm.dia_api_key_configured ? "Enter a new key to replace the configured key" : "Optional"}
+                              value={settingsForm.dia_api_key}
+                              onChange={(event) => updateSetting("dia_api_key", event.target.value)}
+                            />
+                          </label>
+                          <p className="field-note full-width">
+                            Write-only: the server never returns the saved key. Leaving this field empty preserves the current
+                            key. Environment keys remain managed through <code>DIA_SERVER_API_KEY</code>.
+                          </p>
+                        </>
+                      )}
+
+                      <div className="dia-actions full-width">
+                        <button
+                          type="button"
+                          className="secondary-button"
+                          disabled={diaActionBusy !== null}
+                          onClick={() => void handleTestDiaConnection()}
+                        >
+                          {diaActionBusy === "test" ? "Testing..." : "Test DIA Connection"}
+                        </button>
+                        <button
+                          type="button"
+                          className="ghost-button danger-button"
+                          disabled={
+                            diaActionBusy !== null
+                            || (!settingsForm.dia_api_key && settingsForm.dia_api_key_source !== "settings")
+                          }
+                          onClick={() => void handleClearDiaApiKey()}
+                        >
+                          {diaActionBusy === "clear"
+                            ? "Deleting..."
+                            : settingsForm.dia_api_key
+                              ? "Discard Entered Key"
+                              : "Delete Saved Key"}
+                        </button>
+                        {diaActionMessage && (
+                          <p className={`message dia-message ${diaActionSucceeded === false ? "error" : ""}`}>
+                            {diaActionMessage}
+                          </p>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                {serviceFields.includes("debug_retain_history_audio") && (
+                  <label className="settings-checkbox sensitive-setting full-width">
+                    <input
+                      type="checkbox"
+                      checked={settingsForm.debug_retain_history_audio}
+                      onChange={(event) => updateSetting("debug_retain_history_audio", event.target.checked)}
+                    />
+                    <span>
+                      Retain original audio for history debugging
+                      <small>
+                        Sensitive audio data: keeps the byte-identical upload only while its item remains in the visible
+                        history. Disabling this setting deletes every retained debug recording immediately after saving.
+                      </small>
+                    </span>
+                  </label>
+                )}
               </div>
-            </div>
 
-            <label>
-              <span>Wait Time (ms)</span>
-              <input
-                type="number"
-                min={0}
-                value={settingsForm.batch_wait_time_ms}
-                onChange={(event) => updateSetting("batch_wait_time_ms", Number(event.target.value))}
-              />
-            </label>
-
-            <label>
-              <span>Max Segments</span>
-              <input
-                type="number"
-                min={1}
-                value={settingsForm.batch_max_segments}
-                onChange={(event) => updateSetting("batch_max_segments", Number(event.target.value))}
-              />
-            </label>
-
-            <label>
-              <span>Max Audio (s)</span>
-              <input
-                type="number"
-                min={1}
-                step="0.5"
-                value={settingsForm.batch_max_audio_seconds}
-                onChange={(event) => updateSetting("batch_max_audio_seconds", Number(event.target.value))}
-              />
-            </label>
-
-            <label>
-              <span>Long Job Min Chunks</span>
-              <input
-                type="number"
-                min={1}
-                value={settingsForm.scheduler_long_job_min_chunks}
-                onChange={(event) => updateSetting("scheduler_long_job_min_chunks", Number(event.target.value))}
-              />
-            </label>
-
-            <label>
-              <span>Max Parallel Long Jobs (0 = unlimited)</span>
-              <input
-                type="number"
-                min={0}
-                value={settingsForm.scheduler_max_parallel_long_jobs}
-                onChange={(event) => updateSetting("scheduler_max_parallel_long_jobs", Number(event.target.value))}
-              />
-            </label>
-
-            <label className="settings-checkbox full-width">
-              <input
-                type="checkbox"
-                checked={settingsForm.scheduler_first_chunk_fast_path}
-                onChange={(event) => updateSetting("scheduler_first_chunk_fast_path", event.target.checked)}
-              />
-              <span>
-                First-chunk fast path
-                <small>
-                  A request that has not been served yet gets its first chunk into a small batch of its own instead
-                  of riding along in a full batch of a long recording. Batches are always shared round-robin between
-                  active requests; short requests (below "Long Job Min Chunks") never wait for a long-job slot.
-                </small>
-              </span>
-            </label>
-
-            <label className="settings-checkbox full-width">
-              <input
-                type="checkbox"
-                checked={settingsForm.cuda_memory_trim_after_batch}
-                onChange={(event) => updateSetting("cuda_memory_trim_after_batch", event.target.checked)}
-              />
-              <span>
-                Auto VRAM trim after batch
-                <small>
-                  Releases the process-wide CUDA allocator pool once every local GPU phase (ASR batches,
-                  diarization, embeddings, startup warmup) has been idle for 5 s, so the idle footprint stays near
-                  the model floor on a shared GPU (RTX 5090: about 6.3 GB). The next request re-reserves its pool
-                  (measured: about +80 ms once for a ReDimNet batch). Disable only on a GPU this server has to itself.
-                </small>
-              </span>
-            </label>
-
-            <label className="settings-checkbox full-width">
-              <input
-                type="checkbox"
-                checked={settingsForm.cohere_cuda_graphs}
-                onChange={(event) => updateSetting("cohere_cuda_graphs", event.target.checked)}
-              />
-              <span>
-                Cohere CUDA graphs
-                <small>
-                  Replays the Cohere encoder and greedy decoder as captured CUDA graphs (measured on an RTX 4090:
-                  2 s clip 270 to 30 ms, 14 s file 0.9 to 0.12 s, identical transcripts) for about +0.55 GB VRAM
-                  (hard cap 1.5 GB) and about 5 s of extra warmup. fp16/bf16 on CUDA only. Takes effect on the next
-                  model (re)load: restart the server or change model, device, precision or cache path.
-                </small>
-              </span>
-            </label>
-
-            <label className="settings-checkbox sensitive-setting full-width">
-              <input
-                type="checkbox"
-                checked={settingsForm.debug_retain_history_audio}
-                onChange={(event) => updateSetting("debug_retain_history_audio", event.target.checked)}
-              />
-              <span>
-                Retain original audio for history debugging
-                <small>
-                  Sensitive audio data: keeps the byte-identical upload only while its item remains in the visible
-                  history. Disabling this setting deletes every retained debug recording immediately after saving.
-                </small>
-              </span>
-            </label>
-
-            <div className="form-actions full-width">
-              <button type="submit" disabled={saveBusy}>
-                {saveBusy ? "Saving..." : "Save Settings"}
-              </button>
-              {saveMessage && <p className="message">{saveMessage}</p>}
-            </div>
-          </form>
+              <div className="form-actions full-width">
+                <button type="submit" disabled={saveBusy}>
+                  {saveBusy ? "Saving..." : "Save Settings"}
+                </button>
+                {saveMessage && <p className="message">{saveMessage}</p>}
+              </div>
+            </form>
+          </fieldset>
         </section>
 
         <section className="panel">
@@ -2685,7 +2996,8 @@ export default function App() {
             <h2>Cache Manager</h2>
             <p className="section-copy">
               Download or remove the supported ASR models directly in the cache path currently typed in the
-              settings form. Downloaded sizes reflect local cache usage; other values are rough estimates.
+              settings form. Downloaded sizes reflect local cache usage; other values are rough estimates. The active
+              model cannot be deleted, load another model first.
             </p>
           </div>
           <div className="button-row">
@@ -2726,14 +3038,15 @@ export default function App() {
               {managedModels.map((model) => {
                 const rowBusy = modelActionId === model.id;
                 const isDownloading = model.status === "downloading";
-                const canDelete = Boolean(model.cache_path);
+                const canDelete = Boolean(model.cache_path) && !model.active && !modelSelectRunning;
                 return (
                   <tr key={model.id}>
                     <td>
                       <strong>{model.label}</strong>
+                      {model.active && <span className="connection-status configured model-active-marker">Active</span>}
                       <div className="muted mono model-id">{model.id}</div>
                     </td>
-                    <td>{model.backend === "cohere_transcribe" ? "Cohere" : model.backend === "parakeet" ? "Parakeet (ONNX)" : "Whisper"}</td>
+                    <td>{formatBackendLabel(model.backend)}</td>
                     <td>{formatModelSize(model)}</td>
                     <td className="model-status-cell">
                       <strong>{formatModelStatus(model.status)}</strong>
