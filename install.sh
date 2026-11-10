@@ -105,6 +105,17 @@ if [[ "$NEEDS_PY_DEPS" -eq 1 ]]; then
   echo "Installiere/Aktualisiere Python-Abhaengigkeiten ..."
   "$VENV_PIP" install -r requirements.txt || fail "Installation aus requirements.txt fehlgeschlagen."
   touch_stamp "$REQ_STAMP"
+
+  # install_torch_stack laeuft oben nur fuer ein neu angelegtes venv. Existiert das venv schon
+  # (zum Beispiel von Hand mit "python -m venv" plus requirements.txt angelegt), fehlt torchaudio
+  # still: der Server transkribiert und bleibt gesund, jeder Diarisierungspfad gibt aber 503
+  # MODEL_UNAVAILABLE. Dasselbe gilt fuer ein PyPI-Rad neben CUDA-torch - das wirft beim Import.
+  if ! "$VENV_PYTHON" -c 'import torch, torchaudio' >/dev/null 2>&1; then
+    echo "PyTorch-Stack fehlt oder passt nicht (torch und/oder torchaudio nicht importierbar). Nachziehen ..."
+    install_torch_stack || fail "PyTorch-Installation fehlgeschlagen."
+    "$VENV_PYTHON" -c 'import torch, torchaudio' >/dev/null 2>&1 \
+      || fail "torch und torchaudio bleiben auch nach dem Nachziehen nicht importierbar."
+  fi
 fi
 
 if [[ ! -d "$FRONTEND_NODE_MODULES" ]]; then

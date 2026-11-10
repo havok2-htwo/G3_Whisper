@@ -1,3 +1,13 @@
+# torch, torchvision und torchaudio stehen bewusst NICHT in dieser Datei. Sie brauchen den
+# CUDA-Wheel-Index (install.sh: install_torch_stack, Dockerfile: die Zeile mit
+# "pip install torch=="), und ein Eintrag hier zieht beim manuellen Installieren das CPU-Rad
+# vom PyPI-Index - das passt zum CUDA-torch nicht und scheitert beim Import mit
+# "Could not load this library: _torchaudio.so".
+# torchaudio ist trotzdem eine harte Laufzeit-Abhaengigkeit, kein optionales Extra: der
+# ReDimNet2-Sprechenerkenner und die Wort-Zeitstempel (torchaudio.pipelines.MMS_FA) laden
+# darueber. Ohne das Paket transkribiert der Server weiter und meldet sich gesund, jeder
+# Diarisierungspfad antwortet aber 503 MODEL_UNAVAILABLE. Immer vom selben Index wie torch
+# nachziehen.
 fastapi>=0.115,<1.0
 starlette>=0.44,<2.0
 uvicorn[standard]>=0.30,<1.0

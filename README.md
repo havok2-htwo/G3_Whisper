@@ -990,6 +990,21 @@ Linux / Unix equivalent:
 ./venv/bin/pip install -r requirements.txt
 ```
 
+The torch stack is deliberately not part of `requirements.txt` — it needs the CUDA wheel index, and
+`install.sh` installs it *before* `requirements.txt` (`install_torch_stack`). On a manual install,
+install it first and from the same index:
+
+```bash
+./venv/bin/pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+```
+
+`torchaudio` is a hard runtime dependency, not an optional extra: the ReDimNet2 speaker recognizer
+and the word-level timestamps (`torchaudio.pipelines.MMS_FA`) load through it. Without it the server
+still transcribes and still reports healthy, but every diarization request answers
+`503 MODEL_UNAVAILABLE`. A PyPI `torchaudio` next to a CUDA `torch` is worse than missing — it fails
+at import with `Could not load this library: _torchaudio.so`. `install.sh` checks
+`import torch, torchaudio` after the Python dependencies and repairs both cases.
+
 ## Important Repository Areas
 
 Actively relevant:
