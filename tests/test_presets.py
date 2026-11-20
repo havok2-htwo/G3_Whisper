@@ -17,7 +17,8 @@ from backend import genesis_whisper_server_storage as storage
 
 TIER_NAMES = ["32GB VRAM", "24GB VRAM", "24+8 VRAM"]
 PARAKEET_TIER = "Parakeet 8GB VRAM"
-ALL_BUILTIN_NAMES = TIER_NAMES + [PARAKEET_TIER]
+GRANITE_TIER = "Granite 24GB VRAM"
+ALL_BUILTIN_NAMES = TIER_NAMES + [PARAKEET_TIER, GRANITE_TIER]
 
 
 class ParakeetTierTests(unittest.TestCase):
@@ -30,6 +31,24 @@ class ParakeetTierTests(unittest.TestCase):
         self.assertEqual(values["batch_max_audio_seconds"], 100.0)
         self.assertEqual(values["redimnet_max_batch_size"], 2)
         self.assertIn("local_model", presets.PRESET_KEYS)
+
+
+class GraniteTierTests(unittest.TestCase):
+    def test_granite_tier_keeps_the_cohere_vram_values_in_bf16_with_compile_off(self) -> None:
+        values = presets.BUILTIN_PRESETS[GRANITE_TIER]["values"]
+        cohere = presets.BUILTIN_PRESETS["24GB VRAM"]["values"]
+        for key in ("batch_max_segments", "batch_max_audio_seconds", "cuda_memory_trim_after_batch", "redimnet_max_batch_size"):
+            self.assertEqual(values[key], cohere[key], key)
+        self.assertEqual(values["local_model"], "ibm-granite/granite-speech-5.0-2b")
+        self.assertEqual(values["local_model_precision"], "bf16")
+        self.assertEqual(values["granite_compile"], "off")
+        self.assertIsNone(presets.BUILTIN_PRESETS[GRANITE_TIER]["target_vram_gb"])
+        self.assertIn("Not measured yet", presets.BUILTIN_PRESETS[GRANITE_TIER]["description"])
+        normalized = storage.normalize_settings(values)
+        self.assertEqual({key: normalized[key] for key in values}, values)
+
+    def test_granite_starts_from_its_tier(self) -> None:
+        self.assertEqual(presets.MODEL_START_PRESETS["ibm-granite/granite-speech-5.0-2b"], GRANITE_TIER)
 
 
 class _PresetTestCase(unittest.TestCase):

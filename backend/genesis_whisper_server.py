@@ -130,12 +130,15 @@ def _warmup_redimnet() -> None:
 
 
 def _lid_warmup_wanted() -> bool:
-    """Only Cohere needs detection (Whisper detects itself, Parakeet ignores the language), and only while
-    cohere_language_detection is on."""
+    """Only Cohere and Granite use detection (Whisper detects itself, Parakeet ignores the language), and only
+    while cohere_language_detection is on."""
 
-    from .genesis_whisper_server_globals import cohere_language_detection_enabled, uses_cohere_backend
+    from .genesis_whisper_server_globals import cohere_language_detection_enabled, uses_language_detection_backend
 
-    return uses_cohere_backend(str(current_settings.get("local_model") or "")) and cohere_language_detection_enabled()
+    return (
+        uses_language_detection_backend(str(current_settings.get("local_model") or ""))
+        and cohere_language_detection_enabled()
+    )
 
 
 def _prepare_lid() -> None:
@@ -158,11 +161,11 @@ def _warmup_lid() -> None:
     """
 
     try:
-        from .genesis_whisper_server_globals import uses_cohere_backend
+        from .genesis_whisper_server_globals import uses_language_detection_backend
         from .genesis_whisper_server_lid import configured_lid_model, detect_languages, load_lid_model
 
         if not _lid_warmup_wanted():
-            if uses_cohere_backend(str(current_settings.get("local_model") or "")):
+            if uses_language_detection_backend(str(current_settings.get("local_model") or "")):
                 print("[WARMUP-LID] Spracherkennung abgeschaltet -> uebersprungen.", file=sys.stderr)
             return
         print(f"[WARMUP-LID] Lade Spracherkennung '{configured_lid_model()}' ...", file=sys.stderr)

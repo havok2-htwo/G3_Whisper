@@ -26,7 +26,6 @@ from .genesis_whisper_server_batching import served_model_id
 from .genesis_whisper_server_chunking import combine_transcription_chunks, split_audio_for_whisper
 from .genesis_whisper_server_dia_client import DiaClientError, dia_is_configured, diarize_v2
 from .genesis_whisper_server_globals import (
-    COHERE_FALLBACK_LANGUAGE,
     SUPPORTED_LANGUAGE_OPTIONS,
     SUPPORTED_LANGUAGE_VALUES,
     current_settings,
@@ -35,6 +34,7 @@ from .genesis_whisper_server_globals import (
     get_local_model_label,
     is_local_model_loaded,
     language_detection_applies,
+    language_detection_fallback,
     settings_lock,
     uses_parakeet_backend,
     uses_whole_audio_backend,
@@ -514,7 +514,7 @@ async def _transcribe_audio(
 ) -> tuple[str, int, int, str, LanguageDecision]:
     """(text, transcription ms, ASR items, served model, language decision).
 
-    With Cohere and an effective "auto" the language is detected per ASR item before any job is submitted, so
+    With Cohere or Granite and an effective "auto" the language is detected per ASR item before any job is submitted, so
     "auto" never reaches the engine: one item (up to WHOLE_AUDIO_MAX_S) gets one decision; a long file is
     detected per Silero speech piece in one batched pass, cut into superchunks that never mix two languages and
     submitted as one job per language (decide_transcript_items).
@@ -759,7 +759,7 @@ async def _detect_speaker_languages(
                 for index, items in per_turn.items()
             }
         except Exception as exc:
-            print(f"[WARNUNG-LID] Sprecher-Spracherkennung fehlgeschlagen, nutze '{COHERE_FALLBACK_LANGUAGE}': {exc}", file=sys.stderr)
+            print(f"[WARNUNG-LID] Sprecher-Spracherkennung fehlgeschlagen, nutze '{language_detection_fallback()}': {exc}", file=sys.stderr)
             warnings.append(unavailable_warning(str(exc)))
             results = {label: None for label in labels}
             turn_results = {}
@@ -769,7 +769,6 @@ async def _detect_speaker_languages(
     sources = {label: source for label, (_language, source) in resolved.items()}
     dominant = dominant_language(
         [(language, speech_seconds.get(label, 0.0)) for label, language in by_speaker.items()],
-        COHERE_FALLBACK_LANGUAGE,
     )
     seconds: dict[str, float] = {}
     for label, language in by_speaker.items():
@@ -1125,7 +1124,7 @@ async def _process_diarization(
         refinement_diagnostics = refinement.diagnostics
 
     # Per-speaker language, decided once the speaker clouds are final and before
-    # any ASR: Cohere + an effective "auto" only. Everything else keeps its one
+    # any ASR: Cohere/Granite + an effective "auto" only. Everything else keeps its one
     # explicit (or Whisper-detected) language for the whole file.
     # The gated/merged turns ASR will see are refined per turn in the same
     # detection pass (the speaker's language stays the prior).
@@ -1433,7 +1432,7 @@ def create_v2_capabilities_api(app: FastAPI) -> FastAPI:
         configured_language = settings_snapshot["transcription_language"]
         detection = lid_status()
         detection_enabled = settings_snapshot["cohere_language_detection"] is True
-        # "auto" stays "auto" for Cohere while detection is on and its model is not known to be broken.
+        # "auto" stays "auto" for Cohere/Granite while detection is on and its model is not known to be broken.
         detection_effective = detection_enabled and detection["error"] is None
         return {
             "schema_version": V2_SCHEMA_VERSION,

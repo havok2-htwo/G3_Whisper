@@ -10,6 +10,8 @@ from typing import Any
 from huggingface_hub import snapshot_download
 
 from .genesis_whisper_server_globals import (
+    GRANITE_DOWNLOAD_IGNORE_PATTERNS,
+    GRANITE_SPEECH_MODEL_ID,
     LOCAL_ASR_MODEL_SPECS,
     PARAKEET_MODEL_ID,
     current_settings,
@@ -184,6 +186,17 @@ def _supported_model_specs() -> dict[str, dict[str, Any]]:
         "nemo128.onnx",
     )
     specs[PARAKEET_MODEL_ID]["required_any_groups"] = ()
+    # The chat template lives only in chat_template.jinja (tokenizer_config.json has none); one safetensors file.
+    specs[GRANITE_SPEECH_MODEL_ID]["required_files"] = (
+        "config.json",
+        "preprocessor_config.json",
+        "processor_config.json",
+        "tokenizer_config.json",
+        "chat_template.jinja",
+        "model.safetensors",
+    )
+    specs[GRANITE_SPEECH_MODEL_ID]["required_any_groups"] = (("tokenizer.json", "vocab.json"),)
+    specs[GRANITE_SPEECH_MODEL_ID]["ignore_patterns"] = list(GRANITE_DOWNLOAD_IGNORE_PATTERNS)
     return specs
 
 
@@ -248,6 +261,7 @@ def queue_model_download(model_id: str, storage_path: str, huggingface_token: st
     storage_root.mkdir(parents=True, exist_ok=True)
     current_job_key = _job_key(model_id, storage_root)
     download_token = _resolve_huggingface_token(huggingface_token)
+    ignore_patterns = model_specs[model_id].get("ignore_patterns")
 
     with _model_jobs_lock:
         existing_job = _model_jobs.get(current_job_key)
@@ -268,6 +282,7 @@ def queue_model_download(model_id: str, storage_path: str, huggingface_token: st
                 cache_dir=str(storage_root),
                 resume_download=True,
                 token=download_token,
+                ignore_patterns=ignore_patterns,
             )
         except Exception as exc:
             with _model_jobs_lock:

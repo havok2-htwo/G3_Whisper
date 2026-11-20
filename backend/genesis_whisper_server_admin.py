@@ -46,6 +46,8 @@ from .genesis_whisper_server_globals import (
     settings_lock,
     transcription_history,
     uses_cohere_backend,
+    uses_granite_backend,
+    uses_language_detection_backend,
     uses_parakeet_backend,
     uses_whole_audio_backend,
 )
@@ -110,6 +112,7 @@ class AdminSettingsPayload(BaseModel):
     scheduler_first_chunk_fast_path: bool | None = None
     cuda_memory_trim_after_batch: bool | None = None
     cohere_cuda_graphs: bool | None = None
+    granite_compile: str | None = None
     cohere_language_detection: StrictBool | None = None
     language_detection_model: str | None = None
     redimnet_max_batch_size: int | None = None
@@ -343,7 +346,7 @@ async def _reprepare_voice_models(
     saved_settings: Dict[str, Any],
 ) -> None:
     """ReDimNet, MMS_FA and the language detection model follow local_gpu_device, ReDimNet also its max batch,
-    the detector its model choice, its switch and the ASR model (only Cohere uses it). Re-prepare loaded models
+    the detector its model choice, its switch and the ASR model (only Cohere and Granite use it). Re-prepare loaded models
     now, so the old card / the larger bucket pool / a replaced or unused detector is released and the next
     request is warm. None of these reloads the ASR model."""
 
@@ -356,10 +359,10 @@ async def _reprepare_voice_models(
             "cohere_language_detection",
         )
     )
-    # Leaving Cohere makes a resident detector dead weight next to the new ASR model (up to 1.6 GB with turbo).
+    # Leaving Cohere/Granite makes a resident detector dead weight next to the new ASR model (up to 1.6 GB with turbo).
     detector_unused = (
         previous_settings.get("local_model") != saved_settings.get("local_model")
-        and not uses_cohere_backend(str(saved_settings.get("local_model") or ""))
+        and not uses_language_detection_backend(str(saved_settings.get("local_model") or ""))
         and lid_status()["loaded"]
     )
     voice_settings_changed = voice_settings_changed or detector_unused
@@ -435,6 +438,8 @@ def _benchmark_workflow(model_id: str) -> str:
         return "parakeet_audio_batch"
     if uses_cohere_backend(model_id):
         return "cohere_audio_batch"
+    if uses_granite_backend(model_id):
+        return "granite_audio_batch"
     return "whisper_chunk_queue"
 
 

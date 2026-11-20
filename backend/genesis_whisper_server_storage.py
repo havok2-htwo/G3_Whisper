@@ -8,6 +8,7 @@ from dotenv import load_dotenv
 from .genesis_whisper_server_globals import (
     COHERE_MODEL_ID,
     DEFAULT_LANGUAGE_DETECTION_MODEL,
+    GRANITE_COMPILE_MODES,
     LANGUAGE_DETECTION_MODEL_OPTIONS,
     LOCAL_ASR_MODEL_MAP,
     LOG_FILE,
@@ -44,6 +45,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "scheduler_first_chunk_fast_path": True,
     "cuda_memory_trim_after_batch": True,
     "cohere_cuda_graphs": True,
+    "granite_compile": "off",
     "cohere_language_detection": True,
     "language_detection_model": DEFAULT_LANGUAGE_DETECTION_MODEL,
     "redimnet_max_batch_size": 8,
@@ -71,6 +73,7 @@ PRESET_KEYS: Tuple[str, ...] = (
     "scheduler_first_chunk_fast_path",
     "cuda_memory_trim_after_batch",
     "cohere_cuda_graphs",
+    "granite_compile",
     "redimnet_max_batch_size",
 )
 
@@ -99,6 +102,14 @@ MODEL_SETTINGS_FIELDS: Dict[str, Tuple[str, ...]] = {
         "local_model_precision",
         "transcription_language",
         "cohere_cuda_graphs",
+        "cohere_language_detection",
+        "language_detection_model",
+    ),
+    "granite_speech": _COMMON_MODEL_FIELDS
+    + (
+        "local_model_precision",
+        "transcription_language",
+        "granite_compile",
         "cohere_language_detection",
         "language_detection_model",
     ),
@@ -264,6 +275,14 @@ def normalize_settings(settings: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         configured_cuda_graphs
         if isinstance(configured_cuda_graphs, bool)
         else DEFAULT_SETTINGS["cohere_cuda_graphs"]
+    )
+
+    # Read per batch by the Granite engine; "static_cache"/"compile" stay off until measured on the target GPU.
+    configured_granite_compile = str(source.get("granite_compile", DEFAULT_SETTINGS["granite_compile"]) or "").strip().lower()
+    normalized["granite_compile"] = (
+        configured_granite_compile
+        if configured_granite_compile in GRANITE_COMPILE_MODES
+        else DEFAULT_SETTINGS["granite_compile"]
     )
 
     configured_language_detection = source.get(

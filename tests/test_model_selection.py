@@ -52,9 +52,14 @@ class ModelFieldTests(unittest.TestCase):
 
     def test_fields_match_what_each_backend_reads(self) -> None:
         fields = storage.MODEL_SETTINGS_FIELDS
-        self.assertEqual(set(fields), {"whisper", "cohere_transcribe", "parakeet"})
+        self.assertEqual(set(fields), {"whisper", "cohere_transcribe", "parakeet", "granite_speech"})
         self.assertIn("cohere_cuda_graphs", fields["cohere_transcribe"])
         self.assertNotIn("cohere_cuda_graphs", fields["whisper"])
+        self.assertNotIn("cohere_cuda_graphs", fields["granite_speech"])
+        # granite_compile is shown for Granite only.
+        self.assertEqual([backend for backend in fields if "granite_compile" in fields[backend]], ["granite_speech"])
+        for field in ("local_model_precision", "transcription_language", "cohere_language_detection", "language_detection_model"):
+            self.assertIn(field, fields["granite_speech"])
         for field in ("local_model_precision", "transcription_language", "cohere_cuda_graphs"):
             self.assertNotIn(field, fields["parakeet"])
         self.assertEqual(set(fields["whisper"]) - set(fields["parakeet"]), {"local_model_precision", "transcription_language"})

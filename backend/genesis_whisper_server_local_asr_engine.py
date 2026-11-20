@@ -24,8 +24,15 @@ from .genesis_whisper_server_cohere_cuda_graphs import (
     install_cohere_cuda_graphs,
     install_cohere_cudnn_free_encoder,
 )
+from .genesis_whisper_server_granite_speech import (
+    GRANITE_INT8_SKIP_MODULES,
+    ensure_left_padding,
+    release_speed_state,
+    transcribe_granite_batch,
+)
 from .genesis_whisper_server_globals import (
     COHERE_MODEL_URL,
+    GRANITE_DOWNLOAD_IGNORE_PATTERNS,
     PARAKEET_ONNX_MODEL_NAME,
     current_settings,
     get_effective_transcription_language,
@@ -35,6 +42,7 @@ from .genesis_whisper_server_globals import (
     resolve_local_model_cache_path,
     settings_lock,
     uses_cohere_backend,
+    uses_granite_backend,
     uses_parakeet_backend,
 )
 
@@ -231,6 +239,10 @@ def _is_snapshot_ready_for_model(model_id: str, snapshot_path: str) -> bool:
             ]
         )
         tokenizer_files = ["tokenizer.model"]
+    elif uses_granite_backend(model_id):
+        # The chat template exists only as chat_template.jinja.
+        required_files.extend(["processor_config.json", "tokenizer_config.json", "chat_template.jinja"])
+        tokenizer_files = ["tokenizer.json", "vocab.json"]
     else:
         required_files.append("tokenizer_config.json")
         tokenizer_files = ["tokenizer.json", "vocab.json"]
@@ -336,6 +348,28 @@ def _resolve_cohere_pretrained_source(
     return snapshot_path, {"local_files_only": True}
 
 
+def _resolve_granite_pretrained_source(
+    model_id: str,
+    cache_path: str,
+    huggingface_token: Optional[str],
+) -> Tuple[str, Dict[str, Any]]:
+    """A complete local snapshot without network, else download it (public repo, the token is optional)."""
+
+    cached_snapshot_path = _resolve_cached_snapshot_path(model_id, cache_path)
+    if cached_snapshot_path:
+        return cached_snapshot_path, {"local_files_only": True}
+
+    print(f"[INFO] Granite-Snapshot fuer '{model_id}' fehlt lokal oder ist unvollstaendig. Starte Download...", file=sys.stderr)
+    snapshot_path = snapshot_download(
+        model_id,
+        cache_dir=cache_path or None,
+        token=huggingface_token,
+        ignore_patterns=list(GRANITE_DOWNLOAD_IGNORE_PATTERNS),
+    )
+    print(f"[INFO] Granite-Snapshot bereit: '{snapshot_path}'", file=sys.stderr)
+    return snapshot_path, {"local_files_only": True}
+
+
 def _resolve_requested_torch_dtype(model_precision: str, use_gpu: bool) -> torch.dtype:
     normalized_precision = _normalize_model_precision(model_precision)
 
@@ -408,6 +442,11 @@ def _resolve_backend_attention_implementation(model_id: str, requested_attn_impl
                 file=sys.stderr,
             )
         return "eager"
+    if uses_granite_backend(model_id):
+        # GraniteSpeechPreTrainedModel has _supports_flash_attn = False (the Q-Former projector).
+        if requested_attn_implementation != "sdpa":
+            print("[INFO] Granite-Backend nutzt attn_implementation='sdpa' (flash_attention_2 nicht unterstuetzt).", file=sys.stderr)
+        return "sdpa"
     return requested_attn_implementation
 
 
@@ -579,6 +618,8 @@ def _cleanup_previous_model():
     _uninstall_cohere_inference_patch()
     if local_model_components.get("model") is None:
         return
+    if local_model_components.get("model_backend") == "granite_speech":
+        release_speed_state(local_model_components.get("model"))
 
     print("[INFO] Entlade altes lokales Modell und bereinige Speicher aggressiv...", file=sys.stderr)
     try:
@@ -637,6 +678,7 @@ def _build_model_kwargs(
     torch_dtype: torch.dtype,
     attn_implementation: str,
     trust_remote_code: bool = False,
+    int8_skip_modules: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     model_kwargs: Dict[str, Any] = {
         "dtype": torch_dtype,
@@ -662,7 +704,7 @@ def _build_model_kwargs(
     model_kwargs["quantization_config"] = BitsAndBytesConfig(
         load_in_8bit=True,
         # Whisper large-v3-turbo produced early EOS with every encoder layer quantized.
-        llm_int8_skip_modules=["model.encoder.layers.0", "proj_out"],
+        llm_int8_skip_modules=int8_skip_modules or ["model.encoder.layers.0", "proj_out"],
     )
     model_kwargs["device_map"] = {"": target_device}
     print("[INFO] bitsandbytes: load_in_8bit=True mit Transformers device_map aktiviert.", file=sys.stderr)
@@ -735,6 +777,12 @@ def load_local_asr_model(model_id: str, device_selection: str, cache_path: str, 
                     resolved_cache_path,
                     huggingface_token,
                 )
+            elif uses_granite_backend(model_id):
+                pretrained_source, pretrained_args = _resolve_granite_pretrained_source(
+                    model_id,
+                    resolved_cache_path,
+                    huggingface_token,
+                )
             else:
                 pretrained_source, pretrained_args = _resolve_local_pretrained_source(model_id, resolved_cache_path)
             pretrained_args = _with_huggingface_token(pretrained_args, huggingface_token)
@@ -751,6 +799,23 @@ def load_local_asr_model(model_id: str, device_selection: str, cache_path: str, 
                     torch_dtype,
                     attn_implementation,
                     trust_remote_code=True,
+                )
+                model = _load_auto_speech_model(pretrained_source, pretrained_args, model_kwargs)
+            elif uses_granite_backend(model_id):
+                if normalized_precision == "fp16" and use_gpu:
+                    print(
+                        "[INFO] Granite laeuft mit fp16; die Gewichte sind bf16 (Standard-Stufe 'Granite 24GB VRAM': bf16).",
+                        file=sys.stderr,
+                    )
+                processor = AutoProcessor.from_pretrained(pretrained_source, **pretrained_args)
+                ensure_left_padding(processor)
+                model_kwargs = _build_model_kwargs(
+                    normalized_precision,
+                    use_gpu,
+                    target_device,
+                    torch_dtype,
+                    attn_implementation,
+                    int8_skip_modules=GRANITE_INT8_SKIP_MODULES,
                 )
                 model = _load_auto_speech_model(pretrained_source, pretrained_args, model_kwargs)
             else:
@@ -773,7 +838,11 @@ def load_local_asr_model(model_id: str, device_selection: str, cache_path: str, 
                     model = _maybe_compile_whisper_model(model, use_gpu)
 
             model.eval()
-            if uses_cohere_backend(model_id) and target_device != "cpu" and not uses_bnb_quantization:
+            if (
+                (uses_cohere_backend(model_id) or uses_granite_backend(model_id))
+                and target_device != "cpu"
+                and not uses_bnb_quantization
+            ):
                 model.to(target_device)
             model_device, _ = _get_model_device_and_dtype(model)
             if not use_gpu and model_device.type != "cpu":
@@ -1030,4 +1099,6 @@ def transcribe_local_asr_batch(audio_batch: List[np.ndarray], language: str, bat
         return _transcribe_parakeet_batch(model, audio_batch)
     if model_backend == "cohere_transcribe":
         return _transcribe_cohere_batch(processor, model, audio_batch, language=language, batch_size=batch_size)
+    if model_backend == "granite_speech":
+        return transcribe_granite_batch(processor, model, audio_batch, language=language, batch_size=batch_size)
     return _transcribe_whisper_batch(processor, model, audio_batch, language=language)

@@ -102,6 +102,19 @@ BUILTIN_PRESETS: Dict[str, Dict[str, Any]] = {
             "redimnet_max_batch_size": 2,
         },
     },
+    "Granite 24GB VRAM": {
+        "description": "Granite Speech 5.0 2B on a 24 GB card (RTX 3090/4090) next to the other G3 services: the batch "
+        "and ReDimNet values of 24GB VRAM (16 clips, 400 s batches, ReDimNet batch 4, trim on), native bf16, "
+        "granite_compile off. Not measured yet; weights about 4.6 GB bf16 (Cohere: about 4.4 GB plus 1.0 GB CUDA graphs).",
+        "target_vram_gb": None,
+        "values": {
+            **_TIER_COMMON,
+            "local_model": whisper_globals.GRANITE_SPEECH_MODEL_ID,
+            "local_model_precision": "bf16",
+            "granite_compile": "off",
+            "redimnet_max_batch_size": 4,
+        },
+    },
 }
 
 # The model a built-in was measured on. A map, not a key in `values`: loading a tier fills the form, and the three GPU
@@ -111,11 +124,13 @@ BUILTIN_PRESET_MODELS: Dict[str, str] = {
     "24GB VRAM": whisper_globals.COHERE_MODEL_ID,
     "24+8 VRAM": whisper_globals.COHERE_MODEL_ID,
     "Parakeet 8GB VRAM": whisper_globals.PARAKEET_MODEL_ID,
+    "Granite 24GB VRAM": whisper_globals.GRANITE_SPEECH_MODEL_ID,
 }
 # The tier a model starts from the first time it is selected. The two-card tier never applies by itself.
 MODEL_START_PRESETS: Dict[str, str] = {
     whisper_globals.COHERE_MODEL_ID: FIRST_START_PRESET,
     whisper_globals.PARAKEET_MODEL_ID: "Parakeet 8GB VRAM",
+    whisper_globals.GRANITE_SPEECH_MODEL_ID: "Granite 24GB VRAM",
 }
 
 _lock = threading.RLock()

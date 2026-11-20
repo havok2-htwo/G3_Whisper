@@ -16,7 +16,11 @@ thread before any GPU lock is taken: a 1.6 GB first download must never stall th
 or a colocated DIA service, so the GPU phase itself only ever loads a complete local snapshot.
 
 Detection is advisory: when the model cannot be loaded or a clip has too little speech, the request runs with
-COHERE_FALLBACK_LANGUAGE exactly as before and reports why in its warnings. It never fails a request.
+COHERE_FALLBACK_LANGUAGE exactly as before (Granite: "auto", its plain prompt without a language hint, see
+language_detection_fallback) and reports why in its warnings. It never fails a request.
+
+Granite Speech uses the same detector for its prompt hint; a detected language Granite does not support runs the
+plain prompt in the engine.
 """
 
 from __future__ import annotations
@@ -37,14 +41,14 @@ import numpy as np
 import torch
 
 from .genesis_whisper_server_globals import (
-    COHERE_FALLBACK_LANGUAGE,
     COHERE_LANGUAGE_CODES,
     DEFAULT_LANGUAGE_DETECTION_MODEL,
     LANGUAGE_DETECTION_MODEL_OPTIONS,
     current_settings,
+    language_detection_fallback,
     resolve_local_model_cache_path,
     settings_lock,
-    uses_cohere_backend,
+    uses_language_detection_backend,
 )
 from .genesis_whisper_server_gpu import run_sliced_gpu_phase, shared_gpu_lease
 from .genesis_whisper_server_vid import resolve_local_device
@@ -112,7 +116,7 @@ SOURCE_FALLBACK = "fallback"
 
 
 class LanguageDetectionUnavailable(RuntimeError):
-    """The detection model could not be loaded; callers fall back to COHERE_FALLBACK_LANGUAGE."""
+    """The detection model could not be loaded; callers fall back to language_detection_fallback()."""
 
 
 @dataclass(frozen=True)
@@ -222,8 +226,8 @@ def _record_failure(key: tuple, model_id: str, exc: BaseException) -> None:
     _lid_failure.update({"key": key, "error": f"{type(exc).__name__}: {exc}", "at": time.monotonic()})
     if not already_reported:
         print(
-            f"[WARNUNG-LID] Spracherkennung '{model_id}' nicht verfuegbar, Cohere nutzt "
-            f"'{COHERE_FALLBACK_LANGUAGE}': {exc}",
+            f"[WARNUNG-LID] Spracherkennung '{model_id}' nicht verfuegbar, ASR nutzt "
+            f"'{language_detection_fallback()}': {exc}",
             file=sys.stderr,
         )
 
@@ -407,8 +411,8 @@ def apply_lid_device_setting() -> bool:
 
     with settings_lock:
         enabled = current_settings.get("cohere_language_detection", True) is True
-        # Only Cohere uses the detector; after a switch to Whisper or Parakeet its VRAM goes back to the card.
-        enabled = enabled and uses_cohere_backend(str(current_settings.get("local_model") or ""))
+        # Only Cohere and Granite use the detector; after a switch to Whisper or Parakeet its VRAM goes back to the card.
+        enabled = enabled and uses_language_detection_backend(str(current_settings.get("local_model") or ""))
     with _lid_lock:
         # A new choice gets a fresh load attempt instead of waiting out the previous model's retry pause.
         _lid_failure.update({"key": None, "error": None, "at": 0.0})
@@ -600,8 +604,10 @@ def _weighted_majority(languages_and_seconds: Sequence[tuple[str, float]]) -> Op
         totals[language] += max(0.0, float(seconds))
     if not totals:
         return None
-    # Ties go to the language listed first among the Cohere codes, so the result is deterministic.
-    return max(totals, key=lambda code: (totals[code], -COHERE_LANGUAGE_CODES.index(code)))
+    # Ties go to the language listed first among the Cohere codes, so the result is deterministic ("auto", the
+    # Granite fallback, sorts last).
+    order = {code: index for index, code in enumerate(COHERE_LANGUAGE_CODES)}
+    return max(totals, key=lambda code: (totals[code], -order.get(code, len(order))))
 
 
 def _is_confident(result: Optional[LidResult], seconds: float) -> bool:
@@ -611,7 +617,7 @@ def _is_confident(result: Optional[LidResult], seconds: float) -> bool:
 def smooth_chunk_languages(
     results: Sequence[Optional[LidResult]],
     seconds: Sequence[float],
-    fallback: str = COHERE_FALLBACK_LANGUAGE,
+    fallback: Optional[str] = None,
 ) -> List[str]:
     """Per-chunk languages for a transcript: confident chunks keep theirs, the rest take the file majority.
 
@@ -633,7 +639,7 @@ def smooth_chunk_languages(
         ]
     )
     if majority is None:
-        return [fallback for _ in results]
+        return [fallback or language_detection_fallback() for _ in results]
     return [
         result.language if _is_confident(result, chunk_seconds) else majority
         for result, chunk_seconds in zip(results, seconds)
@@ -643,7 +649,7 @@ def smooth_chunk_languages(
 def resolve_speaker_languages(
     results: Mapping[str, Optional[LidResult]],
     seconds: Mapping[str, float],
-    fallback: str = COHERE_FALLBACK_LANGUAGE,
+    fallback: Optional[str] = None,
 ) -> Dict[str, tuple[str, str]]:
     """(language, source) per diarization speaker; one speaker keeps one language for the whole file.
 
@@ -665,7 +671,7 @@ def resolve_speaker_languages(
         elif majority is not None:
             resolved[speaker] = (majority, SOURCE_MAJORITY)
         else:
-            resolved[speaker] = (fallback, SOURCE_FALLBACK)
+            resolved[speaker] = (fallback or language_detection_fallback(), SOURCE_FALLBACK)
     return resolved
 
 
@@ -690,7 +696,7 @@ def turn_language(result: Optional[LidResult], seconds: float, prior: str) -> tu
 def smooth_piece_languages(
     results: Sequence[Optional[LidResult]],
     spans: Sequence[tuple[float, float]],
-    fallback: str = COHERE_FALLBACK_LANGUAGE,
+    fallback: Optional[str] = None,
     seconds: Optional[Sequence[float]] = None,
 ) -> List[str]:
     """Per-piece languages for a long transcript's speech pieces or detection units (time order).
@@ -719,7 +725,7 @@ def smooth_piece_languages(
         [(result.language, piece_seconds) for result, piece_seconds in zip(usable, seconds) if result is not None]
     )
     if majority is None:
-        return [fallback for _ in spans]
+        return [fallback or language_detection_fallback() for _ in spans]
     anchors: List[Optional[str]] = [
         result.language
         if result is not None
@@ -755,8 +761,8 @@ def smooth_piece_languages(
     return languages
 
 
-def dominant_language(languages_and_seconds: Sequence[tuple[str, float]], fallback: str) -> str:
-    return _weighted_majority(languages_and_seconds) or fallback
+def dominant_language(languages_and_seconds: Sequence[tuple[str, float]], fallback: Optional[str] = None) -> str:
+    return _weighted_majority(languages_and_seconds) or fallback or language_detection_fallback()
 
 
 # ---------------------------------------------------------------------------
@@ -794,7 +800,7 @@ class LanguageDecision:
 def unavailable_warning(message: str) -> Dict[str, Any]:
     return {
         "code": "LANGUAGE_DETECTION_UNAVAILABLE",
-        "message": f"{message[:300]} Transcribed as '{COHERE_FALLBACK_LANGUAGE}'.",
+        "message": f"{message[:300]} Transcribed as '{language_detection_fallback()}'.",
     }
 
 
@@ -830,7 +836,7 @@ def _detect_with_features(windows: Sequence[np.ndarray], features: LidFeatures) 
 async def decide_item_languages(gpu_lock: asyncio.Lock, items: Sequence[np.ndarray]) -> LanguageDecision:
     """Detect the language of every ASR item (whole clip or superchunk) and smooth them over the file.
 
-    Never raises: any detection failure becomes COHERE_FALLBACK_LANGUAGE plus a warning.
+    Never raises: any detection failure becomes language_detection_fallback() plus a warning.
     """
 
     started = time.monotonic()
@@ -855,7 +861,7 @@ async def decide_item_languages(gpu_lock: asyncio.Lock, items: Sequence[np.ndarr
                 if mine:
                     item_results[index] = pool_results([result for result, _ in mine], [weight for _, weight in mine])
         except Exception as exc:
-            print(f"[WARNUNG-LID] Spracherkennung fehlgeschlagen, nutze '{COHERE_FALLBACK_LANGUAGE}': {exc}", file=sys.stderr)
+            print(f"[WARNUNG-LID] Spracherkennung fehlgeschlagen, nutze '{language_detection_fallback()}': {exc}", file=sys.stderr)
             warnings.append(unavailable_warning(str(exc)))
             item_results = [None] * len(items)
 
@@ -866,7 +872,7 @@ async def decide_item_languages(gpu_lock: asyncio.Lock, items: Sequence[np.ndarr
         seconds[language] = seconds.get(language, 0.0) + value
     decision = LanguageDecision(
         languages=languages,
-        language=dominant_language(list(zip(languages, item_seconds)), COHERE_FALLBACK_LANGUAGE),
+        language=dominant_language(list(zip(languages, item_seconds))),
         source=SOURCE_DETECTED if detected else SOURCE_FALLBACK,
         model=model_id,
         seconds=seconds,
@@ -915,7 +921,7 @@ async def decide_transcript_items(
             for index, result in zip(detectable, await detect_windows(gpu_lock, windows)):
                 results[index] = result
         except Exception as exc:
-            print(f"[WARNUNG-LID] Spracherkennung fehlgeschlagen, nutze '{COHERE_FALLBACK_LANGUAGE}': {exc}", file=sys.stderr)
+            print(f"[WARNUNG-LID] Spracherkennung fehlgeschlagen, nutze '{language_detection_fallback()}': {exc}", file=sys.stderr)
             warnings.append(unavailable_warning(str(exc)))
             results = [None] * len(units)
     del windows
@@ -926,7 +932,7 @@ async def decide_transcript_items(
         seconds[language] = seconds.get(language, 0.0) + (end - start)
     decision = LanguageDecision(
         languages=languages,
-        language=dominant_language(list(seconds.items()), COHERE_FALLBACK_LANGUAGE),
+        language=dominant_language(list(seconds.items())),
         source=SOURCE_DETECTED if any(result is not None for result in results) else SOURCE_FALLBACK,
         model=model_id,
         seconds=seconds,

@@ -28,6 +28,24 @@ COHERE_MODEL_URL = f"https://huggingface.co/{COHERE_MODEL_ID}"
 # ONNX export of NVIDIA's Parakeet TDT 0.6B v3, run through onnx-asr (no PyTorch weights involved).
 PARAKEET_MODEL_ID = "istupakov/parakeet-tdt-0.6b-v3-onnx"
 PARAKEET_ONNX_MODEL_NAME = "nemo-parakeet-tdt-0.6b-v3"
+# IBM Granite Speech 5.0 2B (Apache 2.0): conformer encoder + Q-Former projector + Granite 2B LLM, bf16 weights.
+GRANITE_SPEECH_MODEL_ID = "ibm-granite/granite-speech-5.0-2b"
+# The ASR languages Granite takes as a prompt hint, with the English name the prompt uses. Any other language
+# (or "auto") runs the plain prompt without a hint: Granite transcribes without one.
+GRANITE_LANGUAGE_NAMES: Dict[str, str] = {
+    "en": "English",
+    "fr": "French",
+    "de": "German",
+    "es": "Spanish",
+    "pt": "Portuguese",
+    "ja": "Japanese",
+}
+GRANITE_LANGUAGE_CODES = tuple(GRANITE_LANGUAGE_NAMES)
+# out_llm.safetensors is a CTC head transformers never loads (411 MB); assets and the sample wav are docs only.
+GRANITE_DOWNLOAD_IGNORE_PATTERNS = ("out_llm.safetensors", "assets/*", "*.wav")
+# granite_compile: "off" (eager generate), "static_cache" (StaticCache, no compile), "compile" (StaticCache plus
+# torch.compile reduce-overhead of the decode step, CUDA graphs via Inductor; needs Triton and a C++ compiler).
+GRANITE_COMPILE_MODES = ("off", "static_cache", "compile")
 
 LOCAL_ASR_MODEL_SPECS: Dict[str, Dict[str, Any]] = {
     "Cohere Transcribe 03/2026": {
@@ -35,6 +53,12 @@ LOCAL_ASR_MODEL_SPECS: Dict[str, Dict[str, Any]] = {
         "backend": "cohere_transcribe",
         "default_language": COHERE_FALLBACK_LANGUAGE,
         "approx_size_gb": None,
+    },
+    "Granite Speech 5.0 2B": {
+        "value": GRANITE_SPEECH_MODEL_ID,
+        "backend": "granite_speech",
+        "default_language": "auto",
+        "approx_size_gb": 4.7,
     },
     "Parakeet TDT 0.6B v3 (ONNX)": {
         "value": PARAKEET_MODEL_ID,
@@ -86,6 +110,7 @@ LOCAL_ASR_MODEL_MAP: Dict[str, str] = {
 SUPPORTED_LANGUAGE_OPTIONS: Dict[str, str] = {
     # Whisper detects the language itself; Cohere cannot, so with auto it asks the language detection model
     # (cohere_language_detection, genesis_whisper_server_lid) and falls back to COHERE_FALLBACK_LANGUAGE.
+    # Granite uses the same detector for its prompt hint and runs without a hint when detection has no answer.
     "Auto detect": "auto",
     "German (de)": "de",
     "English (en)": "en",
@@ -161,13 +186,32 @@ def uses_parakeet_backend(model_id: str) -> bool:
     return get_local_model_backend(model_id) == "parakeet"
 
 
+def uses_granite_backend(model_id: str) -> bool:
+    return get_local_model_backend(model_id) == "granite_speech"
+
+
+def uses_language_detection_backend(model_id: str) -> bool:
+    """Backends whose "auto" is resolved by the Whisper language detector: Cohere needs a language, Granite
+    takes one as a prompt hint."""
+    return uses_cohere_backend(model_id) or uses_granite_backend(model_id)
+
+
+def language_detection_fallback(model_id: str | None = None) -> str:
+    """The language an item gets when detection has no answer: Cohere's German, Granite's "auto" (plain
+    prompt). Without ``model_id`` the configured ASR model decides."""
+    if model_id is None:
+        with settings_lock:
+            model_id = str(current_settings.get("local_model") or "")
+    return "auto" if uses_granite_backend(model_id) else COHERE_FALLBACK_LANGUAGE
+
+
 def uses_whole_audio_backend(model_id: str) -> bool:
     """Backends that take a whole recording per request (no 30 s Whisper windows).
 
     Their long recordings are cut into scheduler-visible superchunks, so live requests can run
     between the chunks of a bulk file.
     """
-    return uses_cohere_backend(model_id) or uses_parakeet_backend(model_id)
+    return uses_cohere_backend(model_id) or uses_parakeet_backend(model_id) or uses_granite_backend(model_id)
 
 
 def cohere_language_detection_enabled() -> bool:
@@ -179,11 +223,12 @@ def cohere_language_detection_enabled() -> bool:
 def language_detection_applies(model_id: str, language: str | None) -> bool:
     """Whether a request has to run language detection before ASR.
 
-    Only Cohere needs it: it cannot detect a language and takes one as its decoder prompt. ``language`` is the
-    request's override or, without one, the server setting; anything but "auto" is an explicit choice and wins.
-    Whisper detects by itself and Parakeet ignores the language, so both keep "auto" untouched.
+    Cohere needs it: it cannot detect a language and takes one as its decoder prompt. Granite takes the detected
+    language as a prompt hint. ``language`` is the request's override or, without one, the server setting; anything
+    but "auto" is an explicit choice and wins. Whisper detects by itself and Parakeet ignores the language, so both
+    keep "auto" untouched.
     """
-    if not uses_cohere_backend(model_id):
+    if not uses_language_detection_backend(model_id):
         return False
     if (language or "auto").strip().lower() != "auto":
         return False
