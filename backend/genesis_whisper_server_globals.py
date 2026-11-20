@@ -84,7 +84,9 @@ LOCAL_ASR_MODEL_MAP: Dict[str, str] = {
 }
 
 SUPPORTED_LANGUAGE_OPTIONS: Dict[str, str] = {
-    "Auto detect (Whisper only)": "auto",
+    # Whisper detects the language itself; Cohere cannot, so with auto it asks the language detection model
+    # (cohere_language_detection, genesis_whisper_server_lid) and falls back to COHERE_FALLBACK_LANGUAGE.
+    "Auto detect": "auto",
     "German (de)": "de",
     "English (en)": "en",
     "French (fr)": "fr",
@@ -101,6 +103,19 @@ SUPPORTED_LANGUAGE_OPTIONS: Dict[str, str] = {
     "Korean (ko)": "ko",
 }
 SUPPORTED_LANGUAGE_VALUES = set(SUPPORTED_LANGUAGE_OPTIONS.values())
+# The languages Cohere Transcribe takes as its decoder prompt, in option order. Language detection only ever
+# chooses among these, so a detected language is always one the ASR model can be prompted with.
+COHERE_LANGUAGE_CODES = tuple(value for value in SUPPORTED_LANGUAGE_OPTIONS.values() if value != "auto")
+
+# Spoken language identification for Cohere + "auto": a Whisper checkpoint used only for its language token
+# (one encoder pass, one decoder step). Base is the default: on the owner's recordings it was right on every
+# 30 s window and on 95 % of 4 s crops, on CPU too; the larger ones trade VRAM for short-clip robustness.
+DEFAULT_LANGUAGE_DETECTION_MODEL = "openai/whisper-base"
+LANGUAGE_DETECTION_MODEL_OPTIONS: Dict[str, str] = {
+    "Whisper Base (74M, about 0.15 GB)": DEFAULT_LANGUAGE_DETECTION_MODEL,
+    "Whisper Small (244M, about 0.5 GB)": "openai/whisper-small",
+    "Whisper Large v3 Turbo (809M, about 1.6 GB)": "openai/whisper-large-v3-turbo",
+}
 
 SUPPORTED_MODEL_PRECISION_OPTIONS: Dict[str, str] = {
     "BF16": "bf16",
@@ -155,10 +170,36 @@ def uses_whole_audio_backend(model_id: str) -> bool:
     return uses_cohere_backend(model_id) or uses_parakeet_backend(model_id)
 
 
-def get_effective_transcription_language(model_id: str, configured_language: str) -> str:
+def cohere_language_detection_enabled() -> bool:
+    """The admin switch ``cohere_language_detection``; a settings dict without the key counts as the default (on)."""
+    with settings_lock:
+        return current_settings.get("cohere_language_detection", True) is True
+
+
+def language_detection_applies(model_id: str, language: str | None) -> bool:
+    """Whether a request has to run language detection before ASR.
+
+    Only Cohere needs it: it cannot detect a language and takes one as its decoder prompt. ``language`` is the
+    request's override or, without one, the server setting; anything but "auto" is an explicit choice and wins.
+    Whisper detects by itself and Parakeet ignores the language, so both keep "auto" untouched.
+    """
+    if not uses_cohere_backend(model_id):
+        return False
+    if (language or "auto").strip().lower() != "auto":
+        return False
+    return cohere_language_detection_enabled()
+
+
+def get_effective_transcription_language(model_id: str, configured_language: str, *, detection: bool = False) -> str:
+    """The language a model really runs with for ``configured_language``.
+
+    ``detection`` says whether Cohere's "auto" is resolved by language detection per request; then "auto" stays
+    "auto" here (the request decides). Without it, and always inside the ASR engine (the last-resort guard: a
+    request must never prompt Cohere with "auto"), Cohere's "auto" is COHERE_FALLBACK_LANGUAGE.
+    """
     normalized_language = (configured_language or "auto").strip().lower()
     if uses_cohere_backend(model_id) and normalized_language == "auto":
-        return COHERE_FALLBACK_LANGUAGE
+        return "auto" if detection else COHERE_FALLBACK_LANGUAGE
     if normalized_language:
         return normalized_language
     return get_local_model_spec(model_id).get("default_language", "auto")
