@@ -68,7 +68,7 @@ type JobEntry = {
   finished_at?: string;
 };
 
-type BenchmarkWorkflow = "whisper_chunk_queue" | "cohere_audio_batch" | string;
+type BenchmarkWorkflow = "whisper_chunk_queue" | "cohere_audio_batch" | "granite_audio_batch" | string;
 type DashboardHistoryPoint = {
   queueSize: number;
   pendingBufferSize: number;
@@ -116,6 +116,7 @@ const emptySettings: AdminSettings = {
   scheduler_first_chunk_fast_path: true,
   cuda_memory_trim_after_batch: true,
   cohere_cuda_graphs: true,
+  granite_compile: "off",
   cohere_language_detection: true,
   language_detection_model: "openai/whisper-base",
   redimnet_max_batch_size: 8,
@@ -236,6 +237,9 @@ function formatBackendLabel(backend: string) {
   if (backend === "cohere_transcribe") {
     return "Cohere";
   }
+  if (backend === "granite_speech") {
+    return "Granite Speech";
+  }
   return backend === "parakeet" ? "Parakeet (ONNX)" : "Whisper";
 }
 
@@ -249,6 +253,9 @@ function describeBenchmarkWorkflow(workflow: BenchmarkWorkflow) {
   }
   if (workflow === "parakeet_audio_batch") {
     return "Parakeet Whole-Audio Batch";
+  }
+  if (workflow === "granite_audio_batch") {
+    return "Granite Whole-Audio Batch";
   }
   if (workflow === "whisper_chunk_queue") {
     return "Whisper Chunk-Queue";
@@ -2426,8 +2433,9 @@ export default function App() {
                 <p className="field-note preset-copy">
                   Only presets of the active model are listed. Cohere Transcribe has the built-in GPU tiers 32GB VRAM
                   (RTX 5090) and 24GB VRAM (RTX 4090) with every G3 service on one card, and 24+8 VRAM on the 24 GB
-                  card of a two-GPU box (the GPU is picked by card size). Parakeet has Parakeet 8GB VRAM. Whisper
-                  models have no built-in tier. Loading fills the form below; Save Settings applies it.
+                  card of a two-GPU box (the GPU is picked by card size). Parakeet has Parakeet 8GB VRAM. Granite
+                  Speech has Granite 24GB VRAM (the Cohere 24 GB values in bf16, not measured yet). Whisper models
+                  have no built-in tier. Loading fills the form below; Save Settings applies it.
                 </p>
               </div>
               <label>
@@ -2671,12 +2679,14 @@ export default function App() {
                     onChange={(event) => updateSetting("cohere_language_detection", event.target.checked)}
                   />
                   <span>
-                    Detect the language (Cohere, language Auto detect)
+                    Detect the language (Cohere and Granite, language Auto detect)
                     <small>
                       Cohere cannot detect a language itself. With Auto detect, a small Whisper model picks one of the
                       14 Cohere languages per request before transcription: per clip, per ~25 s chunk of a long file,
                       per speaker in diarization. An explicit language (setting or request) always wins. Off, or when
-                      the detection model cannot be loaded, Auto detect transcribes as German.
+                      the detection model cannot be loaded, Auto detect transcribes as German. Granite uses the result
+                      as a prompt hint for English, French, German, Spanish, Portuguese and Japanese; other languages
+                      and the fallback run without a hint (never forced to German).
                     </small>
                   </span>
                 </label>
@@ -2723,6 +2733,28 @@ export default function App() {
                     </small>
                   </span>
                 </label>
+              )}
+
+              {activeModelFields.includes("granite_compile") && (
+                <>
+                  <label className="full-width">
+                    <span>Granite speed mode</span>
+                    <select
+                      value={settingsForm.granite_compile}
+                      onChange={(event) => updateSetting("granite_compile", event.target.value)}
+                    >
+                      <option value="off">Off (eager generate)</option>
+                      <option value="static_cache">Static cache</option>
+                      <option value="compile">Static cache + torch.compile (CUDA graphs)</option>
+                    </select>
+                  </label>
+                  <p className="field-note full-width">
+                    Off until measured on the target GPU. Static cache keeps a fixed KV cache between batches (capped
+                    at 1.5 GB VRAM, larger batches run eager); compile additionally compiles the decode step with
+                    torch.compile reduce-overhead and needs CUDA, Triton and a C++ compiler. Any failure falls back to
+                    eager until the next restart. Applies to the next batch.
+                  </p>
+                </>
               )}
 
               <div className="settings-form preset-settings service-settings full-width">
