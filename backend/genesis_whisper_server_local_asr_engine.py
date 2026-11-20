@@ -434,7 +434,7 @@ def _prepare_model_loading_options(device_selection: str, model_precision: str) 
     return use_gpu, target_device, torch_dtype, attn_implementation
 
 
-def _resolve_backend_attention_implementation(model_id: str, requested_attn_implementation: str) -> str:
+def _resolve_backend_attention_implementation(model_id: str, requested_attn_implementation: str) -> Optional[str]:
     if uses_cohere_backend(model_id):
         if requested_attn_implementation != "eager":
             print(
@@ -443,10 +443,11 @@ def _resolve_backend_attention_implementation(model_id: str, requested_attn_impl
             )
         return "eager"
     if uses_granite_backend(model_id):
-        # GraniteSpeechPreTrainedModel has _supports_flash_attn = False (the Q-Former projector).
+        # No explicit value: transformers then picks sdpa per sub-model where supported (LLM, encoder) and eager for
+        # the Q-Former projector, which rejects both sdpa and flash_attention_2 when they are requested explicitly.
         if requested_attn_implementation != "sdpa":
-            print("[INFO] Granite-Backend nutzt attn_implementation='sdpa' (flash_attention_2 nicht unterstuetzt).", file=sys.stderr)
-        return "sdpa"
+            print("[INFO] Granite-Backend: flash_attention_2 nicht unterstuetzt, transformers waehlt sdpa/eager je Teilmodell.", file=sys.stderr)
+        return None
     return requested_attn_implementation
 
 
@@ -676,15 +677,16 @@ def _build_model_kwargs(
     use_gpu: bool,
     target_device: str,
     torch_dtype: torch.dtype,
-    attn_implementation: str,
+    attn_implementation: Optional[str],
     trust_remote_code: bool = False,
     int8_skip_modules: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     model_kwargs: Dict[str, Any] = {
         "dtype": torch_dtype,
         "low_cpu_mem_usage": True,
-        "attn_implementation": attn_implementation,
     }
+    if attn_implementation is not None:
+        model_kwargs["attn_implementation"] = attn_implementation
     if trust_remote_code:
         model_kwargs["trust_remote_code"] = True
 

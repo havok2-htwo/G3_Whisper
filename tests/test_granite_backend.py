@@ -162,10 +162,12 @@ class GraniteRegistryTests(unittest.TestCase):
             open(os.path.join(snapshot, "chat_template.jinja"), "w").close()
             self.assertTrue(engine._is_snapshot_ready_for_model(GRANITE_SPEECH_MODEL_ID, snapshot))
 
-    def test_attention_is_sdpa_even_when_flash_attention_is_installed(self):
+    def test_attention_is_left_to_transformers_even_when_flash_attention_is_installed(self):
+        # An explicit "sdpa" makes the Q-Former projector raise; without a value transformers picks per sub-model.
         with contextlib.redirect_stderr(io.StringIO()):
-            self.assertEqual(engine._resolve_backend_attention_implementation(GRANITE_SPEECH_MODEL_ID, "flash_attention_2"), "sdpa")
-        self.assertEqual(engine._resolve_backend_attention_implementation(GRANITE_SPEECH_MODEL_ID, "sdpa"), "sdpa")
+            self.assertIsNone(engine._resolve_backend_attention_implementation(GRANITE_SPEECH_MODEL_ID, "flash_attention_2"))
+        self.assertIsNone(engine._resolve_backend_attention_implementation(GRANITE_SPEECH_MODEL_ID, "sdpa"))
+        self.assertNotIn("attn_implementation", engine._build_model_kwargs("bf16", True, "cuda:0", torch.bfloat16, None))
 
 
 class GraniteLanguageTests(unittest.TestCase):
@@ -400,7 +402,7 @@ class GraniteSpeedModeTests(_SpeedStateCase):
 
 
 class GraniteLoaderTests(unittest.TestCase):
-    def test_loader_uses_sdpa_left_padding_and_stores_the_granite_backend(self):
+    def test_loader_leaves_attention_to_transformers_enforces_left_padding_and_stores_the_backend(self):
         processor = _FakeProcessor()
         processor.tokenizer.padding_side = "right"
         model = _FakeModel()
@@ -419,7 +421,7 @@ class GraniteLoaderTests(unittest.TestCase):
         source.assert_called_once()
         self.assertNotIn("trust_remote_code", processor_load.call_args.kwargs)
         model_kwargs = model_load.call_args.args[2]
-        self.assertEqual(model_kwargs["attn_implementation"], "sdpa")
+        self.assertNotIn("attn_implementation", model_kwargs)
         self.assertNotIn("trust_remote_code", model_kwargs)
         self.assertEqual(processor.tokenizer.padding_side, "left")
         self.assertEqual(stored["model_backend"], "granite_speech")
