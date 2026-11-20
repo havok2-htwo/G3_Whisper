@@ -5,11 +5,12 @@
 ## Purpose
 
 `G3_WHISPER` is a local transcription server based on FastAPI + React/Vite.
-It provides a simple upload API for audio and video files, features a protected admin dashboard, and currently supports three local ASR paths:
+It provides a simple upload API for audio and video files, features a protected admin dashboard, and currently supports four local ASR paths:
 
 - Whisper models via Hugging Face `transformers`
 - `CohereLabs/cohere-transcribe-03-2026` (default on first start)
 - `istupakov/parakeet-tdt-0.6b-v3-onnx` (NVIDIA Parakeet TDT 0.6B v3 as ONNX, run through `onnx-asr`; see "Parakeet (ONNX)" below)
+- `ibm-granite/granite-speech-5.0-2b` (IBM Granite Speech 5.0 2B via `transformers`, Apache 2.0; see "Granite Speech" below)
 
 Cohere Transcribe is a gated model: accept its license at [https://huggingface.co/CohereLabs/cohere-transcribe-03-2026](https://huggingface.co/CohereLabs/cohere-transcribe-03-2026) with the Hugging Face account whose token you configure, otherwise the download fails.
 
@@ -114,7 +115,9 @@ Core backend files:
   - protected admin endpoints
   - settings, stats, queue, benchmark
 - [backend/genesis_whisper_server_local_asr_engine.py](x:/dev/G3_WHISPER/backend/genesis_whisper_server_local_asr_engine.py)
-  - local loading and inference for Whisper, Cohere and Parakeet (ONNX via onnx-asr)
+  - local loading and inference for Whisper, Cohere, Granite Speech and Parakeet (ONNX via onnx-asr)
+- [backend/genesis_whisper_server_granite_speech.py](x:/dev/G3_WHISPER/backend/genesis_whisper_server_granite_speech.py)
+  - Granite Speech batched generate, prompts, long-clip split, speed modes (`granite_compile`)
 - [backend/genesis_whisper_server_batching.py](x:/dev/G3_WHISPER/backend/genesis_whisper_server_batching.py)
   - queuing and batch processing for Whisper
 - [backend/genesis_whisper_server_chunking.py](x:/dev/G3_WHISPER/backend/genesis_whisper_server_chunking.py)
@@ -224,7 +227,7 @@ Behavior:
 - If `voice_ident=false`, the request is allowed to enter the Whisper batch worker.
 - If `voice_ident=true`, the request is intentionally processed serially under a GPU lock.
 - If the active model is a Whisper model, audio is split into speech segments prior to batch inference.
-- If the active model is Cohere or Parakeet, the request is cut into superchunks (Silero regions merged to about 25 s) and queued like any other job, so live requests can run between the chunks of a long file.
+- If the active model is Cohere, Granite Speech or Parakeet, the request is cut into superchunks (Silero regions merged to about 25 s) and queued like any other job, so live requests can run between the chunks of a long file.
 - For gated Cohere loads, the runtime path now completes an incomplete Hugging Face snapshot first and only then loads the model from the finished local snapshot.
 - Only the native `POST /transcribe/` route can return a `voice_vector`.
 - The legacy response keys remain unchanged, but `voice_vector` now contains exactly 192 ReDimNet2 values instead of the former 512 values.
@@ -413,6 +416,7 @@ The current ASR model list is maintained centrally in [backend/genesis_whisper_s
 Currently available:
 
 - `CohereLabs/cohere-transcribe-03-2026`
+- `ibm-granite/granite-speech-5.0-2b` (label "Granite Speech 5.0 2B")
 - `istupakov/parakeet-tdt-0.6b-v3-onnx` (Parakeet TDT 0.6B v3, ONNX; label "Parakeet TDT 0.6B v3 (ONNX)")
 - `openai/whisper-large-v3-turbo`
 - `openai/whisper-large-v3`
@@ -439,6 +443,9 @@ one encoder pass per 30 s window, one decoder step, a softmax over only the 14 C
   (same batched pass) reaches 0.85 for another language runs in that language (mixed DIA clusters, a speaker switching
   for a sentence). WXC chunks are cut at language changes, a single-language file is chunked exactly as before.
 - An explicit language always wins. Whisper detects by itself, Parakeet ignores the language: neither runs detection.
+- Granite Speech uses the same detection (same switch `cohere_language_detection`, same detector) for its prompt hint.
+  A detected or explicit `en`/`fr`/`de`/`es`/`pt`/`ja` becomes the language-id prompt; any other language, `auto` and the
+  detection fallback run the plain prompt without a hint. Granite's fallback is `auto`, never `de`.
 - The detector loads from the model cache (downloaded on first use on a worker thread, outside the GPU lock), follows
   `local_gpu_device` (FP16 on CUDA, FP32 on CPU), runs under the GPU lock in slices (features computed outside it) and is warmed at startup when Cohere
   is active; it is unloaded when another ASR model is selected. If it cannot be loaded, Cohere falls back to `de`
@@ -487,6 +494,31 @@ Batches of 16 long clips are slower than batches of 4 on this card, and the batc
 measurements. The default `batch_max_audio_seconds` (100 s) keeps scheduler batches in the fast range, so leave it at the
 default for this backend. Only the 100 s bound is verified; larger values are untested.
 
+### Granite Speech
+
+`ibm-granite/granite-speech-5.0-2b` (Apache 2.0, not gated) is a conformer encoder, a Q-Former projector and a Granite
+2B LLM, loaded with `transformers` (`GraniteSpeechForConditionalGeneration`, no remote code) from the model cache.
+
+- Download: about 4.7 GB. `out_llm.safetensors` (a 411 MB CTC head transformers never loads), `assets/` and the sample
+  wav are skipped. A snapshot is ready only with `chat_template.jinja` and `processor_config.json`.
+- Precision: the weights are bf16. The start tier "Granite 24GB VRAM" sets `bf16`; `fp16` also works through the normal
+  precision setting (logged as a hint), `int8_bnb` keeps encoder, projector and output head unquantized. CPU runs fp32.
+- Attention: left to transformers (`sdpa` for the LLM and encoder, `eager` for the Q-Former projector). An explicit
+  `sdpa` or `flash_attention_2` makes the projector refuse to load, so the flash-attn choice of the other backends is
+  not passed.
+- Batching: one scheduler batch becomes one processor call and one greedy `generate` (`num_beams=1`) per sub-batch of at
+  most 16 clips, left padded, each clip with its own number of audio tokens (10 per second). Clips are sorted by length
+  first because the encoder has no padding mask; results come back in input order. `max_new_tokens` is
+  `10 x seconds of the longest clip + 32` (cap 1024). Clips over 60 s are cut at the quietest moment and their texts joined.
+- Language: see "Cohere Language Detection". The language-id prompt is
+  `The speech is in <Language>. Transcribe it exactly; do not translate. transcribe the speech with proper punctuation and capitalization.`
+- Long audio takes the same superchunk path as Cohere.
+- `granite_compile` (per model, default `off`, admin "Granite speed mode"): `static_cache` runs `generate` with a
+  StaticCache (kept in the model between batches, at most 1.5 GB, larger batches run eager); `compile` adds HF's
+  `torch.compile` of the decode step with mode `reduce-overhead` (CUDA graphs; needs CUDA, Triton and a C++ compiler,
+  otherwise eager). Any failure of a fast mode is logged once and the process stays eager until restart. Applies to the
+  next batch. Not measured yet.
+
 ## Optimizations
 
 The local ASR path already utilizes several optimizations:
@@ -507,7 +539,8 @@ The local ASR path already utilizes several optimizations:
   scheduler can interleave other requests between them instead of holding the GPU for one
   whole-file call
 - real batched inference: Whisper uses one processor/model forward per worker batch;
-  Cohere uses sub-batches of at most 16 audio items and performs its own long-audio chunking
+  Cohere uses sub-batches of at most 16 audio items and performs its own long-audio chunking;
+  Granite Speech runs one `generate` per sub-batch of at most 16 length-sorted clips
 - startup warmup of the configured ASR model with a sample clip, or a synthetic clip when
   `testaudio/` is missing (see "Startup Warmup" below)
 - idle CUDA-cache trimming, enabled by default (`cuda_memory_trim_after_batch`), 5 s after the
@@ -857,7 +890,7 @@ order in the admin is: pick the model, then its presets, then its settings.
   accepted during that failed selection run on the restored model. Selecting the active model
   while it is not loaded retries the load.
 - A model selected for the first time starts from the tier it owns (Cohere `24GB VRAM`,
-  Parakeet `Parakeet 8GB VRAM`), a Whisper size keeps the current values. In both cases it
+  Parakeet `Parakeet 8GB VRAM`, Granite Speech `Granite 24GB VRAM`), a Whisper size keeps the current values. In both cases it
   takes the old model's effective language, so clients keep getting the same language:
   `/transcribe/` and `/v1/audio/transcriptions` cannot send one. Cohere's `auto` stays `auto` while
   language detection is on (the next model detects too) and means `de` when it is off.
@@ -878,7 +911,8 @@ Save Settings applies it. Presets hold only model, device, precision, batching, 
 and VRAM settings, never the token, the DIA connection, the language or the model cache
 path; saved presets live in `logs/genesis_whisper_presets.json`. The tier values were
 measured on the RTX 5090 (see "GPU Tier Presets" below). A preset belongs to a model: the
-listing derives `model_id` (the three GPU tiers Cohere, `Parakeet 8GB VRAM` Parakeet, saved
+listing derives `model_id` (the three GPU tiers Cohere, `Parakeet 8GB VRAM` Parakeet,
+`Granite 24GB VRAM` Granite Speech, saved
 presets their `local_model`, `null` fits every model) and `?model_id=` filters by it.
 
 ### GPU Tier Presets
@@ -894,6 +928,7 @@ counter: 9672 vs 9671 MiB).
 | `24GB VRAM` | same, `redimnet_max_batch_size` 4 | ~6.3 GB | ~8.3 GB |
 | `24+8 VRAM` | same as `24GB VRAM`; `local_gpu_device` = the 24 GB card | ~6.3 GB | ~8.3 GB |
 | `Parakeet 8GB VRAM` | `local_model` Parakeet TDT 0.6B v3 (ONNX), `batch_max_segments` 4, `batch_max_audio_seconds` 100, `redimnet_max_batch_size` 2, trim on; no device pinning | ~3.3 GB (Parakeet alone) | ~5.2 GB (Parakeet alone; ReDimNet and MMS_FA on the same card not measured) |
+| `Granite 24GB VRAM` | `local_model` Granite Speech 5.0 2B, bf16, `granite_compile` off, otherwise the `24GB VRAM` values (`batch_max_segments` 16, `batch_max_audio_seconds` 400, `redimnet_max_batch_size` 4, trim on) | not measured (weights ~4.6 GB, no graph pool) | not measured |
 
 Why these values:
 

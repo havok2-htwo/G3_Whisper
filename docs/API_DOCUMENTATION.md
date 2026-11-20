@@ -86,6 +86,10 @@ The request JSON accepts an optional top-level `language`. Accepted values are
 which are exactly the 14 languages the Cohere Transcribe model supports (its
 remote code hard-validates this list and raises on anything else). On Whisper
 backends `auto` enables Whisper's own detection; Parakeet ignores the language.
+Granite Speech (`ibm-granite/granite-speech-5.0-2b`) takes `en`, `fr`, `de`, `es`,
+`pt` and `ja` as a prompt hint ("The speech is in German. Transcribe it exactly;
+do not translate."); every other code and `auto` run its plain transcription
+prompt without a hint, so they stay valid requests.
 Note that Cohere treats the language as a decoder prompt prior, not a hard
 constraint: clearly spoken passages in another supported language may still be
 transcribed in that language (relevant for code-switched meetings).
@@ -107,6 +111,12 @@ encoder pass per 30 s window, restricted to the 14 Cohere languages, so the
 result is always a language Cohere accepts. An explicit language (request or
 server setting) always wins and runs no detection; Whisper and Parakeet backends
 never run it.
+
+Granite Speech uses the same detection with the same switch and detector for its
+prompt hint. A detected language outside Granite's six runs the plain prompt;
+the response still names the detected code. When detection has no answer
+(too little speech, detector unavailable), Granite's fallback is `auto` (plain
+prompt, reported as `language: "auto"` with source `fallback`), never `de`.
 
 - `transcript` / `transcript_embedding`: a clip up to 60 s gets one decision
   (one window up to 30 s, two windows pooled for 30-60 s). A longer file is
@@ -1083,6 +1093,7 @@ Response shape:
   "model_fields": {
     "whisper": ["local_gpu_device", "batch_wait_time_ms", "local_model_precision", "transcription_language"],
     "cohere_transcribe": ["local_gpu_device", "local_model_precision", "transcription_language", "cohere_cuda_graphs", "cohere_language_detection", "language_detection_model"],
+    "granite_speech": ["local_gpu_device", "local_model_precision", "transcription_language", "granite_compile", "cohere_language_detection", "language_detection_model"],
     "parakeet": ["local_gpu_device", "batch_wait_time_ms"]
   },
   "service_fields": [
@@ -1153,7 +1164,8 @@ Notes:
 - `scheduler_first_chunk_fast_path` (default `true`) gives a request that has not been served yet a small batch of its own instead of a seat in a full batch of a long recording; batches are always shared round-robin between active requests.
 - `cuda_memory_trim_after_batch` defaults to `true`: once every local GPU phase (ASR batches, ReDimNet clouds, MMS_FA alignment, verification, embeddings, startup warmups, model reloads) has been quiet for 5 s, Whisper releases the unused process-wide CUDA allocator pool so the idle footprint stays near the model floor on a shared GPU; the next request re-reserves its pool (about +80 ms once for a ReDimNet batch). Disable it only on a dedicated GPU.
 - `cohere_cuda_graphs` defaults to `true`: for the Cohere model on CUDA in `fp16`/`bf16`, encoder and greedy decoder run as captured CUDA graphs (2 s clip ~270 -> 30 ms, 14 s file ~0.9 -> 0.12 s on an RTX 4090, identical transcripts) for ~0.55 GB of graph memory after warmup and a hard cap of 1.5 GB. Changing it does not reload the model (`model_reloaded` stays `false`); it applies on the next model load (server restart or a change of model, device, precision or cache path). Other precisions and Whisper models ignore it. A snapshot without `generation_config.json` no longer disables the graphs: the missing eos/pad token ids are taken from the model config or the tokenizer (logged as a warning).
-- `cohere_language_detection` (strict boolean, default `true`) turns on language detection for Cohere with an effective language `auto` (see [Language detection on Cohere](#language-detection-on-cohere-auto)); off, Cohere's `auto` is `de` as before. `language_detection_model` picks the detector: `openai/whisper-base` (default, about 0.15 GB), `openai/whisper-small` or `openai/whisper-large-v3-turbo`; an unknown id falls back to the default. The detector is loaded from the model cache (`local_model_cache_path`, downloaded on first use with the saved Hugging Face token), follows `local_gpu_device` (FP16 on CUDA, FP32 on CPU) and is warmed at startup when Cohere is active. Changing either key never reloads the ASR model (`model_reloaded` stays `false`): a changed model, the switch turned off or a switch to a non-Cohere ASR model unloads the old detector right away, the next request loads the new one. Neither key is a preset key, so loading a preset never turns detection off.
+- `granite_compile` (default `"off"`, allowed `"off"`, `"static_cache"`, `"compile"`; anything else becomes `"off"`) is the Granite Speech speed mode. `static_cache` runs `generate` with a StaticCache that stays in the model between batches (at most 1.5 GB; a batch that would need more runs eager), `compile` adds HF's `torch.compile` of the decode step with mode `reduce-overhead` (CUDA graphs; needs CUDA, Triton and a C++ compiler, otherwise eager). Any failure of a fast mode is logged once and the process runs eager until restart. It applies to the next batch, no reload. Other backends ignore it. Not measured yet, so the default stays off.
+- `cohere_language_detection` (strict boolean, default `true`) turns on language detection for Cohere and Granite Speech with an effective language `auto` (see [Language detection on Cohere](#language-detection-on-cohere-auto)); off, Cohere's `auto` is `de` as before. `language_detection_model` picks the detector: `openai/whisper-base` (default, about 0.15 GB), `openai/whisper-small` or `openai/whisper-large-v3-turbo`; an unknown id falls back to the default. The detector is loaded from the model cache (`local_model_cache_path`, downloaded on first use with the saved Hugging Face token), follows `local_gpu_device` (FP16 on CUDA, FP32 on CPU) and is warmed at startup when Cohere is active. Changing either key never reloads the ASR model (`model_reloaded` stays `false`): a changed model, the switch turned off or a switch to a non-Cohere ASR model unloads the old detector right away, the next request loads the new one. Neither key is a preset key, so loading a preset never turns detection off.
 - `redimnet_max_batch_size` (default `8`, allowed `1`/`2`/`4`/`8`; other numbers snap down to the next allowed value, a non-number falls back to `8`) is the largest ReDimNet CUDA batch for speaker clouds, verification and embeddings. The reserved pool scales with it (RTX 5090: 746 / 1442 / 2816 MiB for 2 / 4 / 8; 60-min diarization 23.2 s at 4 vs 19.6 s at 8). It applies on save without a restart: a loaded ReDimNet is re-warmed for the new buckets and its old pool released (`model_reloaded` stays `false`).
 - ReDimNet and MMS_FA alignment run on the `local_gpu_device` card like the ASR model; changing the device moves them on save.
 - `debug_retain_history_audio` defaults to `false`. When enabled, successful public API requests may retain their byte-identical original upload for the 25-row admin history; disabling it blocks access immediately and purges retained audio after active readers finish.
@@ -1174,7 +1186,8 @@ Purpose:
 - lists the named settings presets: the built-in GPU tiers first, in tier order, then the saved presets by name
 - built-in tiers (identical names across the G3 services): `32GB VRAM` (RTX 5090, every G3 service on one card), `24GB VRAM` (RTX 4090, every G3 service on one card) and `24+8 VRAM` (3090 + 2070S box, Whisper on the 24 GB card). Whisper has no `8+24 VRAM` tier; on the two-GPU box only DIA runs on the 8 GB card.
 - a tier with a `target_vram_gb` gets `local_gpu_device` set to the CUDA card whose total memory matches within 2 GiB (machines number their cards differently); if no card matches, `local_gpu_device` is left out and `note` explains why. Single-card tiers never set the GPU.
-- `model_id` is derived for each item and never part of `values`: `32GB VRAM`, `24GB VRAM` and `24+8 VRAM` belong to Cohere, `Parakeet 8GB VRAM` to Parakeet, a saved preset to its `values.local_model`. `null` means usable for every model.
+- `model_id` is derived for each item and never part of `values`: `32GB VRAM`, `24GB VRAM` and `24+8 VRAM` belong to Cohere, `Parakeet 8GB VRAM` to Parakeet, `Granite 24GB VRAM` to Granite Speech, a saved preset to its `values.local_model`. `null` means usable for every model.
+- `Granite 24GB VRAM` (not measured yet): the batch and ReDimNet values of `24GB VRAM` (`batch_max_segments` 16, `batch_max_audio_seconds` 400, `redimnet_max_batch_size` 4, trim on) with `local_model_precision` `bf16` (the native weight type) and `granite_compile` `off`.
 
 Query params:
 
@@ -1230,7 +1243,7 @@ Request body:
 
 Notes:
 
-- only the preset keys are stored: `local_model`, `local_gpu_device`, `local_model_precision`, `batch_wait_time_ms`, `batch_max_segments`, `batch_max_audio_seconds`, `scheduler_long_job_min_chunks`, `scheduler_max_parallel_long_jobs`, `scheduler_first_chunk_fast_path`, `cuda_memory_trim_after_batch`, `cohere_cuda_graphs`, `redimnet_max_batch_size`. Every other key (token, DIA URL/key, model cache path, language, debug audio) is dropped; the kept values are normalised exactly like saved settings.
+- only the preset keys are stored: `local_model`, `local_gpu_device`, `local_model_precision`, `batch_wait_time_ms`, `batch_max_segments`, `batch_max_audio_seconds`, `scheduler_long_job_min_chunks`, `scheduler_max_parallel_long_jobs`, `scheduler_first_chunk_fast_path`, `cuda_memory_trim_after_batch`, `cohere_cuda_graphs`, `granite_compile`, `redimnet_max_batch_size`. Every other key (token, DIA URL/key, model cache path, language, debug audio) is dropped; the kept values are normalised exactly like saved settings.
 - names are trimmed, inner whitespace collapsed, at most 64 characters
 - `400` for an empty or too long name, a built-in tier name, or values without any preset key
 - presets are stored in `logs/genesis_whisper_presets.json` next to the settings file (atomic write)
@@ -1342,13 +1355,13 @@ Request body:
 Behavior:
 
 - the tuned values of the old model go to its profile in `model_profiles`, the target's profile applies. Tuned are the preset keys without `local_model` and `local_gpu_device`, plus `transcription_language`.
-- a target without a profile starts from the tier it owns (Cohere `24GB VRAM`, Parakeet `Parakeet 8GB VRAM`), a Whisper size keeps the current values
+- a target without a profile starts from the tier it owns (Cohere `24GB VRAM`, Parakeet `Parakeet 8GB VRAM`, Granite Speech `Granite 24GB VRAM`), a Whisper size keeps the current values
 - the language must not change for clients: a target without a profile takes the old model's effective language. Cohere with `auto` and language detection on hands `auto` to the next model (Whisper then detects by itself); with detection off it hands `de`
 - device, cache path, token, DIA settings and the debug audio switch do not move
 - the settings are saved first, then the model loads under the GPU lock and ReDimNet and MMS_FA are re-prepared when needed, the same path as `PUT /api/admin/settings`
 - the same model while it is loaded is a no-op with `ok: true` and `model_reloaded: false`
 - the same model while it is not loaded loads it: this is the retry after a failed load. No setting changes and `model_reloaded` is `true`; a load that fails again is a `500` and the selection stays.
-- requests that were accepted during a selection that failed run on the restored model instead of repeating the failing load. A request that named its own language keeps it, unless it equals the failed model's language. `models.asr.id` and the history name the restored model. Only one case cannot move: a chunk longer than 30 s made for Cohere or Parakeet when Whisper is restored, because Whisper would cut it. That request gets a retryable `503` (`/v2/audio/process`: `MODEL_UNAVAILABLE`).
+- requests that were accepted during a selection that failed run on the restored model instead of repeating the failing load. A request that named its own language keeps it, unless it equals the failed model's language. `models.asr.id` and the history name the restored model. Only one case cannot move: a chunk longer than 30 s made for Cohere, Granite Speech or Parakeet when Whisper is restored, because Whisper would cut it. That request gets a retryable `503` (`/v2/audio/process`: `MODEL_UNAVAILABLE`).
 - after a successful selection requests already queued under the old model finish on the old model, also long ones. Their batches take turns with new requests, and each turn reloads the other model, so both are slower until the old queue is empty. The results are correct, and `loaded` can show `false` for the selected model in that time.
 
 Status codes:
