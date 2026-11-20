@@ -1010,7 +1010,11 @@ def create_admin_api(app: FastAPI) -> FastAPI:
         retry_id = uuid.uuid4().hex
         request_started = time.monotonic()
         try:
+            from .genesis_whisper_server_keywords import resolve_glossary, sanitize_keyword_setting
             from .genesis_whisper_server_v2 import _generate_embedding, _record_log, _transcribe_audio
+
+            # The source request's own terms again, after today's server glossary.
+            request_keywords = sanitize_keyword_setting((source_entry or {}).get("request_keywords"))
 
             try:
                 with open(lease.path, "rb") as retained_file:
@@ -1022,7 +1026,9 @@ def create_admin_api(app: FastAPI) -> FastAPI:
             except Exception as exc:
                 raise HTTPException(status_code=400, detail=f"Retained audio could not be decoded: {exc}") from exc
 
-            transcript, transcription_ms, _, model_id, language = await _transcribe_audio(request, audio)
+            transcript, transcription_ms, _, model_id, language = await _transcribe_audio(
+                request, audio, glossary=resolve_glossary(request_keywords)
+            )
             transcript = filter_repeated_patterns(transcript)
             embedding_ms: int | None = None
             warnings: list[dict[str, str]] = list(language.warnings)
@@ -1048,6 +1054,7 @@ def create_admin_api(app: FastAPI) -> FastAPI:
                 transcript,
                 retry_of=history_id,
                 existing_blob_id=lease.blob_id,
+                request_keywords=request_keywords,
             )
             timings: dict[str, int] = {
                 "decode": decode_ms,

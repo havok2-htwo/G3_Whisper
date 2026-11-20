@@ -252,6 +252,32 @@ class AdminHistoryRouteTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 422, response.text)
 
+    def test_retry_sends_the_source_request_keywords_after_the_server_glossary(self) -> None:
+        with settings_lock:
+            current_settings["asr_keywords"] = ["Genesis"]
+        source_id = self._append_with_audio(request_keywords=["Optimus", "OmniVoice"])
+        transcribe = mock.AsyncMock(return_value=("Retried", 12, 1, "mock-asr", _GERMAN))
+        with (
+            mock.patch.object(admin, "load_audio_file", return_value=np.full(16_000, 0.1, dtype=np.float32)),
+            mock.patch.object(v2, "_transcribe_audio", new=transcribe),
+            mock.patch.object(v2, "log_transcription"),
+            TestClient(self.app) as client,
+        ):
+            response = client.post(f"/api/admin/history/{source_id}/retry")
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(transcribe.await_args.kwargs["glossary"].terms, ("Genesis", "Optimus", "OmniVoice"))
+        retry_entry = history.get_history_entry(response.json()["history_id"])
+        # A retry of the retry sends the same terms again.
+        self.assertEqual(retry_entry["request_keywords"], ["Optimus", "OmniVoice"])
+
+    def test_record_log_stores_the_request_keywords_only_when_there_are_any(self) -> None:
+        request = SimpleNamespace(client=SimpleNamespace(host="127.0.0.1"))
+        with mock.patch.object(v2, "log_transcription"):
+            v2._record_log(request, "with-terms", "transcript", "m", 1, 1, None, "t", request_keywords=[" Optimus ", "optimus", ""])
+            v2._record_log(request, "without-terms", "transcript", "m", 1, 1, None, "t")
+        self.assertEqual(history.get_history_entry("with-terms")["request_keywords"], ["Optimus"])
+        self.assertNotIn("request_keywords", history.get_history_entry("without-terms"))
+
     def test_transcript_and_embedding_retries_create_linked_timed_rows_and_reuse_blob(self) -> None:
         original = b"one retained blob for source and retry"
         audio_array = np.full(16_000, 0.1, dtype=np.float32)

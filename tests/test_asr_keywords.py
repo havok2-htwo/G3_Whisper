@@ -354,6 +354,35 @@ class GranitePromptTests(_SpeedStateCase):
         granite.transcribe_granite_batch(_FakeProcessor(), model, [clip(2.0)], "de", 16, keywords=("Genesis",))
         self.assertEqual(model.generate_calls[0]["cache_implementation"], "static")
 
+    def test_an_eager_length_skip_keeps_the_compiled_step_for_the_next_sub_batch(self):
+        current_settings["granite_compile"] = "static_cache"
+        processor, model = _FakeProcessor(), _FakeModel(dtype=torch.bfloat16)
+        longest = granite.GRANITE_MAX_ITEM_SECONDS
+        # A glossary the longest clip cannot fit into the static cache with, a short clip still can.
+        terms = ()
+        for count in range(1, 1000):
+            candidate = tuple(f"Begriff{index:04d}" for index in range(count))
+            prompt = granite.prompt_tokens(processor, candidate)
+            if not granite.fits_static_cache(granite.estimated_total_tokens(longest, "ja", prompt)):
+                terms = candidate
+                break
+        self.assertTrue(terms)
+        self.assertTrue(granite.fits_static_cache(granite.estimated_total_tokens(2.0, "ja", prompt)))
+        compiled = object()
+        model.__dict__["_compiled_call"] = compiled
+        model.__dict__["_cache"] = object()
+        granite._speed_state["compiled_shapes"] = {(1, 256)}
+        with mock.patch.object(granite, "_reset_compiled_graphs") as reset:
+            granite.transcribe_granite_batch(processor, model, [clip(longest), clip(2.0)], "ja", 1, keywords=terms)
+        reset.assert_not_called()
+        self.assertIs(model.__dict__.get("_compiled_call"), compiled)
+        self.assertIn((1, 256), granite._speed_state["compiled_shapes"])
+        # One row per sub-batch: the long one eager, then the short one with the static cache again.
+        self.assertEqual(len(model.generate_calls), 2)
+        self.assertNotIn("cache_implementation", model.generate_calls[0])
+        self.assertEqual(model.generate_calls[1]["cache_implementation"], "static")
+        self.assertEqual(granite.speed_stats()["length_skips"], 1)
+
     def test_a_real_input_beyond_the_largest_bucket_falls_back_to_eager(self):
         current_settings["granite_compile"] = "static_cache"
         model = _FakeModel()

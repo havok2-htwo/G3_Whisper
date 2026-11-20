@@ -122,8 +122,8 @@ Processing:
    dropped (counts as truncated); duplicates are removed case-insensitively, the
    first spelling and order are kept.
 3. Limits: at most 1000 terms and 16000 characters in all (sum of the term
-   lengths). The excess is cut from the end, so request terms go before server
-   terms. Any cut or dropped term sets `truncated: true` and adds the warning
+   lengths). The excess is cut from the end, so request terms are dropped before
+   server terms. Any cut or dropped term sets `truncated: true` and adds the warning
    `{"code": "KEYWORDS_TRUNCATED"}` (the response status is then `partial`, as for
    every warning).
 
@@ -1570,6 +1570,11 @@ Supported retry modes are `transcript` and `transcript_embedding`. Legacy
 identification map to `transcript`; v2 transcript modes remain unchanged. Pure `embedding`
 and `diarization` entries expose `retry_mode: null` because DIA profiles and request metadata
 are not retained.
+
+A v2 request's own `keywords` are kept with its history entry (as
+`request_keywords`, normalised and capped, only when there are any). A retry sends them
+again after the current server glossary `asr_keywords`, so the retried transcript uses the
+same terms as the original run.
 
 A successful response identifies the new entry and its source:
 

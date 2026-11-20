@@ -459,12 +459,20 @@ def _record_fast_call(model: Any, mode: str, batch: int, cache_length: int) -> N
         )
 
 
-def _generate_with_fallback(model: Any, inputs: Any, needed_new_tokens: int, mode: str, rows: int) -> torch.Tensor:
-    """Generate in ``mode`` with an eager fallback; ``inputs`` may carry padding rows beyond ``rows`` (fast modes)."""
+def _generate_with_fallback(
+    model: Any, inputs: Any, needed_new_tokens: int, mode: str, rows: int, force_eager: bool = False
+) -> torch.Tensor:
+    """Generate in ``mode`` with an eager fallback; ``inputs`` may carry padding rows beyond ``rows`` (fast modes).
+
+    ``force_eager``: one sub-batch too long for the static cache (counted by the caller) runs eager in an active fast
+    mode; only the cache is freed, the compiled step stays for the next sub-batch that fits.
+    """
 
     if mode == "off":
         # A cache or compiled step left by a fast mode switched off since would hold its VRAM for nothing.
         release_speed_state(model)
+    elif force_eager:
+        release_speed_state(model, keep_compiled=True)
     else:
         input_length = int(inputs["input_ids"].shape[1])
         batch = int(inputs["input_ids"].shape[0])
@@ -559,12 +567,13 @@ def _transcribe_sub_batch(
     language: Optional[str],
     mode: str,
     keywords: Sequence[str] = (),
+    force_eager: bool = False,
 ) -> List[str]:
     device = _model_device(model)
     prompt = build_prompt(processor, language, keywords)
     rows = len(clips)
     batch_clips = list(clips)
-    if mode != "off":
+    if mode != "off" and not force_eager:
         # Fixed row buckets keep the static cache and the compiled shapes reusable; padding rows repeat the shortest clip.
         batch_clips += [clips[-1]] * (bucket_batch_size(rows) - rows)
     # A list of 1-D float32 arrays: the feature extractor pads them itself and keeps each clip's own length.
@@ -572,7 +581,7 @@ def _transcribe_sub_batch(
     inputs = inputs.to(device)
     longest_seconds = max(len(clip) for clip in clips) / SAMPLE_RATE
     needed = max_new_tokens_for(longest_seconds, language)
-    output = _generate_with_fallback(model, inputs, needed, mode, rows)
+    output = _generate_with_fallback(model, inputs, needed, mode, rows, force_eager)
     # Left padding: every row's prompt ends at the same column.
     new_tokens = output[:rows, inputs["input_ids"].shape[1] :]
     truncated = _count_truncated_rows(new_tokens, needed, _stop_token_ids(processor, model))
@@ -619,17 +628,19 @@ def transcribe_granite_batch(
         start = 0
         for size in sub_batch_sizes(seconds, max_rows, language, model, mode != "off", prompt):
             chunk = ordered[start : start + size]
-            sub_mode = mode
+            force_eager = False
             if mode != "off":
                 # A fast mode that failed on an earlier sub-batch is off now.
-                mode = sub_mode = _effective_speed_mode(model, _model_device(model))
-                if sub_mode != "off" and not fits_static_cache(estimated_total_tokens(seconds[start], language, prompt)):
-                    # Sized eager by sub_batch_sizes: no padding rows, no static cache.
-                    sub_mode = "off"
+                mode = _effective_speed_mode(model, _model_device(model))
+                if mode != "off" and not fits_static_cache(estimated_total_tokens(seconds[start], language, prompt)):
+                    # Sized eager by sub_batch_sizes: no padding rows, no static cache; the compiled step stays.
+                    force_eager = True
                     with _state_lock:
                         _speed_state["length_skips"] += 1
             start += size
-            results = _transcribe_sub_batch(processor, model, [part[2] for part in chunk], language, sub_mode, keywords)
+            results = _transcribe_sub_batch(
+                processor, model, [part[2] for part in chunk], language, mode, keywords, force_eager
+            )
             for (index, order, _), text in zip(chunk, results):
                 texts_by_part[(index, order)] = text
 

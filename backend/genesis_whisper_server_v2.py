@@ -47,6 +47,7 @@ from .genesis_whisper_server_keywords import (
     keywords_block,
     parse_request_keywords,
     resolve_glossary,
+    sanitize_keyword_setting,
     truncation_warnings,
     with_keywords,
 )
@@ -1075,6 +1076,7 @@ def _record_log(
     *,
     retry_of: str | None = None,
     existing_blob_id: str | None = None,
+    request_keywords: Sequence[str] | None = None,
 ) -> None:
     entry = {
         "history_id": history_id,
@@ -1090,6 +1092,10 @@ def _record_log(
         "retry_of": retry_of,
         "retry_mode": mode if mode in {"transcript", "transcript_embedding"} else None,
     }
+    # The request's own glossary terms (normalised, capped), so a history retry sends them again.
+    stored_keywords = sanitize_keyword_setting(list(request_keywords or []))
+    if stored_keywords:
+        entry["request_keywords"] = stored_keywords
     append_history_entry(entry, existing_blob_id=existing_blob_id)
     log_transcription(entry)
 
@@ -1654,6 +1660,7 @@ def create_v2_api(app: FastAPI) -> FastAPI:
                 transcription_ms,
                 embedding_ms,
                 transcript_text,
+                request_keywords=parsed.get("keywords") if glossary is not None else None,
             )
             with settings_lock:
                 retain_history_audio = current_settings.get("debug_retain_history_audio", False) is True
