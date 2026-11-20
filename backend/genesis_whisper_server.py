@@ -129,6 +129,33 @@ def _warmup_redimnet() -> None:
         )
 
 
+def _warmup_lid() -> None:
+    """Eager-load the language detection model and run it once, only where requests will use it.
+
+    Only Cohere needs detection (Whisper detects itself, Parakeet ignores the language), and only while
+    cohere_language_detection is on. Best-effort like the other warmups: a failure leaves the lazy load (and the
+    COHERE_FALLBACK_LANGUAGE fallback) in place.
+    """
+
+    try:
+        from .genesis_whisper_server_globals import cohere_language_detection_enabled, uses_cohere_backend
+        from .genesis_whisper_server_lid import configured_lid_model, detect_languages, load_lid_model
+
+        if not uses_cohere_backend(str(current_settings.get("local_model") or "")):
+            return
+        if not cohere_language_detection_enabled():
+            print("[WARMUP-LID] Spracherkennung abgeschaltet -> uebersprungen.", file=sys.stderr)
+            return
+        print(f"[WARMUP-LID] Lade Spracherkennung '{configured_lid_model()}' ...", file=sys.stderr)
+        if not load_lid_model():
+            print("[WARMUP-LID] Spracherkennung nicht verfuegbar; lazy Retry bleibt aktiv.", file=sys.stderr)
+            return
+        detect_languages([_synthetic_warmup_audio()])
+        print("[WARMUP-LID] Spracherkennung ist bereit.", file=sys.stderr)
+    except Exception as exc:
+        print(f"[WARMUP-LID] nicht-kritischer Warmup-Fehler ({type(exc).__name__}: {exc}).", file=sys.stderr)
+
+
 async def startup_server(app: FastAPI):
     print("--- GENESIS Transcription Server wird gestartet (FastAPI + React + lokales ASR-Batching) ---", file=sys.stderr)
 
@@ -166,6 +193,8 @@ async def startup_server(app: FastAPI):
     # warm; the allocator pool its warmup reserved (2.8 GB at batch 8) is released
     # by the batch worker's idle trim 5 s later, like after every other GPU phase.
     await run_blocking_gpu_phase(_warmup_redimnet)
+    # The language detector (about 0.15 GB with whisper-base) comes last, after the ASR trim like ReDimNet.
+    await run_blocking_gpu_phase(_warmup_lid)
 
 
 async def shutdown_server(app: FastAPI):

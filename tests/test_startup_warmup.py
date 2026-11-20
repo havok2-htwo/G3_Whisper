@@ -1,6 +1,7 @@
 """Startup warmup: a synthetic clip replaces the missing testaudio sample, so model load and graph capture still
 happen at startup. Runs without a GPU: the ASR engine calls are mocked.
 """
+import asyncio
 import tempfile
 import unittest
 from pathlib import Path
@@ -9,6 +10,7 @@ from unittest import mock
 import numpy as np
 
 from backend import genesis_whisper_server as server
+from backend import genesis_whisper_server_lid as lid
 from backend import genesis_whisper_server_local_asr_engine as engine
 from backend.genesis_whisper_server_globals import current_settings
 
@@ -86,6 +88,54 @@ class StartupWarmupTests(unittest.TestCase):
         ):
             server._warmup_local_asr()
         transcribe.assert_not_called()
+
+
+class LanguageDetectionWarmupTests(unittest.TestCase):
+    def setUp(self) -> None:
+        patcher = mock.patch.dict(current_settings, {**WARMUP_SETTINGS, "cohere_language_detection": True}, clear=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_cohere_with_detection_loads_and_runs_the_detector_once(self) -> None:
+        with (
+            mock.patch.object(lid, "load_lid_model", return_value=True) as load,
+            mock.patch.object(lid, "detect_languages", return_value=[]) as detect,
+        ):
+            server._warmup_lid()
+        load.assert_called_once_with()
+        detect.assert_called_once()
+        self.assertEqual(len(detect.call_args.args[0]), 1)
+
+    def test_no_detector_for_other_backends_or_when_switched_off(self) -> None:
+        for values in ({"local_model": "openai/whisper-large-v3-turbo"}, {"cohere_language_detection": False}):
+            with self.subTest(values=values):
+                current_settings.update(values)
+                with mock.patch.object(lid, "load_lid_model") as load:
+                    server._warmup_lid()
+                load.assert_not_called()
+                current_settings.update({**WARMUP_SETTINGS, "cohere_language_detection": True})
+
+    def test_a_detector_failure_never_escapes_the_warmup(self) -> None:
+        with mock.patch.object(lid, "load_lid_model", side_effect=RuntimeError("CUDA error")):
+            server._warmup_lid()
+
+    def test_startup_warms_asr_then_redimnet_then_the_detector(self) -> None:
+        order = []
+
+        async def phase(function, *args, **kwargs):
+            order.append(function.__name__)
+
+        app = mock.Mock()
+        manager = mock.Mock()
+        manager.start = mock.AsyncMock()
+        with (
+            mock.patch.object(server, "load_settings_or_first_start_preset", return_value=(dict(current_settings), False)),
+            mock.patch.object(server, "reset_history_audio_store"),
+            mock.patch.object(server, "WhisperBatchManager", return_value=manager),
+            mock.patch.object(server, "run_blocking_gpu_phase", side_effect=phase),
+        ):
+            asyncio.run(server.startup_server(app))
+        self.assertEqual(order, ["_warmup_local_asr", "_warmup_redimnet", "_warmup_lid"])
 
 
 if __name__ == "__main__":

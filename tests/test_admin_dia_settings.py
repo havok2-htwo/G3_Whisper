@@ -182,6 +182,44 @@ class AdminDiaSettingsTests(unittest.TestCase):
         persisted = json.loads(self.settings_file.read_text(encoding="utf-8"))
         self.assertEqual(persisted["redimnet_max_batch_size"], 4)
 
+    def test_language_detection_settings_apply_without_reloading_the_asr_model(self) -> None:
+        endpoint = self._endpoint("/api/admin/settings", "PUT")
+        self.assertTrue(admin.current_settings["cohere_language_detection"])
+        self.assertEqual(admin.current_settings["language_detection_model"], "openai/whisper-base")
+
+        with (
+            mock.patch.object(admin, "_reload_model", new=mock.AsyncMock(return_value=True)) as reload,
+            mock.patch.object(admin, "apply_lid_device_setting", return_value=True) as lid_apply,
+            mock.patch.object(admin, "apply_vid_settings", return_value=False),
+            mock.patch.object(admin, "apply_mms_device_setting", return_value=False),
+        ):
+            for payload, expected in (
+                (admin.AdminSettingsPayload(language_detection_model="openai/whisper-small"), "openai/whisper-small"),
+                # An unknown id is not an error, it falls back to the default detector.
+                (admin.AdminSettingsPayload(language_detection_model="facebook/mms-lid-126"), "openai/whisper-base"),
+            ):
+                response = asyncio.run(endpoint(payload, self._request(), {"username": "admin"}))
+                self.assertEqual(response["settings"]["language_detection_model"], expected)
+                self.assertFalse(response["model_reloaded"])
+            response = asyncio.run(
+                endpoint(admin.AdminSettingsPayload(cohere_language_detection=False), self._request(), {"username": "admin"})
+            )
+        self.assertFalse(response["settings"]["cohere_language_detection"])
+        reload.assert_not_awaited()
+        self.assertEqual(lid_apply.call_count, 3)
+        self.assertEqual(
+            [option["value"] for option in response["options"]["language_detection_models"]],
+            ["openai/whisper-base", "openai/whisper-small", "openai/whisper-large-v3-turbo"],
+        )
+        persisted = json.loads(self.settings_file.read_text(encoding="utf-8"))
+        self.assertFalse(persisted["cohere_language_detection"])
+
+    def test_language_detection_switch_is_a_strict_boolean(self) -> None:
+        self.assertTrue(storage.normalize_settings({"cohere_language_detection": "false"})["cohere_language_detection"])
+        self.assertFalse(storage.normalize_settings({"cohere_language_detection": False})["cohere_language_detection"])
+        with self.assertRaises(Exception):
+            admin.AdminSettingsPayload(cohere_language_detection="false")
+
     def test_gpu_device_change_also_moves_the_voice_models(self) -> None:
         endpoint = self._endpoint("/api/admin/settings", "PUT")
         with (

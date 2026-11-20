@@ -39,6 +39,7 @@ from .genesis_whisper_server_globals import (
     history_lock,
     is_local_model_loaded,
     local_model_components,
+    LANGUAGE_DETECTION_MODEL_OPTIONS,
     LOCAL_ASR_MODEL_MAP,
     SUPPORTED_LANGUAGE_OPTIONS,
     SUPPORTED_MODEL_PRECISION_OPTIONS,
@@ -85,6 +86,7 @@ from .genesis_whisper_server_storage import (
     save_settings,
     with_model_profiles,
 )
+from .genesis_whisper_server_lid import apply_lid_device_setting
 from .genesis_whisper_server_vid import apply_vid_settings
 from .genesis_whisper_server_wxc import apply_mms_device_setting
 
@@ -108,6 +110,8 @@ class AdminSettingsPayload(BaseModel):
     scheduler_first_chunk_fast_path: bool | None = None
     cuda_memory_trim_after_batch: bool | None = None
     cohere_cuda_graphs: bool | None = None
+    cohere_language_detection: StrictBool | None = None
+    language_detection_model: str | None = None
     redimnet_max_batch_size: int | None = None
     debug_retain_history_audio: StrictBool | None = None
     huggingface_token: str | None = None
@@ -218,7 +222,16 @@ def _settings_options() -> Dict[str, List[Dict[str, Any]]]:
     devices = [{"label": label, "value": DEVICE_MAP_UI_TO_INTERNAL[label]} for label in AVAILABLE_DEVICES]
     languages = [{"label": label, "value": value} for label, value in SUPPORTED_LANGUAGE_OPTIONS.items()]
     precisions = [{"label": label, "value": value} for label, value in SUPPORTED_MODEL_PRECISION_OPTIONS.items()]
-    return {"models": models, "devices": devices, "languages": languages, "precisions": precisions}
+    language_detection_models = [
+        {"label": label, "value": value} for label, value in LANGUAGE_DETECTION_MODEL_OPTIONS.items()
+    ]
+    return {
+        "models": models,
+        "devices": devices,
+        "languages": languages,
+        "precisions": precisions,
+        "language_detection_models": language_detection_models,
+    }
 
 
 def _model_rows(storage_path: str) -> List[Dict[str, Any]]:
@@ -315,9 +328,13 @@ async def _load_model_or_error(request: Request, settings_snapshot: Dict[str, An
 
 
 def _apply_voice_model_settings() -> Dict[str, bool]:
-    """Move/re-warm the loaded ReDimNet and MMS_FA models for the saved settings (GPU thread)."""
+    """Move/re-warm the loaded ReDimNet, MMS_FA and language detection models for the saved settings (GPU thread)."""
 
-    return {"redimnet": apply_vid_settings(), "mms_fa": apply_mms_device_setting()}
+    return {
+        "redimnet": apply_vid_settings(),
+        "mms_fa": apply_mms_device_setting(),
+        "language_detection": apply_lid_device_setting(),
+    }
 
 
 async def _reprepare_voice_models(
@@ -325,12 +342,18 @@ async def _reprepare_voice_models(
     previous_settings: Dict[str, Any],
     saved_settings: Dict[str, Any],
 ) -> None:
-    """ReDimNet and MMS_FA follow local_gpu_device, ReDimNet also its max batch. Re-prepare loaded
-    models now, so the old card / the larger bucket pool is released and the next request is warm."""
+    """ReDimNet, MMS_FA and the language detection model follow local_gpu_device, ReDimNet also its max batch,
+    the detector its model choice and switch. Re-prepare loaded models now, so the old card / the larger bucket
+    pool / a replaced detector is released and the next request is warm. None of these reloads the ASR model."""
 
     voice_settings_changed = any(
         previous_settings.get(key) != saved_settings.get(key)
-        for key in ("local_gpu_device", "redimnet_max_batch_size")
+        for key in (
+            "local_gpu_device",
+            "redimnet_max_batch_size",
+            "language_detection_model",
+            "cohere_language_detection",
+        )
     )
     if not voice_settings_changed:
         return

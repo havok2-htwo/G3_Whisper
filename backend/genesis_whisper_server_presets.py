@@ -244,14 +244,20 @@ def model_selection_values(settings: Dict[str, Any], model_id: str) -> Dict[str,
     """Tuned values for model_id replacing the model of settings: its profile, else its start tier, else nothing.
 
     Clients cannot send a language on /transcribe/ and /v1, so without a saved language the new model takes the one
-    the old model really used: Cohere with "auto" runs German, a Whisper model must not start detecting instead.
+    the old model really used: Cohere with "auto" and language detection detects per request, so the next model
+    gets "auto" (Whisper detects by itself); with detection off Cohere runs German, and a Whisper model must not
+    start detecting instead.
     """
     start_preset = BUILTIN_PRESETS.get(MODEL_START_PRESETS.get(model_id, ""), {})
     source = settings.get("model_profiles", {}).get(model_id) or start_preset.get("values", {})
     values = {key: source[key] for key in MODEL_TUNED_KEYS if key in source}
     values.setdefault(
         "transcription_language",
-        get_effective_transcription_language(settings["local_model"], settings["transcription_language"]),
+        get_effective_transcription_language(
+            settings["local_model"],
+            settings["transcription_language"],
+            detection=settings.get("cohere_language_detection", True) is True,
+        ),
     )
     return values
 

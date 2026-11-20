@@ -116,6 +116,8 @@ const emptySettings: AdminSettings = {
   scheduler_first_chunk_fast_path: true,
   cuda_memory_trim_after_batch: true,
   cohere_cuda_graphs: true,
+  cohere_language_detection: true,
+  language_detection_model: "openai/whisper-base",
   redimnet_max_batch_size: 8,
   debug_retain_history_audio: false,
   huggingface_token: "",
@@ -639,6 +641,7 @@ export default function App() {
     devices: [],
     precisions: [],
     languages: [],
+    language_detection_models: [],
   });
   const [modelFields, setModelFields] = useState<Record<string, string[]>>({});
   const [serviceFields, setServiceFields] = useState<string[]>([]);
@@ -704,7 +707,7 @@ export default function App() {
       setPresetFailed(false);
       setManagedModels([]);
       setLoadedModelIdentifier(null);
-      setSettingsOptions({ models: [], devices: [], precisions: [], languages: [] });
+      setSettingsOptions({ models: [], devices: [], precisions: [], languages: [], language_detection_models: [] });
       setModelFields({});
       setServiceFields([]);
       setApiKeys([]);
@@ -2658,6 +2661,49 @@ export default function App() {
                     </small>
                   </span>
                 </label>
+              )}
+
+              {activeModelFields.includes("cohere_language_detection") && (
+                <label className="settings-checkbox full-width">
+                  <input
+                    type="checkbox"
+                    checked={settingsForm.cohere_language_detection}
+                    onChange={(event) => updateSetting("cohere_language_detection", event.target.checked)}
+                  />
+                  <span>
+                    Detect the language (Cohere, language Auto detect)
+                    <small>
+                      Cohere cannot detect a language itself. With Auto detect, a small Whisper model picks one of the
+                      14 Cohere languages per request before transcription: per clip, per ~25 s chunk of a long file,
+                      per speaker in diarization. An explicit language (setting or request) always wins. Off, or when
+                      the detection model cannot be loaded, Auto detect transcribes as German.
+                    </small>
+                  </span>
+                </label>
+              )}
+
+              {activeModelFields.includes("language_detection_model") && (
+                <>
+                  <label className="full-width">
+                    <span>Language detection model</span>
+                    <select
+                      value={settingsForm.language_detection_model}
+                      disabled={!settingsForm.cohere_language_detection}
+                      onChange={(event) => updateSetting("language_detection_model", event.target.value)}
+                    >
+                      {(settingsOptions.language_detection_models ?? []).map((option) => (
+                        <option key={option.value} value={option.value}>
+                          {option.label}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <p className="field-note full-width">
+                    Downloaded into the model cache on first use. Base is enough for most audio; Small and Large v3
+                    Turbo are steadier on very short clips for more VRAM. Applies on save and never reloads the ASR
+                    model.
+                  </p>
+                </>
               )}
 
               {activeModelFields.includes("cohere_cuda_graphs") && (

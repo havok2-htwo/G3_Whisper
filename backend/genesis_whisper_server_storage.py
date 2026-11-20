@@ -7,6 +7,8 @@ from dotenv import load_dotenv
 
 from .genesis_whisper_server_globals import (
     COHERE_MODEL_ID,
+    DEFAULT_LANGUAGE_DETECTION_MODEL,
+    LANGUAGE_DETECTION_MODEL_OPTIONS,
     LOCAL_ASR_MODEL_MAP,
     LOG_FILE,
     LOGS_DIR,
@@ -42,6 +44,8 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "scheduler_first_chunk_fast_path": True,
     "cuda_memory_trim_after_batch": True,
     "cohere_cuda_graphs": True,
+    "cohere_language_detection": True,
+    "language_detection_model": DEFAULT_LANGUAGE_DETECTION_MODEL,
     "redimnet_max_batch_size": 8,
     "debug_retain_history_audio": False,
     "huggingface_token": "",
@@ -52,7 +56,9 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
 
 # Keys a preset may set: model choice, device, precision, batching, scheduler and VRAM behaviour. Machine-specific
 # values (local_model_cache_path), secrets (huggingface_token, dia_api_key), the DIA URL, the transcription language
-# and the debug audio switch stay out, so loading a preset never touches them.
+# and the debug audio switch stay out, so loading a preset never touches them. So does language detection
+# (cohere_language_detection, language_detection_model): it decides what "auto" means, not how much VRAM a tier
+# needs (the default detector is about 0.15 GB next to Cohere), and a preset must not switch it off silently.
 PRESET_KEYS: Tuple[str, ...] = (
     "local_model",
     "local_gpu_device",
@@ -88,7 +94,14 @@ _COMMON_MODEL_FIELDS: Tuple[str, ...] = (
 )
 MODEL_SETTINGS_FIELDS: Dict[str, Tuple[str, ...]] = {
     "whisper": _COMMON_MODEL_FIELDS + ("local_model_precision", "transcription_language"),
-    "cohere_transcribe": _COMMON_MODEL_FIELDS + ("local_model_precision", "transcription_language", "cohere_cuda_graphs"),
+    "cohere_transcribe": _COMMON_MODEL_FIELDS
+    + (
+        "local_model_precision",
+        "transcription_language",
+        "cohere_cuda_graphs",
+        "cohere_language_detection",
+        "language_detection_model",
+    ),
     "parakeet": _COMMON_MODEL_FIELDS,
 }
 SERVICE_SETTINGS_FIELDS: Tuple[str, ...] = (
@@ -251,6 +264,24 @@ def normalize_settings(settings: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         configured_cuda_graphs
         if isinstance(configured_cuda_graphs, bool)
         else DEFAULT_SETTINGS["cohere_cuda_graphs"]
+    )
+
+    configured_language_detection = source.get(
+        "cohere_language_detection",
+        DEFAULT_SETTINGS["cohere_language_detection"],
+    )
+    normalized["cohere_language_detection"] = (
+        configured_language_detection
+        if isinstance(configured_language_detection, bool)
+        else DEFAULT_SETTINGS["cohere_language_detection"]
+    )
+    configured_detection_model = str(
+        source.get("language_detection_model", DEFAULT_SETTINGS["language_detection_model"]) or ""
+    ).strip()
+    normalized["language_detection_model"] = (
+        configured_detection_model
+        if configured_detection_model in LANGUAGE_DETECTION_MODEL_OPTIONS.values()
+        else DEFAULT_SETTINGS["language_detection_model"]
     )
 
     normalized["redimnet_max_batch_size"] = normalize_redimnet_max_batch_size(

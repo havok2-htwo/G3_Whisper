@@ -23,6 +23,8 @@ export type AdminSettings = {
   scheduler_first_chunk_fast_path: boolean;
   cuda_memory_trim_after_batch: boolean;
   cohere_cuda_graphs: boolean;
+  cohere_language_detection: boolean;
+  language_detection_model: string;
   redimnet_max_batch_size: number;
   debug_retain_history_audio: boolean;
   huggingface_token: string;
@@ -106,6 +108,7 @@ export type SettingsResponse = {
     devices: AdminOption[];
     precisions: AdminOption[];
     languages: AdminOption[];
+    language_detection_models: AdminOption[];
   };
   models: ManagedModel[];
   loaded_model_identifier: string[] | null;

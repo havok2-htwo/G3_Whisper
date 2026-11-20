@@ -398,8 +398,17 @@ class SelectModelTests(_AdminCase):
         saved = self.saved()
         self.assertEqual((saved["batch_max_segments"], saved["batch_max_audio_seconds"]), (7, 222.0))
 
-    def test_cohere_auto_becomes_german_on_the_next_model(self) -> None:
+    def test_cohere_auto_with_detection_stays_auto_on_the_next_model(self) -> None:
+        # Cohere detected per request, so the next model keeps detecting (Whisper does it itself).
         self.assertEqual(admin.current_settings["transcription_language"], "auto")
+        self.assertTrue(admin.current_settings["cohere_language_detection"])
+        self.select(WHISPER_TURBO)
+        saved = self.saved()
+        self.assertEqual(saved["transcription_language"], "auto")
+        self.assertEqual(saved["model_profiles"][COHERE_MODEL_ID]["transcription_language"], "auto")
+
+    def test_cohere_auto_without_detection_becomes_german_on_the_next_model(self) -> None:
+        self.use_settings(cohere_language_detection=False)
         self.select(WHISPER_TURBO)
         saved = self.saved()
         self.assertEqual(saved["transcription_language"], "de")
@@ -411,6 +420,7 @@ class SelectModelTests(_AdminCase):
         self.assertEqual(self.saved()["transcription_language"], "fr")
 
     def test_german_survives_a_chain_through_parakeet(self) -> None:
+        self.use_settings(cohere_language_detection=False)
         self.select(PARAKEET_MODEL_ID)
         self.select(WHISPER_TURBO)
         self.assertEqual(self.saved()["transcription_language"], "de")
@@ -1016,7 +1026,8 @@ class StaleFormTests(_AdminCase):
 
     def setUp(self) -> None:
         super().setUp()
-        self.use_settings(transcription_language="auto")
+        # Without detection Cohere's "auto" hands "de" on, which tells the old form's "auto" apart from the new model.
+        self.use_settings(transcription_language="auto", cohere_language_detection=False)
 
     def open_form(self) -> dict:
         settings = self.client.get("/api/admin/settings").json()["settings"]
