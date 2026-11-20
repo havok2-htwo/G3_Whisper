@@ -28,6 +28,8 @@ export type AdminSettings = {
   language_detection_model: string;
   redimnet_max_batch_size: number;
   debug_retain_history_audio: boolean;
+  // Server glossary (Granite Speech only), one term per entry; the server trims, dedupes and caps it on save.
+  asr_keywords: string[];
   huggingface_token: string;
   dia_server_base_url: string;
   dia_api_key: string;

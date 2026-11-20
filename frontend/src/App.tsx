@@ -121,6 +121,7 @@ const emptySettings: AdminSettings = {
   language_detection_model: "openai/whisper-base",
   redimnet_max_batch_size: 8,
   debug_retain_history_audio: false,
+  asr_keywords: [],
   huggingface_token: "",
   dia_server_base_url: "",
   dia_api_key: "",
@@ -2887,6 +2888,26 @@ export default function App() {
                       </div>
                     </div>
                   </div>
+                )}
+
+                {serviceFields.includes("asr_keywords") && (
+                  <>
+                    <label className="full-width">
+                      <span>ASR Glossary</span>
+                      <textarea
+                        rows={6}
+                        placeholder={"One term per line, e.g.\nGenesis\nOptimus"}
+                        value={(settingsForm.asr_keywords ?? []).join("\n")}
+                        // Raw lines, blank ones included, so typing stays natural; the server cleans up on save.
+                        onChange={(event) => updateSetting("asr_keywords", event.target.value.split("\n"))}
+                      />
+                    </label>
+                    <p className="field-note full-width">
+                      Names and terms the transcript should spell exactly as written. Used by Granite Speech only (other
+                      models ignore it) and merged before the keywords a request sends. Up to 1000 terms and 16000
+                      characters in all; terms over 100 characters and duplicates are dropped on save.
+                    </p>
+                  </>
                 )}
 
                 {serviceFields.includes("debug_retain_history_audio") && (
