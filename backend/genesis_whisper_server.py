@@ -129,22 +129,41 @@ def _warmup_redimnet() -> None:
         )
 
 
+def _lid_warmup_wanted() -> bool:
+    """Only Cohere needs detection (Whisper detects itself, Parakeet ignores the language), and only while
+    cohere_language_detection is on."""
+
+    from .genesis_whisper_server_globals import cohere_language_detection_enabled, uses_cohere_backend
+
+    return uses_cohere_backend(str(current_settings.get("local_model") or "")) and cohere_language_detection_enabled()
+
+
+def _prepare_lid() -> None:
+    """Download the detector before its GPU warmup (worker thread): no GPU lock or lease is held meanwhile."""
+
+    try:
+        from .genesis_whisper_server_lid import prepare_lid_model
+
+        if _lid_warmup_wanted():
+            prepare_lid_model()
+    except Exception as exc:
+        print(f"[WARMUP-LID] Download fehlgeschlagen ({type(exc).__name__}: {exc}).", file=sys.stderr)
+
+
 def _warmup_lid() -> None:
     """Eager-load the language detection model and run it once, only where requests will use it.
 
-    Only Cohere needs detection (Whisper detects itself, Parakeet ignores the language), and only while
-    cohere_language_detection is on. Best-effort like the other warmups: a failure leaves the lazy load (and the
-    COHERE_FALLBACK_LANGUAGE fallback) in place.
+    Best-effort like the other warmups: a failure leaves the lazy load (and the COHERE_FALLBACK_LANGUAGE
+    fallback) in place. It loads only what ``_prepare_lid`` put on disk.
     """
 
     try:
-        from .genesis_whisper_server_globals import cohere_language_detection_enabled, uses_cohere_backend
+        from .genesis_whisper_server_globals import uses_cohere_backend
         from .genesis_whisper_server_lid import configured_lid_model, detect_languages, load_lid_model
 
-        if not uses_cohere_backend(str(current_settings.get("local_model") or "")):
-            return
-        if not cohere_language_detection_enabled():
-            print("[WARMUP-LID] Spracherkennung abgeschaltet -> uebersprungen.", file=sys.stderr)
+        if not _lid_warmup_wanted():
+            if uses_cohere_backend(str(current_settings.get("local_model") or "")):
+                print("[WARMUP-LID] Spracherkennung abgeschaltet -> uebersprungen.", file=sys.stderr)
             return
         print(f"[WARMUP-LID] Lade Spracherkennung '{configured_lid_model()}' ...", file=sys.stderr)
         if not load_lid_model():
@@ -194,6 +213,8 @@ async def startup_server(app: FastAPI):
     # by the batch worker's idle trim 5 s later, like after every other GPU phase.
     await run_blocking_gpu_phase(_warmup_redimnet)
     # The language detector (about 0.15 GB with whisper-base) comes last, after the ASR trim like ReDimNet.
+    # Its first download runs on a worker thread first, so the GPU phase only loads from disk.
+    await asyncio.to_thread(_prepare_lid)
     await run_blocking_gpu_phase(_warmup_lid)
 
 

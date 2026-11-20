@@ -642,6 +642,7 @@ class SharedSchedulerPathTests(unittest.TestCase):
                     mock.patch.object(legacy_api, "log_transcription") as log_transcription,
                     mock.patch.object(legacy_api, "append_history_entry"),
                     mock.patch.object(lid, "detect_languages", return_value=[detected]),
+                    mock.patch.object(lid, "prepare_lid_model", return_value=True),
                 ):
                     with TestClient(self._legacy_app(batch_manager)) as client:
                         response = client.post(endpoint, files={"file": ("fr.wav", b"fixture", "audio/wav")}, data=form)

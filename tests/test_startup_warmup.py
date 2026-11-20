@@ -133,9 +133,18 @@ class LanguageDetectionWarmupTests(unittest.TestCase):
             mock.patch.object(server, "reset_history_audio_store"),
             mock.patch.object(server, "WhisperBatchManager", return_value=manager),
             mock.patch.object(server, "run_blocking_gpu_phase", side_effect=phase),
+            mock.patch.object(server, "_prepare_lid", side_effect=lambda: order.append("_prepare_lid")),
         ):
             asyncio.run(server.startup_server(app))
-        self.assertEqual(order, ["_warmup_local_asr", "_warmup_redimnet", "_warmup_lid"])
+        # The detector's download runs before its GPU phase, on a worker thread rather than the GPU thread.
+        self.assertEqual(order, ["_warmup_local_asr", "_warmup_redimnet", "_prepare_lid", "_warmup_lid"])
+
+    def test_the_download_step_runs_only_where_the_detector_is_used(self) -> None:
+        with mock.patch.object(lid, "prepare_lid_model", return_value=True) as prepare:
+            server._prepare_lid()
+            current_settings["cohere_language_detection"] = False
+            server._prepare_lid()
+        prepare.assert_called_once_with()
 
 
 if __name__ == "__main__":

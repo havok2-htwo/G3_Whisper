@@ -48,8 +48,9 @@ CHUNK_PAD_S = 0.25                 # never clip a word at chunk edges
 # the recording is cut into superchunks so the scheduler can interleave other
 # requests between them instead of holding the GPU for one monolithic call.
 WHOLE_AUDIO_MAX_S = 60.0
-# A language piece shorter than this inside one Silero region joins its
-# neighbour instead of becoming its own chunk (see _absorb_language_slivers).
+# A language piece shorter than this joins its neighbour instead of becoming its
+# own chunk: inside one Silero region (_absorb_language_slivers) and across
+# regions (_absorb_short_language_runs).
 WXC_LANGUAGE_MIN_PIECE_S = 0.5
 
 # --- sentence-level 192D verification (validated: words <0.6s are noise,
@@ -217,6 +218,39 @@ def _absorb_language_slivers(pieces: list[list[Any]]) -> list[list[Any]]:
     return out
 
 
+def _absorb_short_language_runs(pieces: list[list[Any]]) -> list[list[Any]]:
+    """Relabel a language run with under WXC_LANGUAGE_MIN_PIECE_S of speech to its nearer neighbour's language.
+
+    _absorb_language_slivers only sees one Silero region. A whole short region of another speaker's language
+    (a 0.35 s "yes" between two German regions) would otherwise become its own sub-second chunk that Cohere
+    fills with hallucinated text, and it would also split the surrounding same-language speech in two. Runs
+    span regions; the shortest run goes first, the neighbour with the smaller pause wins.
+    """
+
+    while True:
+        runs: list[list[int]] = []
+        for index, piece in enumerate(pieces):
+            if runs and pieces[runs[-1][0]][2] == piece[2]:
+                runs[-1][1] = index + 1
+            else:
+                runs.append([index, index + 1])
+        if len(runs) < 2:
+            return pieces
+        short = [
+            (sum(pieces[k][1] - pieces[k][0] for k in range(first, stop)), first, stop)
+            for first, stop in runs
+        ]
+        short = [run for run in short if run[0] < WXC_LANGUAGE_MIN_PIECE_S]
+        if not short:
+            return pieces
+        _, first, stop = min(short)
+        gap_before = pieces[first][0] - pieces[first - 1][1] if first > 0 else float("inf")
+        gap_after = pieces[stop][0] - pieces[stop - 1][1] if stop < len(pieces) else float("inf")
+        language = pieces[first - 1][2] if gap_before <= gap_after else pieces[stop][2]
+        for k in range(first, stop):
+            pieces[k][2] = language
+
+
 def build_language_superchunks(
     regions: Sequence[tuple[float, float]],
     language_spans: Sequence[tuple[float, float, str]],
@@ -251,6 +285,7 @@ def build_language_superchunks(
             else:
                 region_pieces.append([start, end, language])
         pieces.extend(_absorb_language_slivers(region_pieces))
+    pieces = _absorb_short_language_runs(pieces)
 
     chunks: list[list[float]] = []
     languages: list[str] = []

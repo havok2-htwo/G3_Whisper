@@ -630,24 +630,26 @@ def _speaker_lid_spans(
         (int(turn["start_ms"]), int(turn["end_ms"]))
         for turn in sorted(turns, key=lambda item: int(item["start_ms"]) - int(item["end_ms"]))
     )
+    # The budget is spent in priority order: each candidate adds only its not yet chosen audio, clipped to what
+    # is left. Trimming the merged list in time order instead could drop every inlier for an early raw turn.
     chosen: list[tuple[int, int]] = []
-    for span in candidates:
-        if span[1] <= span[0]:
-            continue
-        merged = _merge_spans([*chosen, span])
-        chosen = merged
-        if _span_seconds(chosen) >= max_seconds:
-            break
-    # Trim to exactly max_seconds, keeping time order.
-    trimmed: list[tuple[int, int]] = []
     remaining_ms = int(max_seconds * 1000)
-    for start_ms, end_ms in chosen:
+    for start_ms, end_ms in candidates:
         if remaining_ms <= 0:
             break
-        take = min(end_ms - start_ms, remaining_ms)
-        trimmed.append((start_ms, start_ms + take))
-        remaining_ms -= take
-    return trimmed
+        cursor = start_ms
+        for chosen_start, chosen_end in [*chosen, (end_ms, end_ms)]:
+            if remaining_ms <= 0 or cursor >= end_ms:
+                break
+            if chosen_end <= cursor:
+                continue
+            gap_end = min(chosen_start, end_ms)
+            if gap_end > cursor:
+                take = min(gap_end - cursor, remaining_ms)
+                chosen = _merge_spans([*chosen, (cursor, cursor + take)])
+                remaining_ms -= take
+            cursor = max(cursor, chosen_end)
+    return chosen
 
 
 def _spans_audio(audio: np.ndarray, spans: Sequence[tuple[int, int]]) -> np.ndarray:

@@ -435,9 +435,10 @@ one encoder pass per 30 s window, one decoder step, a softmax over only the 14 C
   weak speakers take the confident speakers' majority. WXC chunks are cut at language changes, a single-language file is
   chunked exactly as before.
 - An explicit language always wins. Whisper detects by itself, Parakeet ignores the language: neither runs detection.
-- The detector loads from the model cache (downloaded on first use), follows `local_gpu_device` (FP16 on CUDA, FP32 on
-  CPU), runs under the GPU lock in slices and is warmed at startup when Cohere is active. If it cannot be loaded, Cohere
-  falls back to `de` (`COHERE_FALLBACK_LANGUAGE`) and the response carries `LANGUAGE_DETECTION_UNAVAILABLE`.
+- The detector loads from the model cache (downloaded on first use on a worker thread, outside the GPU lock), follows
+  `local_gpu_device` (FP16 on CUDA, FP32 on CPU), runs under the GPU lock in slices and is warmed at startup when Cohere
+  is active; it is unloaded when another ASR model is selected. If it cannot be loaded, Cohere falls back to `de`
+  (`COHERE_FALLBACK_LANGUAGE`); a v2 response then carries `LANGUAGE_DETECTION_UNAVAILABLE` (v1 only logs it).
 - Measured on the owner's recordings on CPU, whisper-base: 100 % on 30 s windows, 95.5 % on 4 s crops, 83.6 % on 2 s.
 - Known limitation: the diarization text cleanup drops CJK/kana/Hangul and WXC alignment keeps only Latin-letter words,
   so `zh`/`ja`/`ko`/`ar`/`el` diarization text is lossy.

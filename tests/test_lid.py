@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import io
+import os
+import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -14,7 +16,8 @@ import torch
 
 from backend import genesis_whisper_server_lid as lid
 from backend import genesis_whisper_server_wxc as wxc
-from backend.genesis_whisper_server_globals import COHERE_LANGUAGE_CODES, current_settings
+from backend import genesis_whisper_server_v2 as v2
+from backend.genesis_whisper_server_globals import COHERE_LANGUAGE_CODES, COHERE_MODEL_ID, current_settings
 
 # A Whisper-like vocabulary: the 14 Cohere languages plus languages Cohere cannot take.
 _VOCAB = ["<|startoftranscript|>", "<|ru|>", "<|tr|>", *[f"<|{code}|>" for code in COHERE_LANGUAGE_CODES]]
@@ -74,6 +77,7 @@ class _LidCase(unittest.TestCase):
         settings = mock.patch.dict(
             current_settings,
             {
+                "local_model": COHERE_MODEL_ID,
                 "local_model_cache_path": "",
                 "local_gpu_device": "cpu",
                 "cohere_language_detection": True,
@@ -83,6 +87,10 @@ class _LidCase(unittest.TestCase):
         )
         settings.start()
         self.addCleanup(settings.stop)
+        # The download step is covered by PrepareTests; here the snapshot is "on disk".
+        self.prepare_patch = mock.patch.object(lid, "prepare_lid_model", return_value=True)
+        self.prepare_patch.start()
+        self.addCleanup(self.prepare_patch.stop)
         components = dict(lid._lid_components)
         failure = dict(lid._lid_failure)
         lid._clear_components()
@@ -162,6 +170,38 @@ class RestrictedDetectionTests(_LidCase):
         self.assertTrue(lid.apply_lid_device_setting())
         self.assertIsNone(lid._lid_components["model"])
 
+    def test_switching_the_asr_model_away_from_cohere_unloads_the_detector(self) -> None:
+        self.use_model(_FakeModel())
+        self.assertTrue(lid.load_lid_model())
+        current_settings["local_model"] = "openai/whisper-large-v3-turbo"
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertTrue(lid.apply_lid_device_setting())
+        self.assertIsNone(lid._lid_components["model"])
+
+    def test_a_failed_move_unloads_instead_of_leaving_a_split_model(self) -> None:
+        model = _FakeModel()
+        self.use_model(model)
+        self.assertTrue(lid.load_lid_model())
+        leases = []
+
+        @contextlib.contextmanager
+        def lease():
+            leases.append("in")
+            yield
+
+        self.device = torch.device("cuda:0")
+        with (
+            mock.patch.object(lid, "shared_gpu_lease", lease),
+            mock.patch.object(model, "to", side_effect=RuntimeError("CUDA out of memory")),
+            mock.patch.object(lid, "_release_cuda_pool"),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            lid.apply_lid_device_setting()
+        # The move ran inside the cross-process lease, and its failure left nothing half-moved behind.
+        self.assertEqual(leases, ["in"])
+        self.assertIsNone(lid._lid_components["model"])
+        self.assertIsNone(lid._lid_components["device"])
+
 
 class LoadFailureTests(_LidCase):
     def test_failed_load_warns_once_and_is_not_retried_on_every_request(self) -> None:
@@ -198,6 +238,90 @@ class LoadFailureTests(_LidCase):
             decision = asyncio.run(lid.decide_item_languages(asyncio.Lock(), [np.zeros(16000 * 5, dtype=np.float32)]))
         self.assertEqual((decision.language, decision.source), ("de", "fallback"))
         self.assertEqual(len(decision.warnings), 1)
+
+
+class PrepareTests(_LidCase):
+    """The detector's download: outside every GPU lock, resumed when a snapshot is incomplete."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.prepare_patch.stop()
+        temp = tempfile.TemporaryDirectory(prefix="lid-snapshot-")
+        self.addCleanup(temp.cleanup)
+        self.snapshot = os.path.join(temp.name, "snapshot")
+        os.makedirs(self.snapshot)
+        self.calls: list[bool] = []
+
+        def download(model_id, cache_root, local_only):
+            self.calls.append(local_only)
+            if not local_only:
+                self.write(*lid.LID_REQUIRED_FILES)
+            return self.snapshot
+
+        patcher = mock.patch.object(lid, "_download_snapshot", side_effect=download)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def write(self, *names: str) -> None:
+        for name in names:
+            with open(os.path.join(self.snapshot, name), "w", encoding="utf-8") as handle:
+                handle.write("x")
+
+    def test_an_interrupted_download_is_resumed_not_loaded_offline_for_good(self) -> None:
+        # The feature extractor's config arrived, the weights did not (process restarted mid-download).
+        self.write("preprocessor_config.json", "config.json")
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertTrue(lid.prepare_lid_model())
+        self.assertEqual(self.calls, [True, False])
+        self.assertEqual(lid._local_snapshot("openai/whisper-base", ""), self.snapshot)
+
+    def test_a_complete_snapshot_needs_no_network(self) -> None:
+        self.write(*lid.LID_REQUIRED_FILES)
+        self.assertTrue(lid.prepare_lid_model())
+        self.assertEqual(self.calls, [True])
+
+    def test_the_gpu_phase_never_downloads(self) -> None:
+        self.write("preprocessor_config.json")
+        with self.assertRaises(lid.LanguageDetectionUnavailable):
+            lid._load_pretrained("openai/whisper-base", "")
+        self.assertEqual(self.calls, [True])
+
+    def test_detection_downloads_before_it_takes_the_gpu_lock(self) -> None:
+        gpu_lock = asyncio.Lock()
+        seen: list[tuple[str, bool]] = []
+
+        def prepare() -> bool:
+            seen.append(("prepare", gpu_lock.locked()))
+            return True
+
+        async def sliced(lock, items, function, size):
+            seen.append(("gpu", lock.locked()))
+            return [[]]
+
+        with (
+            mock.patch.object(lid, "prepare_lid_model", side_effect=prepare),
+            mock.patch.object(lid, "run_sliced_gpu_phase", side_effect=sliced),
+        ):
+            asyncio.run(lid.detect_windows(gpu_lock, [np.zeros(16000, dtype=np.float32)]))
+        self.assertEqual(seen, [("prepare", False), ("gpu", False)])
+
+    def test_a_failed_download_is_reported_once_and_not_retried_at_once(self) -> None:
+        def offline(model_id, cache_root, local_only):
+            self.calls.append(local_only)
+            if local_only:
+                return None
+            raise OSError("no network")
+
+        stderr = io.StringIO()
+        with mock.patch.object(lid, "_download_snapshot", side_effect=offline), contextlib.redirect_stderr(stderr):
+            self.assertFalse(lid.prepare_lid_model())
+            self.assertFalse(lid.prepare_lid_model())
+            with self.assertRaises(lid.LanguageDetectionUnavailable):
+                asyncio.run(lid.detect_windows(asyncio.Lock(), [np.zeros(16000, dtype=np.float32)]))
+        # One network attempt; later calls only look at the disk until LID_RETRY_AFTER_SECONDS.
+        self.assertEqual(self.calls, [True, False, True, True])
+        self.assertEqual(stderr.getvalue().count("[WARNUNG-LID]"), 1)
+        self.assertIn("no network", lid.lid_status()["error"])
 
 
 class AggregationTests(unittest.TestCase):
@@ -316,6 +440,35 @@ class WxcLanguageChunkTests(unittest.TestCase):
         spans = [(0.0, 5.0, "de"), (5.0, 5.2, "en"), (5.2, 8.0, "de")]
         chunks, languages = wxc.build_language_superchunks(regions, spans)
         self.assertEqual((chunks, languages), ([(0.0, 10.0)], ["de"]))
+
+    def test_a_short_region_of_another_language_joins_its_neighbours(self) -> None:
+        # A 0.35 s English backchannel is its own Silero region between two German ones.
+        regions = [(0.0, 12.0), (12.4, 12.75), (13.1, 20.0)]
+        spans = [(0.0, 12.0, "de"), (12.4, 12.75, "en"), (13.1, 20.0, "de")]
+        chunks, languages = wxc.build_language_superchunks(regions, spans)
+        self.assertEqual((chunks, languages), (wxc.build_superchunks(regions), ["de"]))
+        # A real English turn keeps its own chunk.
+        regions = [(0.0, 12.0), (12.4, 15.0), (15.3, 20.0)]
+        spans = [(0.0, 12.0, "de"), (12.4, 15.0, "en"), (15.3, 20.0, "de")]
+        self.assertEqual(wxc.build_language_superchunks(regions, spans)[1], ["de", "en", "de"])
+
+
+class SpeakerPoolTests(unittest.TestCase):
+    def test_the_budget_keeps_the_inliers_before_a_long_raw_turn(self) -> None:
+        inliers = [
+            SimpleNamespace(quality=0.9, source_spans=None, start_ms=300000 + i * 3000, end_ms=303000 + i * 3000)
+            for i in range(6)
+        ]
+        turns = [{"start_ms": 0, "end_ms": 45000}, {"start_ms": 300000, "end_ms": 318000}]
+        spans = v2._speaker_lid_spans(SimpleNamespace(inliers=inliers), turns)
+        # All 18 s of inliers, then 12 s of the longest turn; returned in time order.
+        self.assertEqual(spans, [(0, 12000), (300000, 318000)])
+        self.assertEqual(v2._span_seconds(spans), 30.0)
+
+    def test_overlapping_candidates_count_once(self) -> None:
+        inliers = [SimpleNamespace(quality=0.5, source_spans=[(1000, 3000), (5000, 6000)], start_ms=None, end_ms=None)]
+        spans = v2._speaker_lid_spans(SimpleNamespace(inliers=inliers), [{"start_ms": 0, "end_ms": 8000}])
+        self.assertEqual(spans, [(0, 8000)])
 
 
 if __name__ == "__main__":

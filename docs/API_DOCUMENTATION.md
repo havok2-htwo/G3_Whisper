@@ -117,11 +117,23 @@ never run it.
   one language for the file), from up to 30 s of that speaker's best clean
   windows. A speaker with under 1 s of speech or below 0.5 confidence takes the
   majority of the confidently detected speakers, else `de`. The WXC chunks are
-  cut at every language change, so no ASR chunk mixes two languages; with a
-  single language the chunking is exactly the same as without detection.
+  cut at every language change, so no ASR chunk mixes two languages; a language
+  run with under 0.5 s of speech (a short backchannel, DIA jitter) joins its
+  nearer neighbour instead of becoming its own chunk. With a single language the
+  chunking is exactly the same as without detection.
 - Less than 1 s of audio, or a detection model that cannot be loaded, gives `de`
   as before. A load or runtime failure adds the warning
-  `LANGUAGE_DETECTION_UNAVAILABLE` (status `partial`); it never fails the request.
+  `LANGUAGE_DETECTION_UNAVAILABLE` (status `partial`, also on the admin history
+  retry); it never fails the request. `/transcribe/` and `/v1/audio/transcriptions`
+  have no warnings field and only log it.
+- The detector is downloaded on a worker thread before the GPU lock is taken (an
+  interrupted download is resumed), so a first download never blocks other
+  requests; until it is complete, requests run with `de` plus the warning. A
+  failed download is retried after 5 minutes.
+- Scheduling: each language of one request is its own scheduler job. A long
+  bilingual file therefore takes one long-job slot per language
+  (`scheduler_max_parallel_long_jobs`), and a small language group under
+  `scheduler_long_job_min_chunks` chunks is scheduled as a short job.
 
 Response fields (all additive):
 
@@ -132,7 +144,10 @@ Response fields (all additive):
   `languages` are speech seconds per applied language; `fallback` means nothing
   could be detected and `de` was used.
 - `result.transcript.language`: the same dominant language.
-- `diarization` segments carry `language`; every `speaker_assignments[]` entry
+- `diarization` segments carry `language`: the language of the segment's speaker.
+  In WXC it is not necessarily the decoding prompt of every word: an absorbed
+  short piece, or a sentence the 192D verification moved to another speaker, was
+  decoded with its chunk's language. Every `speaker_assignments[]` entry
   carries `language` and `language_source` (`detected`, `majority`, `fallback`,
   or `request` / `setting` when no detection ran).
 - `timings_ms.language_detection` when detection ran;
@@ -1099,7 +1114,7 @@ Notes:
 - `scheduler_first_chunk_fast_path` (default `true`) gives a request that has not been served yet a small batch of its own instead of a seat in a full batch of a long recording; batches are always shared round-robin between active requests.
 - `cuda_memory_trim_after_batch` defaults to `true`: once every local GPU phase (ASR batches, ReDimNet clouds, MMS_FA alignment, verification, embeddings, startup warmups, model reloads) has been quiet for 5 s, Whisper releases the unused process-wide CUDA allocator pool so the idle footprint stays near the model floor on a shared GPU; the next request re-reserves its pool (about +80 ms once for a ReDimNet batch). Disable it only on a dedicated GPU.
 - `cohere_cuda_graphs` defaults to `true`: for the Cohere model on CUDA in `fp16`/`bf16`, encoder and greedy decoder run as captured CUDA graphs (2 s clip ~270 -> 30 ms, 14 s file ~0.9 -> 0.12 s on an RTX 4090, identical transcripts) for ~0.55 GB of graph memory after warmup and a hard cap of 1.5 GB. Changing it does not reload the model (`model_reloaded` stays `false`); it applies on the next model load (server restart or a change of model, device, precision or cache path). Other precisions and Whisper models ignore it. A snapshot without `generation_config.json` no longer disables the graphs: the missing eos/pad token ids are taken from the model config or the tokenizer (logged as a warning).
-- `cohere_language_detection` (strict boolean, default `true`) turns on language detection for Cohere with an effective language `auto` (see [Language detection on Cohere](#language-detection-on-cohere-auto)); off, Cohere's `auto` is `de` as before. `language_detection_model` picks the detector: `openai/whisper-base` (default, about 0.15 GB), `openai/whisper-small` or `openai/whisper-large-v3-turbo`; an unknown id falls back to the default. The detector is loaded from the model cache (`local_model_cache_path`, downloaded on first use with the saved Hugging Face token), follows `local_gpu_device` (FP16 on CUDA, FP32 on CPU) and is warmed at startup when Cohere is active. Changing either key never reloads the ASR model (`model_reloaded` stays `false`): a changed model or the switch turned off unloads the old detector right away, the next request loads the new one. Neither key is a preset key, so loading a preset never turns detection off.
+- `cohere_language_detection` (strict boolean, default `true`) turns on language detection for Cohere with an effective language `auto` (see [Language detection on Cohere](#language-detection-on-cohere-auto)); off, Cohere's `auto` is `de` as before. `language_detection_model` picks the detector: `openai/whisper-base` (default, about 0.15 GB), `openai/whisper-small` or `openai/whisper-large-v3-turbo`; an unknown id falls back to the default. The detector is loaded from the model cache (`local_model_cache_path`, downloaded on first use with the saved Hugging Face token), follows `local_gpu_device` (FP16 on CUDA, FP32 on CPU) and is warmed at startup when Cohere is active. Changing either key never reloads the ASR model (`model_reloaded` stays `false`): a changed model, the switch turned off or a switch to a non-Cohere ASR model unloads the old detector right away, the next request loads the new one. Neither key is a preset key, so loading a preset never turns detection off.
 - `redimnet_max_batch_size` (default `8`, allowed `1`/`2`/`4`/`8`; other numbers snap down to the next allowed value, a non-number falls back to `8`) is the largest ReDimNet CUDA batch for speaker clouds, verification and embeddings. The reserved pool scales with it (RTX 5090: 746 / 1442 / 2816 MiB for 2 / 4 / 8; 60-min diarization 23.2 s at 4 vs 19.6 s at 8). It applies on save without a restart: a loaded ReDimNet is re-warmed for the new buckets and its old pool released (`model_reloaded` stays `false`).
 - ReDimNet and MMS_FA alignment run on the `local_gpu_device` card like the ASR model; changing the device moves them on save.
 - `debug_retain_history_audio` defaults to `false`. When enabled, successful public API requests may retain their byte-identical original upload for the 25-row admin history; disabling it blocks access immediately and purges retained audio after active readers finish.
@@ -1355,7 +1370,7 @@ Response fields:
 Status codes:
 
 - `400`: unsupported model id, or the model is still downloading
-- `409`: the model is the active one, select another model first; or a model selection is running
+- `409`: the model is the active one, select another model first; the model is the language detection model while `cohere_language_detection` is on; or a model selection is running
 
 ### `GET /api/admin/stats`
 

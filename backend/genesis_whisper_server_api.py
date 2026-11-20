@@ -126,10 +126,14 @@ def create_api(app: FastAPI) -> FastAPI:
         segment_count = len(segmented_audio)
         # Cohere + "auto": detect per ASR item (one job per detected language), exactly like /v2/audio/process.
         item_languages = None
+        detection_ms = 0
         if segment_count and language_detection_applies(model_id, local_processing_key[3]):
             decision = await decide_item_languages(request.app.state.local_gpu_lock, segmented_audio)
             item_languages = decision.languages
             effective_language = decision.language
+            # Reported apart, like v2's timings_ms.language_detection, so the history's transcription
+            # times stay comparable across both APIs. A detection warning is logged only: v1 has no warnings.
+            detection_ms = decision.duration_ms
 
         if segment_count == 0:
             transcription_text = ""
@@ -144,7 +148,7 @@ def create_api(app: FastAPI) -> FastAPI:
             model_id = served_model_id(batch_results, model_id)
             transcription_text = combine_transcription_chunks([result.text for result in batch_results])
             batch_ids = sorted({result.batch_id for result in batch_results})
-            transcription_duration_ms = round((time.monotonic() - batch_start) * 1000)
+            transcription_duration_ms = max(0, round((time.monotonic() - batch_start) * 1000) - detection_ms)
 
         if voice_ident and used_batching:
             local_gpu_lock = request.app.state.local_gpu_lock

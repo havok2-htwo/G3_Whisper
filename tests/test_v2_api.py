@@ -1301,6 +1301,12 @@ def _lid_settings(**values) -> dict:
     }
 
 
+def _patch_lid_download(case: unittest.TestCase) -> None:
+    patcher = mock.patch.object(lid, "prepare_lid_model", return_value=True)
+    patcher.start()
+    case.addCleanup(patcher.stop)
+
+
 class _TextPerChunkManager:
     """submit_job fake: one job per call, the text names the language and the chunk's first sample."""
 
@@ -1316,6 +1322,7 @@ class TranscriptLanguageDetectionTests(unittest.TestCase):
     """Cohere + effective "auto": detect before ASR, submit with the detected language, echo what ran."""
 
     def setUp(self) -> None:
+        _patch_lid_download(self)
         self.manager = _TextPerChunkManager()
         self.app = _CapturingApp()
         self.app.state.whisper_batch_manager = self.manager
@@ -1434,6 +1441,9 @@ class DiarizationLanguageDetectionTests(unittest.TestCase):
         {"start_ms": 6000, "end_ms": 12000, "speaker_id": "SPEAKER_B"},
         {"start_ms": 12000, "end_ms": 18000, "speaker_id": "SPEAKER_A"},
     ]
+
+    def setUp(self) -> None:
+        _patch_lid_download(self)
 
     def run_diarization(self, detected, *, pipeline="turns", settings=None, language=None):
         clouds = {

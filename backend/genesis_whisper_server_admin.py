@@ -86,7 +86,7 @@ from .genesis_whisper_server_storage import (
     save_settings,
     with_model_profiles,
 )
-from .genesis_whisper_server_lid import apply_lid_device_setting
+from .genesis_whisper_server_lid import apply_lid_device_setting, configured_lid_model, lid_status
 from .genesis_whisper_server_vid import apply_vid_settings
 from .genesis_whisper_server_wxc import apply_mms_device_setting
 
@@ -343,8 +343,9 @@ async def _reprepare_voice_models(
     saved_settings: Dict[str, Any],
 ) -> None:
     """ReDimNet, MMS_FA and the language detection model follow local_gpu_device, ReDimNet also its max batch,
-    the detector its model choice and switch. Re-prepare loaded models now, so the old card / the larger bucket
-    pool / a replaced detector is released and the next request is warm. None of these reloads the ASR model."""
+    the detector its model choice, its switch and the ASR model (only Cohere uses it). Re-prepare loaded models
+    now, so the old card / the larger bucket pool / a replaced or unused detector is released and the next
+    request is warm. None of these reloads the ASR model."""
 
     voice_settings_changed = any(
         previous_settings.get(key) != saved_settings.get(key)
@@ -355,6 +356,13 @@ async def _reprepare_voice_models(
             "cohere_language_detection",
         )
     )
+    # Leaving Cohere makes a resident detector dead weight next to the new ASR model (up to 1.6 GB with turbo).
+    detector_unused = (
+        previous_settings.get("local_model") != saved_settings.get("local_model")
+        and not uses_cohere_backend(str(saved_settings.get("local_model") or ""))
+        and lid_status()["loaded"]
+    )
+    voice_settings_changed = voice_settings_changed or detector_unused
     if not voice_settings_changed:
         return
     try:
@@ -884,10 +892,21 @@ def create_admin_api(app: FastAPI) -> FastAPI:
         # The selection may be loading this model, or need it to roll back to.
         if model_select_lock.locked():
             raise HTTPException(status_code=409, detail="A model selection is running, delete again when it has finished.")
-        if payload.model_id == _settings_snapshot()["local_model"]:
+        settings_snapshot = _settings_snapshot()
+        if payload.model_id == settings_snapshot["local_model"]:
             raise HTTPException(
                 status_code=409,
                 detail=f"Model '{payload.model_id}' is the active model. Select another model before deleting it.",
+            )
+        # openai/whisper-base is an ASR entry too; deleting the detector's files would only show after a restart,
+        # as a fresh download or, offline, as Cohere + "auto" silently staying on the fallback language.
+        if settings_snapshot.get("cohere_language_detection", True) is True and payload.model_id == configured_lid_model():
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Model '{payload.model_id}' is the language detection model. Choose another detection model "
+                    "or switch language detection off before deleting it."
+                ),
             )
         try:
             result = delete_model_cache(payload.model_id, _effective_model_storage_path(payload.storage_path))
@@ -974,10 +993,10 @@ def create_admin_api(app: FastAPI) -> FastAPI:
             except Exception as exc:
                 raise HTTPException(status_code=400, detail=f"Retained audio could not be decoded: {exc}") from exc
 
-            transcript, transcription_ms, _, model_id, _language = await _transcribe_audio(request, audio)
+            transcript, transcription_ms, _, model_id, language = await _transcribe_audio(request, audio)
             transcript = filter_repeated_patterns(transcript)
             embedding_ms: int | None = None
-            warnings: list[dict[str, str]] = []
+            warnings: list[dict[str, str]] = list(language.warnings)
             if retry_mode == "transcript_embedding":
                 embedding_started = time.monotonic()
                 try:

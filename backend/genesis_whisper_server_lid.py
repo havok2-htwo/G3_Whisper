@@ -11,7 +11,9 @@ Measured on the owner's recordings (CPU, whisper-base): 100 % on 30 s windows, 9
 The model follows ReDimNet's pattern (genesis_whisper_server_vid): one module slot under a lock, lazy load,
 the device of ``local_gpu_device``, FP16 on CUDA and FP32 on CPU, load and inference inside the cross-process
 GPU lease, OOM back-off. Request handlers run it through the sliced GPU phase so a long file never holds the
-GPU lock for all its windows at once.
+GPU lock for all its windows at once. The download is a separate step (``prepare_lid_model``) on a worker
+thread before any GPU lock is taken: a 1.6 GB first download must never stall the ASR queue, live embeddings
+or a colocated DIA service, so the GPU phase itself only ever loads a complete local snapshot.
 
 Detection is advisory: when the model cannot be loaded or a clip has too little speech, the request runs with
 COHERE_FALLBACK_LANGUAGE exactly as before and reports why in its warnings. It never fails a request.
@@ -21,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+import os
 import sys
 import threading
 import time
@@ -40,6 +43,7 @@ from .genesis_whisper_server_globals import (
     current_settings,
     resolve_local_model_cache_path,
     settings_lock,
+    uses_cohere_backend,
 )
 from .genesis_whisper_server_gpu import run_sliced_gpu_phase, shared_gpu_lease
 from .genesis_whisper_server_vid import resolve_local_device
@@ -64,6 +68,18 @@ LID_BATCH_SIZE = 8
 LID_SLICE_WINDOWS = 16
 # A failed load (missing download, no network) is not retried on every request.
 LID_RETRY_AFTER_SECONDS = 300.0
+# The files a detector needs. A snapshot without all of them (an interrupted first download) is completed by the
+# next prepare step instead of being loaded offline and failing for good. All three Whisper options ship
+# safetensors, so the PyTorch/Flax/TF duplicates are never fetched.
+LID_REQUIRED_FILES = (
+    "config.json",
+    "preprocessor_config.json",
+    "tokenizer_config.json",
+    "vocab.json",
+    "merges.txt",
+    "model.safetensors",
+)
+LID_DOWNLOAD_PATTERNS = ["*.json", "merges.txt", "model.safetensors"]
 
 SOURCE_DETECTED = "detected"
 SOURCE_MAJORITY = "majority"
@@ -97,6 +113,8 @@ _lid_components: Dict[str, Any] = {
 }
 # The last failed load: key (model id, cache root), the error and when, so it is logged once and retried late.
 _lid_failure: Dict[str, Any] = {"key": None, "error": None, "at": 0.0}
+# Serializes downloads (worker threads, never the GPU thread) so parallel requests fetch a snapshot only once.
+_lid_download_lock = threading.Lock()
 
 
 def configured_lid_model() -> str:
@@ -142,26 +160,107 @@ def _clear_components() -> None:
     )
 
 
-def _load_pretrained(model_id: str, cache_root: str):
-    """(feature extractor, tokenizer, model) from the ASR models' cache, downloading on first use.
+def _snapshot_complete(path: Optional[str]) -> bool:
+    return bool(path) and all(os.path.isfile(os.path.join(path, name)) for name in LID_REQUIRED_FILES)
 
-    Same source resolution and token as the ASR engine: a complete snapshot loads offline, otherwise
-    transformers fetches it into ``cache_root`` with the configured Hugging Face token.
+
+def _download_snapshot(model_id: str, cache_root: str, local_only: bool) -> Optional[str]:
+    """The snapshot folder of ``model_id`` in ``cache_root`` (HF default cache when empty); None offline-missing."""
+
+    from huggingface_hub import snapshot_download
+
+    from .genesis_whisper_server_local_asr_engine import _resolve_huggingface_token
+
+    try:
+        return snapshot_download(
+            repo_id=model_id,
+            cache_dir=cache_root or None,
+            token=_resolve_huggingface_token(),
+            allow_patterns=LID_DOWNLOAD_PATTERNS,
+            local_files_only=local_only,
+        )
+    except Exception:
+        if local_only:
+            return None
+        raise
+
+
+def _local_snapshot(model_id: str, cache_root: str) -> Optional[str]:
+    """A complete local snapshot, without network (HF links a file into the snapshot only once it is complete)."""
+
+    path = _download_snapshot(model_id, cache_root, local_only=True)
+    return path if _snapshot_complete(path) else None
+
+
+def _record_failure(key: tuple, model_id: str, exc: BaseException) -> None:
+    already_reported = _lid_failure["key"] == key
+    _lid_failure.update({"key": key, "error": f"{type(exc).__name__}: {exc}", "at": time.monotonic()})
+    if not already_reported:
+        print(
+            f"[WARNUNG-LID] Spracherkennung '{model_id}' nicht verfuegbar, Cohere nutzt "
+            f"'{COHERE_FALLBACK_LANGUAGE}': {exc}",
+            file=sys.stderr,
+        )
+
+
+def _retry_pending(key: tuple) -> bool:
+    return _lid_failure["key"] == key and time.monotonic() - float(_lid_failure["at"]) < LID_RETRY_AFTER_SECONDS
+
+
+def prepare_lid_model() -> bool:
+    """Make sure the configured detector is complete on disk. Worker thread, never under a GPU lock.
+
+    Resumes an interrupted download (only the missing files are fetched). False when it is unavailable; the
+    failure is logged once and not retried for LID_RETRY_AFTER_SECONDS.
+    """
+
+    model_id = configured_lid_model()
+    cache_root = _cache_root()
+    if (
+        _lid_components["model"] is not None
+        and _lid_components["model_id"] == model_id
+        and _lid_components["cache_root"] == cache_root
+    ):
+        return True
+    key = (model_id, cache_root)
+    with _lid_download_lock:
+        if _local_snapshot(model_id, cache_root):
+            return True
+        if _retry_pending(key):
+            return False
+        started = time.monotonic()
+        print(f"[INFO-LID] Lade Spracherkennung '{model_id}' herunter ...", file=sys.stderr)
+        try:
+            path = _download_snapshot(model_id, cache_root, local_only=False)
+            if not _snapshot_complete(path):
+                raise RuntimeError(f"Snapshot '{path}' lacks one of {', '.join(LID_REQUIRED_FILES)}.")
+        except Exception as exc:
+            _record_failure(key, model_id, exc)
+            return False
+        # A load that failed only for want of these files may run right away.
+        _lid_failure.update({"key": None, "error": None, "at": 0.0})
+        print(
+            f"[INFO-LID] Spracherkennung '{model_id}' heruntergeladen "
+            f"({round((time.monotonic() - started) * 1000)} ms).",
+            file=sys.stderr,
+        )
+        return True
+
+
+def _load_pretrained(model_id: str, cache_root: str):
+    """(feature extractor, tokenizer, model) from the complete local snapshot only, never from the network.
+
+    This runs inside the GPU lease; the download belongs to ``prepare_lid_model`` before it.
     """
 
     from transformers import WhisperFeatureExtractor, WhisperForConditionalGeneration, WhisperTokenizer
 
-    from .genesis_whisper_server_local_asr_engine import (
-        _resolve_huggingface_token,
-        _resolve_local_pretrained_source,
-        _with_huggingface_token,
-    )
-
-    source, pretrained_args = _resolve_local_pretrained_source(model_id, cache_root)
-    pretrained_args = _with_huggingface_token(pretrained_args, _resolve_huggingface_token())
-    feature_extractor = WhisperFeatureExtractor.from_pretrained(source, **pretrained_args)
-    tokenizer = WhisperTokenizer.from_pretrained(source, **pretrained_args)
-    model = WhisperForConditionalGeneration.from_pretrained(source, **pretrained_args)
+    source = _local_snapshot(model_id, cache_root)
+    if source is None:
+        raise LanguageDetectionUnavailable(f"Language detection model '{model_id}' is not downloaded (yet).")
+    feature_extractor = WhisperFeatureExtractor.from_pretrained(source, local_files_only=True)
+    tokenizer = WhisperTokenizer.from_pretrained(source, local_files_only=True)
+    model = WhisperForConditionalGeneration.from_pretrained(source, local_files_only=True)
     return feature_extractor, tokenizer, model
 
 
@@ -174,15 +273,28 @@ def _token_ids(tokenizer: Any) -> tuple[list[int], int]:
     return [int(token) for token in language_ids], int(start_id)
 
 
-def _move_model(target_device: torch.device) -> None:
-    """Move the loaded model to ``target_device`` (caller holds ``_lid_lock``)."""
+def _move_model(target_device: torch.device) -> bool:
+    """Move the loaded model to ``target_device`` (caller holds ``_lid_lock``, not the lease).
+
+    Inside the lease like every other allocation, so a colocated DIA at its VRAM peak is not hit by it. A failed
+    move (OOM on the new card) would leave the weights split over two devices or dtypes, so the model is
+    dropped instead and the next detection loads it cleanly. Returns whether the model is still loaded.
+    """
 
     previous = _lid_components["device"]
     dtype = _lid_dtype(target_device)
-    _lid_components["model"].to(device=target_device, dtype=dtype)
+    try:
+        with shared_gpu_lease():
+            _lid_components["model"].to(device=target_device, dtype=dtype)
+    except Exception as exc:
+        _clear_components()
+        _release_cuda_pool()
+        print(f"[WARNUNG-LID] Spracherkennung nicht nach '{target_device}' verschiebbar, entladen: {exc}", file=sys.stderr)
+        return False
     _lid_components.update({"device": target_device, "dtype": dtype, "batch_size": LID_BATCH_SIZE})
     _release_cuda_pool()
     print(f"[INFO-LID] Spracherkennung von '{previous}' nach '{target_device}' verschoben.", file=sys.stderr)
+    return True
 
 
 def _ensure_loaded() -> bool:
@@ -193,14 +305,14 @@ def _ensure_loaded() -> bool:
     if _lid_components["model"] is not None:
         if _lid_components["model_id"] == model_id and _lid_components["cache_root"] == cache_root:
             target_device = resolve_local_device()
-            if str(_lid_components["device"]) != str(target_device):
-                _move_model(target_device)
-            return True
-        _clear_components()
-        _release_cuda_pool()
+            if str(_lid_components["device"]) == str(target_device) or _move_model(target_device):
+                return True
+        else:
+            _clear_components()
+            _release_cuda_pool()
 
     key = (model_id, cache_root)
-    if _lid_failure["key"] == key and time.monotonic() - float(_lid_failure["at"]) < LID_RETRY_AFTER_SECONDS:
+    if _retry_pending(key):
         return False
 
     device = resolve_local_device()
@@ -213,14 +325,7 @@ def _ensure_loaded() -> bool:
             model.eval()
             model.to(device=device, dtype=dtype)
     except Exception as exc:
-        already_reported = _lid_failure["key"] == key
-        _lid_failure.update({"key": key, "error": f"{type(exc).__name__}: {exc}", "at": time.monotonic()})
-        if not already_reported:
-            print(
-                f"[WARNUNG-LID] Spracherkennung '{model_id}' nicht verfuegbar, Cohere nutzt "
-                f"'{COHERE_FALLBACK_LANGUAGE}': {exc}",
-                file=sys.stderr,
-            )
+        _record_failure(key, model_id, exc)
         return False
 
     _lid_components.update(
@@ -246,7 +351,10 @@ def _ensure_loaded() -> bool:
 
 
 def load_lid_model() -> bool:
-    """Load the configured detection model once (GPU phase thread). False when it is unavailable."""
+    """Load the configured detection model once (GPU phase thread). False when it is unavailable.
+
+    Loads only a complete local snapshot; ``prepare_lid_model`` (off the GPU thread) downloads it first.
+    """
 
     with _lid_lock:
         return _ensure_loaded()
@@ -267,13 +375,15 @@ def lid_status() -> Dict[str, Any]:
 def apply_lid_device_setting() -> bool:
     """Admin hook: follow a saved ``local_gpu_device`` / ``language_detection_model`` right away (GPU thread).
 
-    A changed device moves the weights; a changed model, or detection switched off, unloads the old one so its
-    VRAM is free (the next detection loads what is configured then). A not yet loaded model needs nothing.
+    A changed device moves the weights; a changed model, detection switched off or an ASR model other than Cohere
+    unloads the old one so its VRAM is free (the next detection loads what is configured then). A not yet loaded model needs nothing.
     Returns True when something changed. Never touches the ASR model.
     """
 
     with settings_lock:
         enabled = current_settings.get("cohere_language_detection", True) is True
+        # Only Cohere uses the detector; after a switch to Whisper or Parakeet its VRAM goes back to the card.
+        enabled = enabled and uses_cohere_backend(str(current_settings.get("local_model") or ""))
     with _lid_lock:
         # A new choice gets a fresh load attempt instead of waiting out the previous model's retry pause.
         _lid_failure.update({"key": None, "error": None, "at": 0.0})
@@ -533,8 +643,16 @@ def unavailable_warning(message: str) -> Dict[str, Any]:
 
 
 async def detect_windows(gpu_lock: asyncio.Lock, windows: Sequence[np.ndarray]) -> List[LidResult]:
-    """detect_languages over many windows, one GPU-lock hold per LID_SLICE_WINDOWS windows."""
+    """detect_languages over many windows, one GPU-lock hold per LID_SLICE_WINDOWS windows.
 
+    The download (first use, a new model choice, a resumed interrupted fetch) runs before, on a worker thread
+    and outside every GPU lock. Raises LanguageDetectionUnavailable when the model is not available.
+    """
+
+    if not await asyncio.to_thread(prepare_lid_model):
+        raise LanguageDetectionUnavailable(
+            f"Language detection model '{configured_lid_model()}' is unavailable: {_lid_failure['error']}"
+        )
     parts = await run_sliced_gpu_phase(gpu_lock, list(windows), detect_languages, LID_SLICE_WINDOWS)
     return [result for part in parts for result in part]
 
@@ -675,6 +793,7 @@ __all__ = [
     "lid_status",
     "load_lid_model",
     "pool_results",
+    "prepare_lid_model",
     "resolve_speaker_languages",
     "smooth_chunk_languages",
     "submit_by_language",

@@ -1145,6 +1145,28 @@ class DeleteGuardTests(_AdminCase):
         delete_cache.assert_called_once()
         self.assertIn("active", response.json()["models"][0])
 
+    def test_the_language_detection_model_is_refused_while_detection_is_on(self) -> None:
+        with mock.patch.object(admin, "delete_model_cache", return_value={"ok": True}) as delete_cache:
+            response = self.delete("openai/whisper-base")
+            self.assertEqual(response.status_code, 409)
+            self.assertIn("language detection", response.json()["detail"])
+            delete_cache.assert_not_called()
+
+            admin.current_settings["cohere_language_detection"] = False
+            self.assertEqual(self.delete("openai/whisper-base").status_code, 200)
+        delete_cache.assert_called_once()
+
+    def test_leaving_cohere_releases_a_resident_detector(self) -> None:
+        # The detector is only used by Cohere; after a switch its VRAM must be released right away.
+        status = {"model": "openai/whisper-base", "loaded": True, "error": None}
+        with (
+            mock.patch.object(admin, "_apply_voice_model_settings", return_value={}) as apply,
+            mock.patch.object(admin, "lid_status", return_value=status),
+        ):
+            response = self.client.post("/api/admin/models/select", json={"model_id": WHISPER_TURBO})
+        self.assertEqual(response.status_code, 200, response.text)
+        apply.assert_called_once_with()
+
 
 class ClientDiscoveryTests(unittest.TestCase):
     def setUp(self) -> None:
