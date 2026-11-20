@@ -47,6 +47,13 @@ from .genesis_whisper_server_globals import (
 )
 from .genesis_whisper_server_gpu import run_sliced_gpu_phase, shared_gpu_lease
 from .genesis_whisper_server_vid import resolve_local_device
+from .genesis_whisper_server_wxc import (
+    build_language_superchunks,
+    build_superchunks,
+    padded_chunk_audio,
+    region_pieces,
+    superchunk_speech_regions,
+)
 
 SAMPLE_RATE = 16000
 # Whisper's encoder always sees 30 s (shorter input is padded), so a window longer than that would be cut.
@@ -62,6 +69,19 @@ LID_MAX_POOL_SECONDS = 30.0
 LID_MIN_SPEECH_SECONDS = 1.0
 # A whole-audio item longer than one window (31-60 s clips) is judged on at most this many windows.
 LID_MAX_WINDOWS_PER_ITEM = 2
+# Refinement below the prior (a diarization speaker's language, a long transcript's majority): a turn or speech
+# piece of at least this length is detected on its own. Shorter ones keep the prior (1 s is mostly a guess,
+# 2 s crops were 84 % right).
+LID_TURN_MIN_SECONDS = 1.5
+# A turn (or transcript piece) leaves its prior only with at least this top probability. Calibrated on
+# whisper-base over 459 de/en clips of 2-8 s (owner crops, TTS, synthetic conversations; ground truth by hand):
+#   threshold        0.60  0.70  0.80  0.85  0.90  0.95
+#   wrong overrides  3.9%  2.8%  1.7%  1.3%  1.1%  0.2%   (confident but wrong, share of all clips)
+#   caught switches  91%   89%   87%   86%   83%   75%    (confident and right)
+# 0.85 keeps a wrong switch near 1 % (2 s: 3.2 %, 4-8 s: <=0.7 %) and still catches 86 % of real switches;
+# beyond it every wrong switch avoided costs about ten caught ones. All 14 languages, 607 clips: 3.5 %
+# wrong, 82 % caught (nl and zh TTS read as de with up to 0.99 carry most of the rest).
+LID_TURN_OVERRIDE_CONFIDENCE = 0.85
 # Windows per encoder call. whisper-base at 8 x 30 s is about 0.2 GB of activations in FP16.
 LID_BATCH_SIZE = 8
 # Windows per GPU-lock hold in request handlers (two encoder batches), so live requests get in between.
@@ -494,14 +514,19 @@ def windows_for_item(audio: np.ndarray) -> List[np.ndarray]:
     long file (it is then sent whole); its first LID_MAX_WINDOWS_PER_ITEM windows are enough to judge it.
     """
 
+    return split_windows(audio)[:LID_MAX_WINDOWS_PER_ITEM]
+
+
+def split_windows(audio: np.ndarray) -> List[np.ndarray]:
+    """The audio itself up to 30 s, else all its equal parts of at most 30 s (a long turn, a long piece)."""
+
     samples = np.asarray(audio, dtype=np.float32).reshape(-1)
     window_samples = int(LID_WINDOW_SECONDS * SAMPLE_RATE)
     if len(samples) <= window_samples:
         return [samples]
     count = math.ceil(len(samples) / window_samples)
     size = math.ceil(len(samples) / count)
-    parts = [samples[offset : offset + size] for offset in range(0, len(samples), size)]
-    return parts[:LID_MAX_WINDOWS_PER_ITEM]
+    return [samples[offset : offset + size] for offset in range(0, len(samples), size)]
 
 
 def pool_results(results: Sequence[Optional[LidResult]], weights: Sequence[float]) -> Optional[LidResult]:
@@ -597,6 +622,89 @@ def resolve_speaker_languages(
         else:
             resolved[speaker] = (fallback, SOURCE_FALLBACK)
     return resolved
+
+
+def turn_language(result: Optional[LidResult], seconds: float, prior: str) -> tuple[str, bool]:
+    """(language, overridden) of one diarization turn whose speaker was decided ``prior``.
+
+    The speaker's language stays the prior: only a turn of at least LID_TURN_MIN_SECONDS whose own detection
+    reaches LID_TURN_OVERRIDE_CONFIDENCE for another language takes that language (a German interjection in a
+    cluster DIA labelled with an English speaker, a speaker who switches for a sentence).
+    """
+
+    if (
+        result is not None
+        and seconds >= LID_TURN_MIN_SECONDS
+        and result.probability >= LID_TURN_OVERRIDE_CONFIDENCE
+        and result.language != prior
+    ):
+        return result.language, True
+    return prior, False
+
+
+def smooth_piece_languages(
+    results: Sequence[Optional[LidResult]],
+    spans: Sequence[tuple[float, float]],
+    fallback: str = COHERE_FALLBACK_LANGUAGE,
+) -> List[str]:
+    """Per-piece languages for a long transcript's speech pieces (time order).
+
+    The file majority (confident pieces, weighted by seconds) is the prior. An anchor is a piece of at least
+    LID_TURN_MIN_SECONDS with a confident result (LID_MIN_CONFIDENCE) for the majority, or with
+    LID_TURN_OVERRIDE_CONFIDENCE for another language, the same bar a diarization turn needs to leave its
+    speaker's language. Every other piece (short, weak, or a doubtful deviation) takes the language of the
+    nearest anchor, the earlier one on a tie; without any anchor everything is the majority, without any
+    result at all ``fallback``.
+    """
+
+    seconds = [max(0.0, float(end) - float(start)) for start, end in spans]
+    usable = [
+        result if result is not None and piece_seconds >= LID_TURN_MIN_SECONDS else None
+        for result, piece_seconds in zip(results, seconds)
+    ]
+    confident = [
+        (result.language, piece_seconds)
+        for result, piece_seconds in zip(usable, seconds)
+        if result is not None and result.probability >= LID_MIN_CONFIDENCE
+    ]
+    majority = _weighted_majority(confident) or _weighted_majority(
+        [(result.language, piece_seconds) for result, piece_seconds in zip(usable, seconds) if result is not None]
+    )
+    if majority is None:
+        return [fallback for _ in spans]
+    anchors: List[Optional[str]] = [
+        result.language
+        if result is not None
+        and result.probability >= LID_MIN_CONFIDENCE
+        and (result.language == majority or result.probability >= LID_TURN_OVERRIDE_CONFIDENCE)
+        else None
+        for result in usable
+    ]
+    if not any(anchors):
+        return [majority for _ in spans]
+    # The nearest anchor is the previous or the next one (pieces are in time order): two linear scans.
+    previous: List[Optional[int]] = []
+    last: Optional[int] = None
+    for index, anchor in enumerate(anchors):
+        if anchor is not None:
+            last = index
+        previous.append(last)
+    following: List[Optional[int]] = [None] * len(anchors)
+    upcoming: Optional[int] = None
+    for index in range(len(anchors) - 1, -1, -1):
+        if anchors[index] is not None:
+            upcoming = index
+        following[index] = upcoming
+    languages: List[str] = []
+    for index, anchor in enumerate(anchors):
+        if anchor is not None:
+            languages.append(anchor)
+            continue
+        before, after = previous[index], following[index]
+        gap_before = float(spans[index][0]) - float(spans[before][1]) if before is not None else math.inf
+        gap_after = float(spans[after][0]) - float(spans[index][1]) if after is not None else math.inf
+        languages.append(anchors[before] if gap_before <= gap_after else anchors[after])
+    return languages
 
 
 def dominant_language(languages_and_seconds: Sequence[tuple[str, float]], fallback: str) -> str:
@@ -713,6 +821,73 @@ async def decide_item_languages(gpu_lock: asyncio.Lock, items: Sequence[np.ndarr
     return decision
 
 
+async def decide_transcript_items(
+    gpu_lock: asyncio.Lock,
+    audio: np.ndarray,
+) -> tuple[List[np.ndarray], LanguageDecision]:
+    """ASR items and their languages for a transcript with Cohere and an effective "auto". Never raises.
+
+    Audio up to WHOLE_AUDIO_MAX_S (or without any Silero speech) stays one item with one decision, exactly as
+    decide_item_languages. A longer file is judged per speech piece instead of per superchunk: every Silero
+    region of split_audio_into_superchunks is one piece (longer ones in parts of at most 30 s), all pieces of
+    at least LID_TURN_MIN_SECONDS go through one batched detection pass, smooth_piece_languages labels them,
+    and the same builder as WXC diarization cuts superchunks that never mix two languages. One language gives
+    exactly the superchunks of split_audio_into_superchunks.
+    """
+
+    samples = np.asarray(audio, dtype=np.float32).reshape(-1)
+    regions = await asyncio.to_thread(superchunk_speech_regions, samples)
+    if regions is None:
+        items = [samples]
+        return items, await decide_item_languages(gpu_lock, items)
+
+    started = time.monotonic()
+    model_id = configured_lid_model()
+    pieces = region_pieces(regions, LID_WINDOW_SECONDS)
+    detectable = [index for index, (start, end) in enumerate(pieces) if end - start >= LID_TURN_MIN_SECONDS]
+    warnings: List[Dict[str, Any]] = []
+    results: List[Optional[LidResult]] = [None] * len(pieces)
+    if detectable:
+        windows = [
+            samples[max(0, round(pieces[index][0] * SAMPLE_RATE)) : round(pieces[index][1] * SAMPLE_RATE)]
+            for index in detectable
+        ]
+        try:
+            for index, result in zip(detectable, await detect_windows(gpu_lock, windows)):
+                results[index] = result
+        except Exception as exc:
+            print(f"[WARNUNG-LID] Spracherkennung fehlgeschlagen, nutze '{COHERE_FALLBACK_LANGUAGE}': {exc}", file=sys.stderr)
+            warnings.append(unavailable_warning(str(exc)))
+            results = [None] * len(pieces)
+
+    piece_languages = smooth_piece_languages(results, pieces)
+    if len(set(piece_languages)) > 1:
+        chunks, languages = build_language_superchunks(
+            regions, [(start, end, language) for (start, end), language in zip(pieces, piece_languages)]
+        )
+    else:
+        chunks = build_superchunks(regions)
+        languages = [piece_languages[0]] * len(chunks)
+    items = padded_chunk_audio(samples, chunks)
+    seconds: Dict[str, float] = {}
+    for (start, end), language in zip(chunks, languages):
+        seconds[language] = seconds.get(language, 0.0) + (end - start)
+    decision = LanguageDecision(
+        languages=languages,
+        language=dominant_language(list(seconds.items()), COHERE_FALLBACK_LANGUAGE),
+        source=SOURCE_DETECTED if any(result is not None for result in results) else SOURCE_FALLBACK,
+        model=model_id,
+        seconds=seconds,
+        warnings=warnings,
+        duration_ms=round((time.monotonic() - started) * 1000),
+    )
+    log_decision(
+        decision,
+        [f"{result.language}:{result.probability:.2f}" if result is not None else "-" for result in results],
+    )
+    return items, decision
+
+
 def log_decision(decision: LanguageDecision, confidences: Sequence[str]) -> None:
     shown = list(confidences[:12]) + (["..."] if len(confidences) > 12 else [])
     print(
@@ -781,12 +956,15 @@ __all__ = [
     "LID_MAX_POOL_SECONDS",
     "LID_MIN_CONFIDENCE",
     "LID_MIN_SPEECH_SECONDS",
+    "LID_TURN_MIN_SECONDS",
+    "LID_TURN_OVERRIDE_CONFIDENCE",
     "LanguageDecision",
     "LanguageDetectionUnavailable",
     "LidResult",
     "apply_lid_device_setting",
     "configured_lid_model",
     "decide_item_languages",
+    "decide_transcript_items",
     "detect_languages",
     "detect_windows",
     "dominant_language",
@@ -796,7 +974,10 @@ __all__ = [
     "prepare_lid_model",
     "resolve_speaker_languages",
     "smooth_chunk_languages",
+    "smooth_piece_languages",
+    "split_windows",
     "submit_by_language",
+    "turn_language",
     "windows_for_item",
     "with_language",
 ]

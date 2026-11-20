@@ -471,5 +471,98 @@ class SpeakerPoolTests(unittest.TestCase):
         self.assertEqual(spans, [(0, 8000)])
 
 
+def _result(language: str, probability: float) -> lid.LidResult:
+    rest = (1.0 - probability) / (len(COHERE_LANGUAGE_CODES) - 1)
+    return lid.LidResult(language, probability, {code: (probability if code == language else rest) for code in COHERE_LANGUAGE_CODES})
+
+
+class TurnRefinementTests(unittest.TestCase):
+    def test_a_turn_overrides_its_speaker_only_when_long_and_confident_enough(self) -> None:
+        cutoff = lid.LID_TURN_OVERRIDE_CONFIDENCE
+        self.assertEqual(lid.turn_language(_result("de", cutoff), 3.0, "en"), ("de", True))
+        self.assertEqual(lid.turn_language(_result("de", cutoff - 0.01), 3.0, "en"), ("en", False))
+        self.assertEqual(lid.turn_language(_result("de", 0.99), lid.LID_TURN_MIN_SECONDS - 0.01, "en"), ("en", False))
+        self.assertEqual(lid.turn_language(_result("en", 0.99), 3.0, "en"), ("en", False))
+        self.assertEqual(lid.turn_language(None, 3.0, "en"), ("en", False))
+
+    def test_the_calibrated_constants(self) -> None:
+        self.assertEqual(lid.LID_TURN_MIN_SECONDS, 1.5)
+        self.assertGreater(lid.LID_TURN_OVERRIDE_CONFIDENCE, lid.LID_MIN_CONFIDENCE)
+
+    def test_long_audio_is_split_into_windows_of_at_most_30_s(self) -> None:
+        windows = lid.split_windows(np.zeros(16000 * 70, dtype=np.float32))
+        self.assertEqual(len(windows), 3)
+        self.assertTrue(all(len(window) <= 16000 * 30 for window in windows))
+        self.assertEqual(sum(len(window) for window in windows), 16000 * 70)
+        self.assertEqual(len(lid.split_windows(np.zeros(16000 * 10, dtype=np.float32))), 1)
+        # Whole-audio items keep their cap.
+        self.assertEqual(len(lid.windows_for_item(np.zeros(16000 * 100, dtype=np.float32))), lid.LID_MAX_WINDOWS_PER_ITEM)
+
+    def test_region_pieces_split_only_long_regions(self) -> None:
+        self.assertEqual(wxc.region_pieces([(0.0, 10.0), (12.0, 72.0)], 30.0), [(0.0, 10.0), (12.0, 42.0), (42.0, 72.0)])
+        pieces = wxc.region_pieces([(0.0, 61.0)], 30.0)
+        self.assertEqual(len(pieces), 3)
+        self.assertEqual((pieces[0][0], pieces[-1][1]), (0.0, 61.0))
+
+
+class PieceSmoothingTests(unittest.TestCase):
+    SPANS = [(0.0, 10.0), (10.5, 12.0), (12.5, 13.5), (14.0, 24.0)]
+
+    def test_confident_pieces_keep_their_language_others_take_the_nearest_anchor(self) -> None:
+        results = [_result("de", 0.97), _result("en", 0.3), None, _result("en", 0.95)]
+        # Piece 1 is weak (gap 0.5 s to de, 2.0 s to en), piece 2 is short (2.0 s to de, 0.5 s to en).
+        self.assertEqual(lid.smooth_piece_languages(results, self.SPANS), ["de", "de", "en", "en"])
+
+    def test_a_deviation_from_the_majority_needs_the_override_confidence(self) -> None:
+        spans = [(0.0, 20.0), (20.5, 24.0), (24.5, 40.0)]
+        doubtful = [_result("de", 0.97), _result("en", lid.LID_TURN_OVERRIDE_CONFIDENCE - 0.05), _result("de", 0.97)]
+        sure = [_result("de", 0.97), _result("en", lid.LID_TURN_OVERRIDE_CONFIDENCE), _result("de", 0.97)]
+        self.assertEqual(lid.smooth_piece_languages(doubtful, spans), ["de", "de", "de"])
+        self.assertEqual(lid.smooth_piece_languages(sure, spans), ["de", "en", "de"])
+
+    def test_without_anchors_the_majority_and_without_results_the_fallback(self) -> None:
+        weak = [_result("fr", 0.3), _result("fr", 0.4), None, _result("it", 0.2)]
+        self.assertEqual(lid.smooth_piece_languages(weak, self.SPANS), ["fr"] * 4)
+        self.assertEqual(lid.smooth_piece_languages([None] * 4, self.SPANS), ["de"] * 4)
+
+
+class SuperchunkRegionTests(unittest.TestCase):
+    def test_short_audio_and_no_speech_stay_one_item(self) -> None:
+        self.assertIsNone(wxc.superchunk_speech_regions(np.zeros(16000 * 30, dtype=np.float32)))
+        with (
+            mock.patch.object(wxc, "silero_frame_probs", return_value=np.zeros(4)),
+            mock.patch.object(wxc, "speech_regions_from_probs", return_value=[]),
+        ):
+            self.assertIsNone(wxc.superchunk_speech_regions(np.zeros(16000 * 90, dtype=np.float32)))
+
+    def test_a_long_transcript_without_a_language_change_is_chunked_exactly_as_before(self) -> None:
+        regions = [(1.0, 24.0), (30.0, 52.0), (70.0, 82.0), (82.5, 94.0)]
+        audio = np.full(16000 * 100, 0.2, dtype=np.float32)
+        with (
+            mock.patch.object(wxc, "silero_frame_probs", return_value=np.zeros(4)),
+            mock.patch.object(wxc, "speech_regions_from_probs", return_value=regions),
+            mock.patch.object(lid, "detect_languages", side_effect=lambda windows: [_result("de", 0.97)] * len(windows)),
+            mock.patch.object(lid, "prepare_lid_model", return_value=True),
+        ):
+            before = wxc.split_audio_into_superchunks(audio)
+            items, decision = asyncio.run(lid.decide_transcript_items(asyncio.Lock(), audio))
+        self.assertEqual([len(item) for item in items], [len(item) for item in before])
+        self.assertTrue(all(np.array_equal(a, b) for a, b in zip(items, before)))
+        self.assertEqual(decision.languages, ["de"] * len(before))
+
+    def test_unavailable_detection_keeps_the_old_chunks_in_german_with_a_warning(self) -> None:
+        regions = [(1.0, 24.0), (30.0, 52.0)]
+        audio = np.full(16000 * 100, 0.2, dtype=np.float32)
+        with (
+            mock.patch.object(lid, "superchunk_speech_regions", return_value=regions),
+            mock.patch.object(lid, "prepare_lid_model", return_value=False),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            items, decision = asyncio.run(lid.decide_transcript_items(asyncio.Lock(), audio))
+        self.assertEqual(len(items), len(wxc.build_superchunks(regions)))
+        self.assertEqual((decision.languages, decision.source), (["de", "de"], "fallback"))
+        self.assertEqual(decision.warnings[0]["code"], "LANGUAGE_DETECTION_UNAVAILABLE")
+
+
 if __name__ == "__main__":
     unittest.main()

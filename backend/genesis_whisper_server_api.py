@@ -25,7 +25,7 @@ from .genesis_whisper_server_local_asr_engine import (
     load_local_asr_model,
     transcribe_local_asr_batch,
 )
-from .genesis_whisper_server_lid import decide_item_languages, submit_by_language
+from .genesis_whisper_server_lid import decide_item_languages, decide_transcript_items, submit_by_language
 from .genesis_whisper_server_storage import log_transcription
 from .genesis_whisper_server_vid import generate_voice_vector
 from .genesis_whisper_server_wxc import split_audio_into_superchunks
@@ -117,18 +117,24 @@ def create_api(app: FastAPI) -> FastAPI:
         batch_manager = request.app.state.whisper_batch_manager
         request_id = uuid.uuid4().hex
         batch_start = time.monotonic()
-        if uses_whole_audio_backend(model_id):
+        detect = language_detection_applies(model_id, local_processing_key[3])
+        decision = None
+        if detect and uses_whole_audio_backend(model_id):
+            # Cohere + "auto": the detected speech pieces decide where a long file is cut (one job per
+            # language), exactly like /v2/audio/process.
+            segmented_audio, decision = await decide_transcript_items(request.app.state.local_gpu_lock, audio_data)
+        elif uses_whole_audio_backend(model_id):
             # Cohere accepts whole recordings, but a long one must still reach the
             # scheduler as chunks so live requests can run between them.
             segmented_audio = await asyncio.to_thread(split_audio_into_superchunks, audio_data)
         else:
             segmented_audio = await asyncio.to_thread(split_audio_for_whisper, audio_data)
         segment_count = len(segmented_audio)
-        # Cohere + "auto": detect per ASR item (one job per detected language), exactly like /v2/audio/process.
         item_languages = None
         detection_ms = 0
-        if segment_count and language_detection_applies(model_id, local_processing_key[3]):
+        if decision is None and segment_count and detect:
             decision = await decide_item_languages(request.app.state.local_gpu_lock, segmented_audio)
+        if decision is not None:
             item_languages = decision.languages
             effective_language = decision.language
             # Reported apart, like v2's timings_ms.language_detection, so the history's transcription

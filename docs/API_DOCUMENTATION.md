@@ -110,17 +110,35 @@ never run it.
 
 - `transcript` / `transcript_embedding`: a clip up to 60 s gets one decision
   (one window up to 30 s, two windows pooled for 30-60 s). A longer file is
-  detected per ~25 s superchunk in one batched pass; a chunk below 0.5 confidence
-  takes the file's duration-weighted majority. Each language is submitted as its
-  own ASR job and the texts are joined in the original order.
-- `diarization`: the language is decided once per DIA speaker (a speaker keeps
-  one language for the file), from up to 30 s of that speaker's best clean
-  windows. A speaker with under 1 s of speech or below 0.5 confidence takes the
-  majority of the confidently detected speakers, else `de`. The WXC chunks are
-  cut at every language change, so no ASR chunk mixes two languages; a language
-  run with under 0.5 s of speech (a short backchannel, DIA jitter) joins its
-  nearer neighbour instead of becoming its own chunk. With a single language the
-  chunking is exactly the same as without detection.
+  detected per speech piece in one batched pass: every Silero speech region the
+  superchunking finds is one piece (a region over 30 s in parts of at most
+  30 s). The file's duration-weighted majority is the prior. A piece of at least
+  1.5 s keeps its own result when it is confident (0.5) for the majority
+  language, or reaches 0.85 for another language; every other piece (shorter,
+  weaker, or a doubtful deviation) takes the language of the nearest such
+  piece. The superchunks are then cut like the WXC chunks below, so a German
+  sentence followed by English is no longer one chunk decoded in one language.
+  With a single language the chunks are exactly those without detection. Each
+  language is submitted as its own ASR job and the texts are joined in the
+  original order. A language change inside one Silero region (no pause of at
+  least 0.3 s) is not seen.
+- `diarization`: the language is decided once per DIA speaker, from up to 30 s
+  of that speaker's best clean windows. A speaker with under 1 s of speech or
+  below 0.5 confidence takes the majority of the confidently detected speakers,
+  else `de`. The speaker's language is the prior for each of its turns: every
+  turn ASR sees (gated and merged) of at least 1.5 s is detected on its own in
+  the same batched pass (a turn over 30 s in parts, pooled), and takes its own
+  language only when that reaches 0.85 confidence and differs from its
+  speaker's. This covers a DIA cluster that mixes one speaker with short
+  interjections of others in another language, and a speaker who switches for a
+  sentence. Shorter or less certain turns keep the speaker's language. The 0.85
+  is calibrated on 459 German/English clips of 2-8 s: about 1.3 % of turns in
+  the speaker's language would switch wrongly, 86 % of real switches are caught.
+  The legacy turn path decodes each turn in its turn language. The WXC chunks
+  are cut at every language change of the turns, so no ASR chunk mixes two
+  languages; a language run with under 0.5 s of speech (a short backchannel,
+  DIA jitter) joins its nearer neighbour instead of becoming its own chunk. With
+  a single language the chunking is exactly the same as without detection.
 - Less than 1 s of audio, or a detection model that cannot be loaded, gives `de`
   as before. A load or runtime failure adds the warning
   `LANGUAGE_DETECTION_UNAVAILABLE` (status `partial`, also on the admin history
@@ -141,15 +159,22 @@ Response fields (all additive):
   by speech seconds when several were used), never `auto` on Cohere.
 - `models.asr.language_detection`, only when detection ran:
   `{"model": "openai/whisper-base", "source": "detected" | "fallback", "languages": {"en": 42.5, "de": 12.0}}`.
-  `languages` are speech seconds per applied language; `fallback` means nothing
-  could be detected and `de` was used.
+  `languages` are speech seconds per applied language (in diarization a turn
+  that took its own language counts for that language); `fallback` means
+  nothing could be detected and `de` was used.
 - `result.transcript.language`: the same dominant language.
-- `diarization` segments carry `language`: the language of the segment's speaker.
-  In WXC it is not necessarily the decoding prompt of every word: an absorbed
-  short piece, or a sentence the 192D verification moved to another speaker, was
-  decoded with its chunk's language. Every `speaker_assignments[]` entry
-  carries `language` and `language_source` (`detected`, `majority`, `fallback`,
-  or `request` / `setting` when no detection ran).
+- `diarization` segments carry `language` and `language_source`. On the legacy
+  turn path `language` is exactly the language the segment's turn was decoded
+  with. In WXC it is the language of the ASR chunk that owns the sentence's
+  midpoint; a sentence that spans a chunk seam can hold words decoded in the
+  neighbouring chunk's language. `language_source` is `speaker` when that is
+  the speaker's language and `turn` when it differs (its turn overrode the
+  speaker, or in WXC its chunk ran in another language), or `request` /
+  `setting` when no detection ran.
+- Every `speaker_assignments[]` entry carries `language` and `language_source`
+  (`detected`, `majority`, `fallback`, or `request` / `setting` when no
+  detection ran). This is the speaker-level decision; single turns of that
+  speaker may have run in another language (see the segments).
 - `timings_ms.language_detection` when detection ran;
   `result.chunking.superchunk_languages` (chunks per language) on the WXC path.
 

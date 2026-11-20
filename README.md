@@ -429,11 +429,14 @@ Whisper model (`language_detection_model`, default `openai/whisper-base`, about 
 one encoder pass per 30 s window, one decoder step, a softmax over only the 14 Cohere languages
 ([backend/genesis_whisper_server_lid.py](x:/dev/G3_WHISPER/backend/genesis_whisper_server_lid.py)).
 
-- Clips up to 60 s get one decision; long files one per ~25 s superchunk, smoothed over the file (a chunk below 0.5
-  confidence takes the duration-weighted majority). Each language becomes its own ASR job, texts keep their order.
-- Diarization decides once per DIA speaker from up to 30 s of the speaker's clean windows (the speaker keeps one language);
-  weak speakers take the confident speakers' majority. WXC chunks are cut at language changes, a single-language file is
-  chunked exactly as before.
+- Clips up to 60 s get one decision. Long files are detected per Silero speech region (over 30 s in parts): the file
+  majority is the prior, a piece of at least 1.5 s keeps its own language when confident (0.5 for the majority, 0.85 for
+  another one), the rest take the nearest confident neighbour's; superchunks never mix two languages. Each language
+  becomes its own ASR job, texts keep their order; a single-language file is chunked exactly as before.
+- Diarization decides once per DIA speaker from up to 30 s of the speaker's clean windows; weak speakers take the
+  confident speakers' majority. The speaker's language is the prior per turn: a turn of at least 1.5 s whose own detection
+  (same batched pass) reaches 0.85 for another language runs in that language (mixed DIA clusters, a speaker switching
+  for a sentence). WXC chunks are cut at language changes, a single-language file is chunked exactly as before.
 - An explicit language always wins. Whisper detects by itself, Parakeet ignores the language: neither runs detection.
 - The detector loads from the model cache (downloaded on first use on a worker thread, outside the GPU lock), follows
   `local_gpu_device` (FP16 on CUDA, FP32 on CPU), runs under the GPU lock in slices and is warmed at startup when Cohere

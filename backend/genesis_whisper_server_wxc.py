@@ -257,12 +257,15 @@ def build_language_superchunks(
 ) -> tuple[list[tuple[float, float]], list[str]]:
     """Superchunks that never mix two languages, plus each chunk's language, in time order.
 
-    ``language_spans`` are the gated turns as (start s, end s, language of their
-    speaker). Every Silero region is cut where the covering turn's language
-    changes (speech outside any turn belongs to the nearest one), then the
-    pieces merge to ~SUPERCHUNK_TARGET_S exactly like build_superchunks, but a
-    chunk only grows while the language stays the same. With a single language
-    the result equals build_superchunks(regions).
+    ``language_spans`` are labeled spans (start s, end s, language): the gated
+    turns with their turn language in diarization (the speaker's language unless
+    the turn's own detection overrode it), the labeled speech pieces of a long
+    transcript. Every Silero region is cut where the covering span's language
+    changes (speech outside any span belongs to the nearest one), pieces under
+    WXC_LANGUAGE_MIN_PIECE_S fold into a neighbour, then the pieces merge to
+    ~SUPERCHUNK_TARGET_S exactly like build_superchunks, but a chunk only grows
+    while the language stays the same. With a single language the result equals
+    build_superchunks(regions).
     """
 
     spans = sorted(language_spans)
@@ -323,14 +326,39 @@ def split_audio_into_superchunks(
     """
 
     samples = np.asarray(audio, dtype=np.float32).reshape(-1)
-    if len(samples) <= int(whole_audio_max_seconds * SAMPLE_RATE):
-        return [samples]
-    probs = silero_frame_probs(samples)
-    regions = speech_regions_from_probs(probs)
-    if not regions:
-        # Never drop audio silently: let the model decide what the file holds.
+    regions = superchunk_speech_regions(samples, whole_audio_max_seconds=whole_audio_max_seconds)
+    if regions is None:
         return [samples]
     return padded_chunk_audio(samples, build_superchunks(regions))
+
+
+def superchunk_speech_regions(
+    audio: np.ndarray,
+    *,
+    whole_audio_max_seconds: float = WHOLE_AUDIO_MAX_S,
+) -> list[tuple[float, float]] | None:
+    """The Silero speech regions split_audio_into_superchunks merges, or None when the audio stays one item.
+
+    None means: short enough to be one ASR item, or Silero found no speech (never drop audio silently: the
+    model then decides what the file holds). Language detection reuses the regions to label speech pieces.
+    """
+
+    samples = np.asarray(audio, dtype=np.float32).reshape(-1)
+    if len(samples) <= int(whole_audio_max_seconds * SAMPLE_RATE):
+        return None
+    regions = speech_regions_from_probs(silero_frame_probs(samples))
+    return regions or None
+
+
+def region_pieces(regions: Sequence[tuple[float, float]], max_seconds: float) -> list[tuple[float, float]]:
+    """Every region as one piece, a region longer than ``max_seconds`` as equal parts of at most that length."""
+
+    pieces: list[tuple[float, float]] = []
+    for start, end in regions:
+        count = max(1, int(np.ceil((end - start) / max_seconds - 1e-9)))
+        size = (end - start) / count
+        pieces.extend((start + index * size, end if index == count - 1 else start + (index + 1) * size) for index in range(count))
+    return pieces
 
 
 # ---------------------------------------------------------------------------

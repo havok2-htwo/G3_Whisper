@@ -1379,24 +1379,6 @@ class TranscriptLanguageDetectionTests(unittest.TestCase):
                 self.assertEqual(self.manager.calls[0][1][3], "auto")
                 self.assertEqual(decision.language, applied)
 
-    def test_long_audio_with_two_languages_is_two_jobs_in_chunk_order(self) -> None:
-        audio = np.zeros(16000 * 100, dtype=np.float32)
-        chunks = [np.full(16000 * 20, float(index), dtype=np.float32) for index in range(4)]
-        detected = [_lid_result("de"), _lid_result("en"), _lid_result("de", 0.3), _lid_result("en")]
-        with (
-            self.settings(),
-            mock.patch.object(v2, "split_audio_into_superchunks", return_value=chunks),
-            mock.patch.object(lid, "detect_languages", return_value=detected),
-        ):
-            text, _, count, _, decision = self.transcribe(audio)
-
-        self.assertEqual(count, 4)
-        self.assertEqual(sorted(key[3] for _, key in self.manager.calls), ["de", "en"])
-        # The weak third chunk takes the file majority (de 20 s vs en 40 s -> en).
-        self.assertEqual(decision.languages, ["de", "en", "en", "en"])
-        self.assertEqual(text, "de0 en1 en2 en3")
-        self.assertEqual((decision.language, decision.seconds), ("en", {"de": 20.0, "en": 60.0}))
-
     def test_endpoint_echoes_the_applied_language_and_the_detection_block(self) -> None:
         audio = np.full(16000 * 6, 0.1, dtype=np.float32)
         upload = _upload()
@@ -1484,7 +1466,8 @@ class DiarizationLanguageDetectionTests(unittest.TestCase):
         (result, timings, models, warnings, _), detect = self.run_diarization([_lid_result("en"), _lid_result("de")])
 
         detect.assert_called_once()
-        self.assertEqual(len(detect.call_args.args[0]), 2)  # one pooled window per speaker, one pass
+        # One pass: a pooled window per speaker, then one per ASR turn (the fake answers only the speakers).
+        self.assertEqual(len(detect.call_args.args[0]), 2 + 3)
         self.assertEqual(sorted(key[3] for _, key in self.manager.calls), ["de", "en"])
         self.assertEqual(
             [
@@ -1579,6 +1562,218 @@ class DiarizationLanguageDetectionTests(unittest.TestCase):
         self.assertEqual([text[:2] for text in texts], ["en", "de", "en"])
         self.assertEqual(sorted(key[3] for _, key in manager.calls), ["de", "en"])
         self.assertEqual(diagnostics["superchunk_languages"], {"de": 1, "en": 2})
+
+
+def _lid_by_level(levels):
+    """detect_languages fake: each window's mean level picks (language, probability) from ``levels``."""
+
+    def detect(windows):
+        results = []
+        for window in windows:
+            level = float(np.mean(window)) if len(window) else 0.0
+            for upper, language, probability in levels:
+                if level <= upper:
+                    results.append(_lid_result(language, probability))
+                    break
+        return results
+
+    return detect
+
+
+# 0.1 English, 0.2 German, 0.3 German below LID_TURN_OVERRIDE_CONFIDENCE, 0.4 weak English, 0.5 below
+# LID_MIN_CONFIDENCE. A pooled speaker window answers by its mean level.
+_LEVELS = [(0.17, "en", 0.97), (0.25, "de", 0.97), (0.35, "de", 0.7), (0.45, "en", 0.7), (0.55, "fr", 0.4)]
+
+
+def _audio_with_levels(seconds: float, spans) -> np.ndarray:
+    audio = np.zeros(int(seconds * 16000), dtype=np.float32)
+    for start_s, end_s, level in spans:
+        audio[int(start_s * 16000) : int(end_s * 16000)] = level
+    return audio
+
+
+class TurnLanguageRefinementTests(unittest.TestCase):
+    """The speaker's language is the prior; a long enough, confident turn of another language overrides it."""
+
+    def setUp(self) -> None:
+        _patch_lid_download(self)
+
+    @staticmethod
+    def turns(interjection_end_ms: int = 17000):
+        # SPEAKER_A is the "mixed cluster": an English speaker plus a German interjection of someone else.
+        return [
+            {"start_ms": 0, "end_ms": 8000, "speaker_id": "SPEAKER_A"},
+            {"start_ms": 8000, "end_ms": 14000, "speaker_id": "SPEAKER_B"},
+            {"start_ms": 14000, "end_ms": interjection_end_ms, "speaker_id": "SPEAKER_A"},
+            {"start_ms": 20000, "end_ms": 26000, "speaker_id": "SPEAKER_B"},
+        ]
+
+    def run_case(self, turns, audio, *, pipeline="turns", regions=None):
+        clouds = {
+            "SPEAKER_A": _ready_cloud("SPEAKER_A", _vector(0)),
+            "SPEAKER_B": _ready_cloud("SPEAKER_B", _vector(1)),
+        }
+        dia_response = {"model": {"id": "community-1"}, "diarization": turns, "exclusive_diarization": turns, "overlaps": []}
+        manager = _TextPerChunkManager()
+        app = _CapturingApp()
+        app.state.whisper_batch_manager = manager
+        original_spans = v2._speaker_lid_spans
+        align = mock.AsyncMock(return_value=[])
+        with (
+            mock.patch.dict(v2.current_settings, _lid_settings(), clear=True),
+            mock.patch.object(v2, "diarize_v2", new=mock.AsyncMock(return_value=dia_response)),
+            mock.patch.object(v2, "_extract_speaker_clouds", new=mock.AsyncMock(return_value=clouds)),
+            # The fixture clouds all sit on 0-9 s; pool each speaker from its own turns instead.
+            mock.patch.object(v2, "_speaker_lid_spans", side_effect=lambda cloud, items, *a, **k: original_spans(None, items, *a, **k)),
+            mock.patch.object(lid, "detect_languages", side_effect=_lid_by_level(_LEVELS)) as detect,
+            mock.patch.object(v2, "silero_frame_probs", return_value=np.ones(4)),
+            mock.patch.object(v2, "speech_regions_from_probs", return_value=regions or []),
+            mock.patch.object(v2, "_align_words_sliced", new=align),
+            mock.patch.object(v2, "plan_verification_windows", return_value=([], [])),
+            mock.patch.object(v2, "finish_verification", return_value={}),
+        ):
+            processed = asyncio.run(
+                v2._process_diarization(
+                    _request(app),
+                    _upload(),
+                    audio,
+                    {"expected_speakers": 2, "known_speakers": [], "speaker_refinement": "off"},
+                    False,
+                    False,
+                    pipeline,
+                    None,
+                )
+            )
+        return processed, manager, detect, align
+
+    def segments_by_start(self, result):
+        return {
+            segment["start_ms"]: (segment["diarization_speaker_id"], segment["language"], segment["language_source"])
+            for segment in result["transcript"]["segments"]
+        }
+
+    def test_a_confident_german_turn_in_an_english_cluster_is_decoded_german(self) -> None:
+        audio = _audio_with_levels(26, [(0, 8, 0.1), (8, 14, 0.2), (14, 17, 0.2), (20, 26, 0.2)])
+        (result, _, models, _, _), manager, detect, _ = self.run_case(self.turns(), audio)
+
+        detect.assert_called_once()  # speakers and turns share one batched pass
+        jobs = {key[3]: [round(len(segment) / 16000) for segment in segments] for segments, key in manager.calls}
+        # The 3 s interjection runs with the German job although its cluster is English.
+        self.assertEqual(jobs, {"en": [8], "de": [6, 3, 6]})
+        self.assertEqual(
+            self.segments_by_start(result),
+            {
+                0: ("SPEAKER_A", "en", "speaker"),
+                8000: ("SPEAKER_B", "de", "speaker"),
+                14000: ("SPEAKER_A", "de", "turn"),
+                20000: ("SPEAKER_B", "de", "speaker"),
+            },
+        )
+        assignments = {item["diarization_speaker_id"]: item for item in result["speaker_assignments"]}
+        self.assertEqual((assignments["SPEAKER_A"]["language"], assignments["SPEAKER_A"]["language_source"]), ("en", "detected"))
+        # The reported seconds follow the turns: the interjection counts as German.
+        self.assertEqual(models["asr"]["language_detection"]["languages"], {"de": 15.0, "en": 8.0})
+
+    def test_wxc_cuts_the_chunk_at_the_overriding_turn(self) -> None:
+        audio = _audio_with_levels(26, [(0, 8, 0.1), (8, 14, 0.2), (14, 17, 0.2), (20, 26, 0.2)])
+        processed, manager, _, align = self.run_case(
+            self.turns(), audio, pipeline="wxc", regions=[(0.2, 7.8), (8.1, 16.9), (20.1, 25.8)]
+        )
+        self.assertEqual(processed[3], [])  # WXC itself ran, no fallback to the turn path
+
+        chunks, texts = align.await_args.args[2], align.await_args.args[3]
+        # Without the override the cluster's English would cover 14-17 s (the bug); now German runs on.
+        self.assertEqual(chunks, [(0.2, 7.8), (8.1, 25.8)])
+        self.assertEqual([text[:2] for text in texts], ["en", "de"])
+        self.assertEqual(sorted(key[3] for _, key in manager.calls), ["de", "en"])
+
+    def test_a_turn_below_the_override_confidence_keeps_its_speakers_language(self) -> None:
+        audio = _audio_with_levels(26, [(0, 8, 0.1), (8, 14, 0.2), (14, 17, 0.3), (20, 26, 0.2)])
+        (result, _, _, _, _), manager, _, _ = self.run_case(self.turns(), audio)
+
+        self.assertEqual(self.segments_by_start(result)[14000], ("SPEAKER_A", "en", "speaker"))
+        jobs = {key[3]: [round(len(segment) / 16000) for segment in segments] for segments, key in manager.calls}
+        self.assertEqual(jobs, {"en": [8, 3], "de": [6, 6]})
+
+    def test_a_turn_shorter_than_the_minimum_is_not_detected_and_keeps_its_speakers_language(self) -> None:
+        turns = self.turns(interjection_end_ms=15200)  # 1.2 s < LID_TURN_MIN_SECONDS
+        audio = _audio_with_levels(26, [(0, 8, 0.1), (8, 14, 0.2), (14, 15.2, 0.2), (20, 26, 0.2)])
+        (result, _, _, _, _), _, detect, _ = self.run_case(turns, audio)
+
+        windows = [window for call in detect.call_args_list for window in call.args[0]]
+        self.assertEqual(len(windows), 2 + 3)  # two speakers, three long turns; the 1.2 s one is skipped
+        self.assertEqual(self.segments_by_start(result)[14000], ("SPEAKER_A", "en", "speaker"))
+
+    def test_without_a_language_change_the_chunking_is_unchanged(self) -> None:
+        audio = _audio_with_levels(26, [(0, 8, 0.2), (8, 14, 0.2), (14, 17, 0.2), (20, 26, 0.2)])
+        regions = [(0.2, 7.8), (8.1, 16.9), (20.1, 25.8)]
+        _, manager, _, align = self.run_case(self.turns(), audio, pipeline="wxc", regions=regions)
+
+        self.assertEqual(align.await_args.args[2], v2.build_superchunks(regions))
+        self.assertEqual([key[3] for _, key in manager.calls], ["de"])
+
+
+class TranscriptPieceLanguageTests(unittest.TestCase):
+    """Long transcripts: detection per Silero speech piece, superchunks never mix two languages."""
+
+    def setUp(self) -> None:
+        _patch_lid_download(self)
+        self.manager = _TextPerChunkManager()
+        self.app = _CapturingApp()
+        self.app.state.whisper_batch_manager = self.manager
+        self.request = _request(self.app)
+
+    def transcribe(self, audio, regions):
+        with (
+            mock.patch.dict(v2.current_settings, _lid_settings(), clear=True),
+            mock.patch.object(lid, "superchunk_speech_regions", return_value=regions),
+            mock.patch.object(lid, "detect_languages", side_effect=_lid_by_level(_LEVELS)) as detect,
+        ):
+            return asyncio.run(v2._transcribe_audio(self.request, audio)), detect
+
+    def test_a_german_sentence_then_english_inside_one_old_superchunk_gets_two_languages(self) -> None:
+        # 70-82 s German, 82.5-94 s English: build_superchunks made that one chunk, detected as a whole.
+        regions = [(1.0, 24.0), (30.0, 52.0), (70.0, 82.0), (82.5, 94.0)]
+        audio = _audio_with_levels(100, [(1, 24, 0.2), (30, 52, 0.2), (70, 82, 0.2), (82.5, 94, 0.1)])
+        self.assertEqual(v2.build_superchunks(regions)[-1], (70.0, 94.0))
+
+        (text, _, count, _, decision), detect = self.transcribe(audio, regions)
+
+        detect.assert_called_once()
+        self.assertEqual(len(detect.call_args.args[0]), 4)  # one window per piece
+        self.assertEqual(decision.languages, ["de", "de", "de", "en"])
+        self.assertEqual(count, 4)
+        self.assertEqual(sorted(key[3] for _, key in self.manager.calls), ["de", "en"])
+        en_job = next(segments for segments, key in self.manager.calls if key[3] == "en")
+        self.assertEqual([round(len(segment) / 16000, 2) for segment in en_job], [12.0])  # 82.5-94 s plus 2 x 0.25 s pad
+        self.assertEqual(decision.seconds, {"de": 57.0, "en": 11.5})
+
+    def test_one_language_keeps_todays_superchunks(self) -> None:
+        regions = [(1.0, 24.0), (30.0, 52.0), (70.0, 82.0), (82.5, 94.0)]
+        audio = _audio_with_levels(100, [(1, 24, 0.2), (30, 52, 0.2), (70, 82, 0.2), (82.5, 94, 0.2)])
+        (_, _, count, _, decision), _ = self.transcribe(audio, regions)
+
+        expected = v2.padded_chunk_audio(audio, v2.build_superchunks(regions))
+        [(segments, key)] = self.manager.calls
+        self.assertEqual(key[3], "de")
+        self.assertEqual(count, len(expected))
+        self.assertEqual([len(segment) for segment in segments], [len(segment) for segment in expected])
+        self.assertTrue(all(np.array_equal(a, b) for a, b in zip(segments, expected)))
+
+    def test_weak_short_and_doubtful_pieces_take_the_nearest_anchor(self) -> None:
+        # Mostly German. 24.5-27 s: English at 0.7 (a doubtful deviation from the majority, joins its German
+        # neighbour). 70.5-74 s: below LID_MIN_CONFIDENCE, 74.3-75.3 s: too short to detect; both sit
+        # between confident English pieces and take English.
+        regions = [(1.0, 24.0), (24.5, 27.0), (30.0, 52.0), (60.0, 70.0), (70.5, 74.0), (74.3, 75.3), (75.6, 90.0)]
+        audio = _audio_with_levels(
+            100,
+            [(1, 24, 0.2), (24.5, 27, 0.4), (30, 52, 0.2), (60, 70, 0.1), (70.5, 74, 0.5), (74.3, 75.3, 0.2), (75.6, 90, 0.1)],
+        )
+        (_, _, _, _, decision), detect = self.transcribe(audio, regions)
+
+        self.assertEqual(len(detect.call_args.args[0]), 6)  # the 1 s piece is not detected
+        self.assertEqual(decision.languages, ["de", "de", "de", "en", "en"])
+        self.assertEqual({code: round(value, 1) for code, value in decision.seconds.items()}, {"de": 47.5, "en": 29.7})
 
 
 if __name__ == "__main__":

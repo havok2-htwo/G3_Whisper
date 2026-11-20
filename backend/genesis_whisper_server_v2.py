@@ -10,7 +10,7 @@ import math
 import sys
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
 
 import numpy as np
@@ -43,17 +43,22 @@ from .genesis_whisper_server_history import append_history_entry, capture_histor
 from .genesis_whisper_server_lid import (
     LID_MAX_POOL_SECONDS,
     LID_MIN_SPEECH_SECONDS,
+    LID_TURN_MIN_SECONDS,
     SOURCE_DETECTED,
     SOURCE_FALLBACK,
     LanguageDecision,
     configured_lid_model,
     decide_item_languages,
+    decide_transcript_items,
     detect_windows,
     dominant_language,
     lid_status,
     log_decision,
+    pool_results,
     resolve_speaker_languages,
+    split_windows,
     submit_by_language,
+    turn_language,
     unavailable_warning,
 )
 from .genesis_whisper_server_gpu import run_blocking_gpu_phase, run_sliced_gpu_phase
@@ -98,6 +103,9 @@ SPEAKER_REFINEMENT_MODES = {"off", "shadow", "conservative"}
 MAX_EXPECTED_SPEAKERS = 64
 MAX_TURN_CHUNK_SECONDS = 30.0
 TURN_MERGE_GAP_MS = 250
+# segment "language_source" in diarization: the segment ran in its speaker's language, or in its own turn's.
+LANGUAGE_SOURCE_SPEAKER = "speaker"
+LANGUAGE_SOURCE_TURN = "turn"
 
 
 @dataclass
@@ -507,24 +515,31 @@ async def _transcribe_audio(
     """(text, transcription ms, ASR items, served model, language decision).
 
     With Cohere and an effective "auto" the language is detected per ASR item before any job is submitted, so
-    "auto" never reaches the engine: one item (up to WHOLE_AUDIO_MAX_S) gets one decision; superchunks of a long
-    file are detected in one batched pass, smoothed over the file and submitted as one job per language.
+    "auto" never reaches the engine: one item (up to WHOLE_AUDIO_MAX_S) gets one decision; a long file is
+    detected per Silero speech piece in one batched pass, cut into superchunks that never mix two languages and
+    submitted as one job per language (decide_transcript_items).
     """
 
     processing_key = _request_processing_key(language_override)
     model_id = processing_key[0]
     batch_manager = request.app.state.whisper_batch_manager
     started = time.monotonic()
-    if uses_whole_audio_backend(model_id):
+    detect = language_detection_applies(model_id, processing_key[3])
+    decision: LanguageDecision | None = None
+    if detect and uses_whole_audio_backend(model_id):
+        # The language pieces decide where the superchunks are cut, so detection builds them itself.
+        segments, decision = await decide_transcript_items(request.app.state.local_gpu_lock, audio)
+    elif uses_whole_audio_backend(model_id):
         # Cohere accepts whole recordings, but a long one must still reach the
         # scheduler as chunks so live requests can run between them.
         segments = await asyncio.to_thread(split_audio_into_superchunks, audio)
     else:
         segments = await asyncio.to_thread(split_audio_for_whisper, audio)
-    if language_detection_applies(model_id, processing_key[3]) and segments:
-        decision = await decide_item_languages(request.app.state.local_gpu_lock, segments)
-    else:
-        decision = _static_language_decision(language_override)
+    if decision is None:
+        if detect and segments:
+            decision = await decide_item_languages(request.app.state.local_gpu_lock, segments)
+        else:
+            decision = _static_language_decision(language_override)
     if not segments:
         return "", 0, 0, model_id, decision
     results = await submit_by_language(batch_manager, segments, processing_key, decision.languages or None)
@@ -578,19 +593,39 @@ def _merge_exclusive_turns(items: Sequence[Mapping[str, Any]]) -> list[dict[str,
     return merged
 
 
+def _turn_key(turn: Mapping[str, Any]) -> tuple[int, int, str]:
+    return (int(turn["start_ms"]), int(turn["end_ms"]), str(turn["speaker_id"]))
+
+
 @dataclass
 class SpeakerLanguages:
-    """Detected language per diarization label; a label without one (no cloud, no turns) gets ``default``."""
+    """Detected language per diarization label; a label without one (no cloud, no turns) gets ``default``.
+
+    ``by_turn`` holds only the turns whose own detection overrode their speaker's language (keyed by
+    start_ms, end_ms, speaker_id of the gated turn); every other turn is decoded in its speaker's language.
+    """
 
     by_speaker: dict[str, str]
     sources: dict[str, str]
     default: str
+    by_turn: dict[tuple[int, int, str], str] = field(default_factory=dict)
 
     def for_speaker(self, label: Any) -> str:
         return self.by_speaker.get(str(label), self.default)
 
     def source_for(self, label: Any) -> str:
         return self.sources.get(str(label), "majority" if self.by_speaker else SOURCE_FALLBACK)
+
+    def for_turn(self, turn: Mapping[str, Any]) -> str:
+        return self.by_turn.get(_turn_key(turn)) or self.for_speaker(turn["speaker_id"])
+
+    def turn_source(self, turn: Mapping[str, Any]) -> str:
+        return LANGUAGE_SOURCE_TURN if _turn_key(turn) in self.by_turn else LANGUAGE_SOURCE_SPEAKER
+
+    def segment_source(self, label: Any, language: str) -> str:
+        """LANGUAGE_SOURCE_TURN when a segment ran in another language than its speaker's."""
+
+        return LANGUAGE_SOURCE_SPEAKER if language == self.for_speaker(label) else LANGUAGE_SOURCE_TURN
 
 
 def _merge_spans(spans: Sequence[tuple[int, int]]) -> list[tuple[int, int]]:
@@ -668,11 +703,16 @@ async def _detect_speaker_languages(
     audio: np.ndarray,
     speaker_clouds: Mapping[str, Any],
     exclusive_turns: Sequence[Mapping[str, Any]],
+    asr_turns: Sequence[Mapping[str, Any]] = (),
 ) -> tuple[SpeakerLanguages, LanguageDecision]:
-    """One language per diarization speaker (the owner's premise: a speaker keeps his language).
+    """One language per diarization speaker as the prior, refined per ASR turn. Never raises.
 
-    Every speaker's pooled speech is one LID window; all speakers go through one batched detection pass.
-    Weak speakers take the majority of the confident ones, weighted by speech seconds. Never raises.
+    Every speaker's pooled speech is one LID window. Weak speakers take the majority of the confident ones,
+    weighted by speech seconds. Every ``asr_turns`` turn (the gated/merged turns ASR will see) of at least
+    LID_TURN_MIN_SECONDS is detected on its own as well (a turn over 30 s in parts, pooled); speakers and
+    turns share one batched detection pass. A turn keeps its speaker's language unless its own result reaches
+    LID_TURN_OVERRIDE_CONFIDENCE for another one (turn_language): a cluster that mixes an English speaker
+    with German interjections of others, or a speaker switching for a sentence.
     """
 
     started = time.monotonic()
@@ -691,17 +731,36 @@ async def _detect_speaker_languages(
         spans = _speaker_lid_spans(speaker_clouds.get(label), turns_by_speaker.get(label, []))
         if _span_seconds(spans) >= LID_MIN_SPEECH_SECONDS:
             pooled[label] = _spans_audio(audio, spans)
+    # Turn windows ride in the same pass as the speakers: (turn index, window seconds) per window.
+    windows: list[np.ndarray] = list(pooled.values())
+    turn_owners: list[tuple[int, float]] = []
+    for index, turn in enumerate(asr_turns):
+        if (int(turn["end_ms"]) - int(turn["start_ms"])) / 1000.0 < LID_TURN_MIN_SECONDS:
+            continue
+        for window in split_windows(_spans_audio(audio, [(int(turn["start_ms"]), int(turn["end_ms"]))])):
+            if len(window):
+                windows.append(window)
+                turn_owners.append((index, len(window) / 16000.0))
 
     warnings: list[dict[str, Any]] = []
     results: dict[str, Any] = {label: None for label in labels}
-    if pooled:
+    turn_results: dict[int, Any] = {}
+    if windows:
         try:
-            detected = await detect_windows(request.app.state.local_gpu_lock, list(pooled.values()))
-            results.update(dict(zip(pooled, detected)))
+            detected = await detect_windows(request.app.state.local_gpu_lock, windows)
+            results.update(dict(zip(pooled, detected[: len(pooled)])))
+            per_turn: dict[int, list[tuple[Any, float]]] = {}
+            for (index, window_seconds), result in zip(turn_owners, detected[len(pooled) :]):
+                per_turn.setdefault(index, []).append((result, window_seconds))
+            turn_results = {
+                index: pool_results([result for result, _ in items], [weight for _, weight in items])
+                for index, items in per_turn.items()
+            }
         except Exception as exc:
             print(f"[WARNUNG-LID] Sprecher-Spracherkennung fehlgeschlagen, nutze '{COHERE_FALLBACK_LANGUAGE}': {exc}", file=sys.stderr)
             warnings.append(unavailable_warning(str(exc)))
             results = {label: None for label in labels}
+            turn_results = {}
 
     resolved = resolve_speaker_languages(results, speech_seconds)
     by_speaker = {label: language for label, (language, _source) in resolved.items()}
@@ -713,9 +772,25 @@ async def _detect_speaker_languages(
     seconds: dict[str, float] = {}
     for label, language in by_speaker.items():
         seconds[language] = seconds.get(language, 0.0) + speech_seconds.get(label, 0.0)
+    by_turn: dict[tuple[int, int, str], str] = {}
+    overridden_log: list[str] = []
+    for index, result in turn_results.items():
+        turn = asr_turns[index]
+        prior = by_speaker.get(str(turn["speaker_id"]), dominant)
+        turn_seconds = (int(turn["end_ms"]) - int(turn["start_ms"])) / 1000.0
+        language, overridden = turn_language(result, turn_seconds, prior)
+        if overridden:
+            by_turn[_turn_key(turn)] = language
+            # The reported seconds follow what really runs: the turn's speech moves to its own language.
+            seconds[prior] = max(0.0, seconds.get(prior, 0.0) - turn_seconds)
+            seconds[language] = seconds.get(language, 0.0) + turn_seconds
+            overridden_log.append(
+                f"{turn['speaker_id']}@{int(turn['start_ms']) / 1000:.1f}s={language}:{result.probability:.2f}"
+            )
+    seconds = {code: value for code, value in seconds.items() if value > 0.0} or seconds
     decision = LanguageDecision(
         languages=[by_speaker[label] for label in labels],
-        language=dominant,
+        language=dominant_language(list(seconds.items()), dominant) if by_turn else dominant,
         source=SOURCE_DETECTED if any(result is not None for result in results.values()) else SOURCE_FALLBACK,
         model=configured_lid_model(),
         seconds=seconds,
@@ -727,9 +802,11 @@ async def _detect_speaker_languages(
         [
             f"{label}={result.language}:{result.probability:.2f}" if result is not None else f"{label}=-"
             for label, result in results.items()
-        ],
+        ]
+        + ([f"Turns {len(turn_results)}, umgestellt {len(overridden_log)}"] if turn_results else [])
+        + overridden_log,
     )
-    return SpeakerLanguages(by_speaker=by_speaker, sources=sources, default=dominant), decision
+    return SpeakerLanguages(by_speaker=by_speaker, sources=sources, default=dominant, by_turn=by_turn), decision
 
 
 def _turn_audio_chunks(audio: np.ndarray, start_ms: int, end_ms: int) -> list[np.ndarray]:
@@ -769,10 +846,10 @@ async def _transcribe_turns(
         turn_chunk_counts.append(len(chunks))
         prepared_chunks.extend(chunks)
         if chunk_languages is not None:
-            chunk_languages.extend([speaker_languages.for_speaker(turn["speaker_id"])] * len(chunks))
+            chunk_languages.extend([speaker_languages.for_turn(turn)] * len(chunks))
     started = time.monotonic()
     batch_manager = request.app.state.whisper_batch_manager
-    # One job per speaker language; results come back in turn order.
+    # One job per language (the speaker's, or the turn's own where it overrode it); results come back in turn order.
     batch_results = await submit_by_language(batch_manager, prepared_chunks, processing_key, chunk_languages)
     result_index = 0
     transcript_segments: list[dict[str, Any]] = []
@@ -807,6 +884,10 @@ async def _transcribe_turns(
         }
         if disposition == "asr_failure":
             segment["asr_failure"] = True
+        if speaker_languages is not None:
+            # Exactly the language this turn was decoded with.
+            segment["language"] = speaker_languages.for_turn(turn)
+            segment["language_source"] = speaker_languages.turn_source(turn)
         transcript_segments.append(segment)
     return transcript_segments, round((time.monotonic() - started) * 1000), served_model_id(batch_results, model_id)
 
@@ -823,11 +904,13 @@ async def _wxc_transcribe_segments(
     """Transcribe-first WXC path: large Silero chunks -> ASR -> word alignment ->
     gated speaker skeleton -> sentence-level 192D verification.
 
-    With per-speaker languages and more than one of them, the superchunks are
-    cut at every language change of the gated turns so no chunk mixes two
-    languages, and every language is its own ASR job. The chunk list stays in
-    time order, so alignment, seams and speaker assignment see what they saw
-    before. One language keeps exactly the chunking of before.
+    With detected languages and more than one of them among the gated turns
+    (each turn in its speaker's language unless its own detection overrode
+    it), the superchunks are cut at every language change so no chunk mixes
+    two languages, and every language is its own ASR job. The chunk list stays
+    in time order, so alignment, seams and speaker assignment see what they
+    saw before. One language keeps exactly the chunking of before. A sentence
+    reports the language of the chunk that owns its midpoint.
 
     Raises WxcNoSpeechError when Silero finds no usable speech so the caller can
     fall back to the legacy per-turn path instead of returning silence.
@@ -849,7 +932,7 @@ async def _wxc_transcribe_segments(
             (
                 float(turn["start_ms"]) / 1000.0,
                 float(turn["end_ms"]) / 1000.0,
-                speaker_languages.for_speaker(turn["speaker_id"]),
+                speaker_languages.for_turn(turn),
             )
             for turn in gated_turns
         ]
@@ -883,6 +966,7 @@ async def _wxc_transcribe_segments(
 
     assign_words_to_turns(words, gated_turns)
     sentences = words_to_sentences(words, overlaps)
+    bounds = alignment_bounds(chunks)
 
     verify_started = time.monotonic()
     verify_windows, verify_kept = await asyncio.to_thread(plan_verification_windows, audio, sentences)
@@ -907,6 +991,10 @@ async def _wxc_transcribe_segments(
         }
         if "verified_from" in sentence:
             segment["verified_from"] = str(sentence["verified_from"])
+        if chunk_languages and speaker_languages is not None:
+            language = _chunk_language_at((sentence["t0"] + sentence["t1"]) / 2.0, bounds, chunk_languages)
+            segment["language"] = language
+            segment["language_source"] = speaker_languages.segment_source(sentence["speaker"], language)
         transcript_segments.append(segment)
 
     speech_seconds = sum(b - a for a, b in regions)
@@ -923,6 +1011,15 @@ async def _wxc_transcribe_segments(
         "verification": verification,
     }
     return transcript_segments, timings, diagnostics, served_model_id(results, processing_key[0])
+
+
+def _chunk_language_at(moment: float, bounds: Sequence[float], chunk_languages: Sequence[str]) -> str:
+    """Language of the chunk that owns ``moment`` (the seam ownership of the word alignment)."""
+
+    for index, language in enumerate(chunk_languages):
+        if bounds[index] < moment <= bounds[index + 1]:
+            return language
+    return chunk_languages[-1]
 
 
 class WxcNoSpeechError(RuntimeError):
@@ -1028,21 +1125,23 @@ async def _process_diarization(
     # Per-speaker language, decided once the speaker clouds are final and before
     # any ASR: Cohere + an effective "auto" only. Everything else keeps its one
     # explicit (or Whisper-detected) language for the whole file.
-    speaker_languages: SpeakerLanguages | None = None
-    lid_ms: int | None = None
-    if language_detection_applies(*_language_settings(language_override)):
-        speaker_languages, language_decision = await _detect_speaker_languages(
-            http_request, audio, speaker_clouds, effective_exclusive
-        )
-        lid_ms = language_decision.duration_ms
-    else:
-        language_decision = _static_language_decision(language_override)
-
+    # The gated/merged turns ASR will see are refined per turn in the same
+    # detection pass (the speaker's language stays the prior).
     if gate_enabled:
         turns, gate_diagnostics = prefilter_turns(effective_exclusive)
     else:
         turns = _merge_exclusive_turns(effective_exclusive)
         gate_diagnostics = {"enabled": False}
+
+    speaker_languages: SpeakerLanguages | None = None
+    lid_ms: int | None = None
+    if language_detection_applies(*_language_settings(language_override)):
+        speaker_languages, language_decision = await _detect_speaker_languages(
+            http_request, audio, speaker_clouds, effective_exclusive, turns
+        )
+        lid_ms = language_decision.duration_ms
+    else:
+        language_decision = _static_language_decision(language_override)
 
     wxc_diagnostics: dict[str, Any] | None = None
     wxc_fallback_warning: dict[str, Any] | None = None
@@ -1135,11 +1234,14 @@ async def _process_diarization(
         else:
             segment["speaker_id"] = unmatched_public_ids[dia_speaker_id]
             segment["speaker_kind"] = "unknown"
-        segment["language"] = (
-            speaker_languages.for_speaker(dia_speaker_id)
-            if speaker_languages is not None
-            else language_decision.language
-        )
+        # The ASR paths set the language each segment was decoded with; anything else (no detection, a WXC
+        # chunk list without languages) runs in the speaker's or the request's one language.
+        if speaker_languages is None:
+            segment["language"] = language_decision.language
+            segment["language_source"] = language_decision.source
+        elif "language" not in segment:
+            segment["language"] = speaker_languages.for_speaker(dia_speaker_id)
+            segment["language_source"] = LANGUAGE_SOURCE_SPEAKER
 
     def _speaker_language_fields(dia_speaker_id: str) -> dict[str, str]:
         if speaker_languages is None:
