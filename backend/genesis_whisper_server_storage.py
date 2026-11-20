@@ -19,6 +19,7 @@ from .genesis_whisper_server_globals import (
     SUPPORTED_LANGUAGE_VALUES,
     SUPPORTED_MODEL_PRECISION_VALUES,
 )
+from .genesis_whisper_server_keywords import sanitize_keyword_setting
 
 
 load_dotenv(os.path.join(PROJECT_ROOT, ".env"), override=False)
@@ -50,6 +51,8 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "language_detection_model": DEFAULT_LANGUAGE_DETECTION_MODEL,
     "redimnet_max_batch_size": 8,
     "debug_retain_history_audio": False,
+    # Server glossary for Granite Speech, merged before every request's own keywords.
+    "asr_keywords": [],
     "huggingface_token": "",
     "dia_server_base_url": "",
     "dia_api_key": "",
@@ -121,6 +124,7 @@ SERVICE_SETTINGS_FIELDS: Tuple[str, ...] = (
     "dia_server_base_url",
     "dia_api_key",
     "debug_retain_history_audio",
+    "asr_keywords",
 )
 
 
@@ -316,6 +320,8 @@ def normalize_settings(settings: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         if isinstance(configured_history_audio_debug, bool)
         else DEFAULT_SETTINGS["debug_retain_history_audio"]
     )
+
+    normalized["asr_keywords"] = sanitize_keyword_setting(source.get("asr_keywords", []))
 
     normalized["model_profiles"] = _normalize_model_profiles(source.get("model_profiles"))
 

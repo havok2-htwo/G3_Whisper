@@ -477,7 +477,11 @@ class V2EndpointTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(payload["result"], {"transcript": {"text": "Ein Transkript", "language": "de"}})
         # The language the ASR ran with; no detection block when no detection ran.
-        self.assertEqual(payload["models"], {"asr": {"id": "asr-model", "language": "de"}})
+        # keywords: always reported when ASR ran; "asr-model" is no Granite model, nothing applied.
+        self.assertEqual(
+            payload["models"],
+            {"asr": {"id": "asr-model", "language": "de", "keywords": {"applied": False, "count": 0, "truncated": False}}},
+        )
 
     def test_explicit_invalid_api_key_is_not_hidden_by_admin_session(self) -> None:
         with (

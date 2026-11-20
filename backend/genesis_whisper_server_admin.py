@@ -121,6 +121,8 @@ class AdminSettingsPayload(BaseModel):
     language_detection_model: str | None = None
     redimnet_max_batch_size: int | None = None
     debug_retain_history_audio: StrictBool | None = None
+    # Server glossary, one term per entry; normalised and capped on save.
+    asr_keywords: List[str] | None = None
     huggingface_token: str | None = None
     dia_server_base_url: str | None = None
     dia_api_key: str | None = None
@@ -286,7 +288,7 @@ def _fail_over_queued_jobs(request: Request, failed_settings: Dict[str, Any]) ->
     failed_model = failed_settings["local_model"]
     failed_language = failed_settings["transcription_language"]
 
-    def retarget(processing_key: tuple[str, str, str, str, str], segments) -> tuple[str, str, str, str, str]:
+    def retarget(processing_key: tuple, segments) -> tuple:
         model_id, device, cache_path, selected_language, precision = _get_local_processing_key()
         # Selected again in the meantime: this key is good.
         if processing_key[0] == model_id:
@@ -301,7 +303,8 @@ def _fail_over_queued_jobs(request: Request, failed_settings: Dict[str, Any]) ->
                 )
         # The failed model's own language goes back with it, a per-request language stays.
         language = selected_language if processing_key[3] == failed_language else processing_key[3]
-        return model_id, device, cache_path, language, precision
+        # The glossary element (if any) stays: it is per request, not per model.
+        return (model_id, device, cache_path, language, precision, *processing_key[5:])
 
     request.app.state.whisper_batch_manager.fail_over_model(failed_model, retarget)
 
@@ -455,7 +458,7 @@ def _granite_speed_delta(before: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         return {}
     block = dict(after)
     if before is not None:
-        for key in ("fast_calls", "eager_calls", "budget_skips", "oom_fallbacks", "truncated_rows"):
+        for key in ("fast_calls", "eager_calls", "budget_skips", "length_skips", "oom_fallbacks", "truncated_rows"):
             block[key] = after[key] - before.get(key, 0)
     return {"granite_speed": block}
 

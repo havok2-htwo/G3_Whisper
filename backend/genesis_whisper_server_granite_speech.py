@@ -14,6 +14,10 @@ rows and the cache to GRANITE_CACHE_LENGTH_BUCKET tokens, so the cache in ``mode
 sees a bounded set of shapes; generation still stops at the eager token budget. A CUDA OOM runs that one sub-batch
 eager; any other fast-mode failure is logged once and the process stays eager from then on. ``speed_stats`` reports
 what really ran.
+
+Keywords (the ASR glossary) end the prompt as " Keywords: a, b, c", the form of the model card. One glossary per call:
+the scheduler batches only equal processing keys. Their tokens count in the KV sizing, so a long glossary makes
+sub-batches smaller; a sub-batch whose cache would outgrow GRANITE_MAX_CACHE_LENGTH runs eager.
 """
 
 from __future__ import annotations
@@ -49,9 +53,12 @@ GRANITE_DENSE_TOKENS_PER_SECOND = 16
 GRANITE_SPARSE_LANGUAGES = frozenset({"en", "fr", "de", "es", "pt"})
 GRANITE_TOKEN_MARGIN = 32
 GRANITE_MAX_NEW_TOKENS_CAP = 1024
-# Sub-batch KV sizing before the processor runs: projector tokens per audio second plus a prompt allowance.
+# Sub-batch KV sizing before the processor runs: projector tokens per audio second plus a prompt allowance
+# (the plain prompt; keywords add their own count).
 GRANITE_AUDIO_TOKENS_PER_SECOND = 10
 GRANITE_PROMPT_TOKENS = 64
+# Keyword token estimate when the tokenizer cannot count: ASCII ~3 chars per token, anything else one token per char.
+GRANITE_KEYWORD_CHARS_PER_TOKEN = 3
 GRANITE_KV_BUDGET_MB = 1536
 # Fast modes: row and length buckets of the static cache (and of the compiled decode step).
 GRANITE_BATCH_BUCKETS = (1, 2, 4, 8, 16)
@@ -60,6 +67,7 @@ GRANITE_CACHE_LENGTH_BUCKET = 256
 GRANITE_COMPILE_RECOMPILE_LIMIT = 64
 
 PUNCTUATION_INSTRUCTION = "transcribe the speech with proper punctuation and capitalization."
+KEYWORDS_PREFIX = " Keywords: "
 AUDIO_TOKEN = "<|audio|>"
 # Int8 (bitsandbytes) keeps the audio path and the output head in the compute dtype.
 GRANITE_INT8_SKIP_MODULES = ["encoder", "projector", "language_model.lm_head"]
@@ -75,6 +83,7 @@ def _fresh_speed_state() -> Dict[str, Any]:
         "fast_calls": 0,
         "eager_calls": 0,
         "budget_skips": 0,
+        "length_skips": 0,
         "oom_fallbacks": 0,
         "truncated_rows": 0,
         "compiled_shapes": set(),
@@ -92,17 +101,40 @@ def _log_once(key: str, message: str) -> None:
     print(message, file=sys.stderr)
 
 
-def prompt_content(language: Optional[str]) -> str:
-    """User message of the prompt: with a language hint for the six Granite ASR languages, plain otherwise."""
+def keywords_suffix(keywords: Sequence[str] = ()) -> str:
+    return f"{KEYWORDS_PREFIX}{', '.join(keywords)}" if keywords else ""
 
+
+def prompt_content(language: Optional[str], keywords: Sequence[str] = ()) -> str:
+    """User message of the prompt: with a language hint for the six Granite ASR languages, plain otherwise; the
+    keywords, if any, at its end."""
+
+    suffix = keywords_suffix(keywords)
     name = GRANITE_LANGUAGE_NAMES.get((language or "auto").strip().lower())
     if name is None:
-        return f"{AUDIO_TOKEN}{PUNCTUATION_INSTRUCTION}"
-    return f"{AUDIO_TOKEN}The speech is in {name}. Transcribe it exactly; do not translate. {PUNCTUATION_INSTRUCTION}"
+        return f"{AUDIO_TOKEN}{PUNCTUATION_INSTRUCTION}{suffix}"
+    return f"{AUDIO_TOKEN}The speech is in {name}. Transcribe it exactly; do not translate. {PUNCTUATION_INSTRUCTION}{suffix}"
 
 
-def build_prompt(processor: Any, language: Optional[str]) -> str:
-    content = prompt_content(language)
+def prompt_tokens(processor: Any, keywords: Sequence[str] = ()) -> int:
+    """Prompt allowance of one row: GRANITE_PROMPT_TOKENS plus the keyword suffix, counted once per call."""
+
+    suffix = keywords_suffix(keywords)
+    if not suffix:
+        return GRANITE_PROMPT_TOKENS
+    tokenizer = getattr(processor, "tokenizer", processor)
+    try:
+        counted = len(tokenizer.encode(suffix, add_special_tokens=False))
+    except Exception:
+        counted = 0
+    if counted <= 0:
+        ascii_chars = sum(1 for char in suffix if ord(char) < 128)
+        counted = math.ceil(ascii_chars / GRANITE_KEYWORD_CHARS_PER_TOKEN) + (len(suffix) - ascii_chars)
+    return GRANITE_PROMPT_TOKENS + int(counted)
+
+
+def build_prompt(processor: Any, language: Optional[str], keywords: Sequence[str] = ()) -> str:
+    content = prompt_content(language, keywords)
     tokenizer = getattr(processor, "tokenizer", processor)
     try:
         return tokenizer.apply_chat_template(
@@ -132,11 +164,11 @@ def max_new_tokens_for(seconds: float, language: Optional[str] = None) -> int:
     return int(min(GRANITE_MAX_NEW_TOKENS_CAP, math.ceil(max(0.0, seconds) * rate) + GRANITE_TOKEN_MARGIN))
 
 
-def estimated_total_tokens(seconds: float, language: Optional[str] = None) -> int:
+def estimated_total_tokens(seconds: float, language: Optional[str] = None, prompt: int = GRANITE_PROMPT_TOKENS) -> int:
     """Prompt plus audio plus new tokens of one row, an upper estimate made before the processor runs."""
 
     audio_tokens = math.ceil(max(0.0, seconds) * GRANITE_AUDIO_TOKENS_PER_SECOND)
-    return GRANITE_PROMPT_TOKENS + audio_tokens + max_new_tokens_for(seconds, language)
+    return int(prompt) + audio_tokens + max_new_tokens_for(seconds, language)
 
 
 def bucket_batch_size(rows: int) -> int:
@@ -148,6 +180,15 @@ def bucket_batch_size(rows: int) -> int:
 
 def bucket_cache_length(tokens: int) -> int:
     return int(math.ceil(max(1, tokens) / GRANITE_CACHE_LENGTH_BUCKET) * GRANITE_CACHE_LENGTH_BUCKET)
+
+
+# Largest static cache: the longest clip with the plain prompt. Longer (keyword) prompts run eager, so the fast modes
+# keep their bounded set of shapes.
+GRANITE_MAX_CACHE_LENGTH = bucket_cache_length(estimated_total_tokens(GRANITE_MAX_ITEM_SECONDS, "ja"))
+
+
+def fits_static_cache(tokens: int) -> bool:
+    return bucket_cache_length(tokens) <= GRANITE_MAX_CACHE_LENGTH
 
 
 def split_long_item(samples: np.ndarray, max_seconds: float = GRANITE_MAX_ITEM_SECONDS) -> List[np.ndarray]:
@@ -209,22 +250,32 @@ def kv_cache_mb(model: Any, rows: int, tokens: int) -> float:
     return rows * tokens * _kv_bytes_per_token(model) / (1024 * 1024)
 
 
-def sub_batch_sizes(seconds_desc: Sequence[float], max_rows: int, language: Optional[str], model: Any, fast: bool) -> List[int]:
+def sub_batch_sizes(
+    seconds_desc: Sequence[float],
+    max_rows: int,
+    language: Optional[str],
+    model: Any,
+    fast: bool,
+    prompt: int = GRANITE_PROMPT_TOKENS,
+) -> List[int]:
     """Row counts of consecutive sub-batches over clips sorted longest first.
 
     Each sub-batch is padded to its first (longest) clip; it takes as many rows as fit GRANITE_KV_BUDGET_MB, with the
-    row and length buckets of the fast modes counted. One row always goes, an oversized one runs eager.
+    row and length buckets of the fast modes counted (a sub-batch beyond GRANITE_MAX_CACHE_LENGTH is sized eager and
+    runs eager). ``prompt`` is the prompt allowance per row (prompt_tokens). One row always goes, an oversized one
+    runs eager.
     """
 
     sizes: List[int] = []
     start = 0
     while start < len(seconds_desc):
-        tokens = estimated_total_tokens(seconds_desc[start], language)
-        if fast:
+        tokens = estimated_total_tokens(seconds_desc[start], language, prompt)
+        bucketed = fast and fits_static_cache(tokens)
+        if bucketed:
             tokens = bucket_cache_length(tokens)
         size = 1
         for rows in range(min(max_rows, len(seconds_desc) - start), 0, -1):
-            padded_rows = bucket_batch_size(rows) if fast else rows
+            padded_rows = bucket_batch_size(rows) if bucketed else rows
             if kv_cache_mb(model, padded_rows, tokens) <= GRANITE_KV_BUDGET_MB:
                 size = rows
                 break
@@ -300,12 +351,14 @@ def speed_stats(model: Any = None) -> Dict[str, Any]:
             "fast_calls": _speed_state["fast_calls"],
             "eager_calls": _speed_state["eager_calls"],
             "budget_skips": _speed_state["budget_skips"],
+            "length_skips": _speed_state["length_skips"],
             "oom_fallbacks": _speed_state["oom_fallbacks"],
             "truncated_rows": _speed_state["truncated_rows"],
             "compiled_shapes": len(_speed_state["compiled_shapes"]),
             "recompile_limit": GRANITE_COMPILE_RECOMPILE_LIMIT,
             "kept_cache_mb": kept,
             "kv_budget_mb": GRANITE_KV_BUDGET_MB,
+            "max_cache_length": GRANITE_MAX_CACHE_LENGTH,
         }
 
 
@@ -417,7 +470,16 @@ def _generate_with_fallback(model: Any, inputs: Any, needed_new_tokens: int, mod
         batch = int(inputs["input_ids"].shape[0])
         cache_length = bucket_cache_length(input_length + needed_new_tokens)
         cache_mb = kv_cache_mb(model, batch, cache_length)
-        if cache_mb > GRANITE_KV_BUDGET_MB:
+        if cache_length > GRANITE_MAX_CACHE_LENGTH:
+            with _state_lock:
+                _speed_state["length_skips"] += 1
+            _log_once(
+                "length",
+                f"[INFO] Granite StaticCache fuer {cache_length} Tokens ueber der groessten Laenge "
+                f"{GRANITE_MAX_CACHE_LENGTH} (lange Keyword-Liste) -> dieser und aehnliche Batches eager.",
+            )
+            release_speed_state(model, keep_compiled=True)
+        elif cache_mb > GRANITE_KV_BUDGET_MB:
             with _state_lock:
                 _speed_state["budget_skips"] += 1
             _log_once(
@@ -491,10 +553,15 @@ def _count_truncated_rows(new_tokens: torch.Tensor, needed: int, stop_ids: Seque
 
 
 def _transcribe_sub_batch(
-    processor: Any, model: Any, clips: Sequence[np.ndarray], language: Optional[str], mode: str
+    processor: Any,
+    model: Any,
+    clips: Sequence[np.ndarray],
+    language: Optional[str],
+    mode: str,
+    keywords: Sequence[str] = (),
 ) -> List[str]:
     device = _model_device(model)
-    prompt = build_prompt(processor, language)
+    prompt = build_prompt(processor, language, keywords)
     rows = len(clips)
     batch_clips = list(clips)
     if mode != "off":
@@ -527,8 +594,11 @@ def transcribe_granite_batch(
     audio_batch: Sequence[np.ndarray],
     language: Optional[str],
     batch_size: int,
+    keywords: Sequence[str] = (),
 ) -> List[str]:
-    """Texts in input order. One language per call: the scheduler batches only equal processing keys."""
+    """Texts in input order. One language and one glossary per call: the scheduler batches only equal processing keys."""
+
+    keywords = tuple(keywords or ())
 
     waveforms = [np.asarray(audio, dtype=np.float32).reshape(-1) for audio in audio_batch]
     parts: List[Tuple[int, int, np.ndarray]] = []
@@ -545,14 +615,21 @@ def transcribe_granite_batch(
         ordered = sorted(parts, key=lambda part: len(part[2]), reverse=True)
         mode = _effective_speed_mode(model, _model_device(model))
         seconds = [len(part[2]) / SAMPLE_RATE for part in ordered]
+        prompt = prompt_tokens(processor, keywords)
         start = 0
-        for size in sub_batch_sizes(seconds, max_rows, language, model, mode != "off"):
+        for size in sub_batch_sizes(seconds, max_rows, language, model, mode != "off", prompt):
             chunk = ordered[start : start + size]
-            start += size
+            sub_mode = mode
             if mode != "off":
                 # A fast mode that failed on an earlier sub-batch is off now.
-                mode = _effective_speed_mode(model, _model_device(model))
-            results = _transcribe_sub_batch(processor, model, [part[2] for part in chunk], language, mode)
+                mode = sub_mode = _effective_speed_mode(model, _model_device(model))
+                if sub_mode != "off" and not fits_static_cache(estimated_total_tokens(seconds[start], language, prompt)):
+                    # Sized eager by sub_batch_sizes: no padding rows, no static cache.
+                    sub_mode = "off"
+                    with _state_lock:
+                        _speed_state["length_skips"] += 1
+            start += size
+            results = _transcribe_sub_batch(processor, model, [part[2] for part in chunk], language, sub_mode, keywords)
             for (index, order, _), text in zip(chunk, results):
                 texts_by_part[(index, order)] = text
 

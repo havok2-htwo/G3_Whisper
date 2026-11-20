@@ -1054,7 +1054,8 @@ def log_decision(decision: LanguageDecision, confidences: Sequence[str]) -> None
 
 
 def with_language(processing_key: tuple, language: str) -> tuple:
-    return (processing_key[0], processing_key[1], processing_key[2], language, processing_key[4])
+    # Everything after the language (precision, a glossary) is kept.
+    return (*processing_key[:3], language, *processing_key[4:])
 
 
 async def submit_by_language(

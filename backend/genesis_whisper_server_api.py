@@ -25,6 +25,14 @@ from .genesis_whisper_server_local_asr_engine import (
     load_local_asr_model,
     transcribe_local_asr_batch,
 )
+from .genesis_whisper_server_keywords import (
+    KEYWORDS_KEY_INDEX,
+    key_keywords,
+    keywords_block,
+    parse_form_keywords,
+    resolve_glossary,
+    with_keywords,
+)
 from .genesis_whisper_server_lid import decide_item_languages, decide_transcript_items, submit_by_language
 from .genesis_whisper_server_storage import log_transcription
 from .genesis_whisper_server_vid import generate_voice_vector
@@ -54,8 +62,10 @@ def _get_local_processing_key() -> Tuple[str, str, str, str, str]:
     return model_id, device, cache_path, language, precision
 
 
-def process_local_asr_batch(audio_batch: List[np.ndarray], processing_key: Tuple[str, str, str, str, str]) -> List[str]:
-    model_id, device, cache_path, language, precision = processing_key
+def process_local_asr_batch(audio_batch: List[np.ndarray], processing_key: tuple) -> List[str]:
+    # (model, device, cache path, language, precision) plus an optional KeywordSet.
+    model_id, device, cache_path, language, precision = processing_key[:KEYWORDS_KEY_INDEX]
+    keywords = key_keywords(processing_key)
     with shared_gpu_lease():
         if not load_local_asr_model(model_id, device, cache_path, precision):
             load_error = get_last_local_asr_load_error()
@@ -65,6 +75,8 @@ def process_local_asr_batch(audio_batch: List[np.ndarray], processing_key: Tuple
             raise RuntimeError(detail)
         with settings_lock:
             batch_size = max(1, int(current_settings.get("batch_max_segments", len(audio_batch) or 1)))
+        if keywords:
+            return transcribe_local_asr_batch(audio_batch, language=language, batch_size=batch_size, keywords=keywords)
         return transcribe_local_asr_batch(audio_batch, language=language, batch_size=batch_size)
 
 
@@ -83,6 +95,9 @@ def create_api(app: FastAPI) -> FastAPI:
         file: UploadFile = File(..., description="Die zu transkribierende Audiodatei (z.B. WAV, MP3, FLAC)."),
         engine: str = Form("local", description="Es wird nur noch die lokale ASR-Engine unterstuetzt."),
         voice_ident: bool = Form(False, description="Wenn True, wird zusaetzlich ein Stimm-Vektor (Embedding) generiert."),
+        keywords: Optional[str] = Form(
+            None, description="Glossar: Begriffe, getrennt durch Zeilenumbrueche oder Kommas (nur Granite Speech)."
+        ),
     ):
         api_key_id = authorize_api_key(request)
         request_start_time = time.monotonic()
@@ -105,7 +120,9 @@ def create_api(app: FastAPI) -> FastAPI:
         segment_count = 1
         used_batching = False
 
-        local_processing_key = _get_local_processing_key()
+        # Server glossary first, the form's terms after it; a non-empty glossary separates the job's batches.
+        glossary = resolve_glossary(parse_form_keywords(keywords if isinstance(keywords, str) else None))
+        local_processing_key = with_keywords(_get_local_processing_key(), glossary)
         model_id = local_processing_key[0]
         effective_language = get_effective_transcription_language(model_id, local_processing_key[3])
 
@@ -227,6 +244,7 @@ def create_api(app: FastAPI) -> FastAPI:
             "language": effective_language,
             "total_duration_ms": total_duration_ms,
             "transcription_duration_ms": transcription_duration_ms,
+            "keywords": keywords_block(glossary, model_id),
         }
         if voice_ident:
             response_data["voice_vector"] = voice_vector
@@ -269,9 +287,10 @@ def create_api(app: FastAPI) -> FastAPI:
         prompt: Optional[str] = Form(None),
         response_format: Optional[str] = Form("json"),
         temperature: Optional[float] = Form(0.0),
+        keywords: Optional[str] = Form(None),
     ):
-        # We call the existing endpoint logic to avoid duplication
-        response = await transcribe_endpoint(request, file=file, engine="local", voice_ident=False)
+        # We call the existing endpoint logic to avoid duplication. "prompt" stays unused; the glossary is "keywords".
+        response = await transcribe_endpoint(request, file=file, engine="local", voice_ident=False, keywords=keywords)
         transcription_text = response.get("transcription", "")
         
         if response_format == "text":
@@ -283,7 +302,8 @@ def create_api(app: FastAPI) -> FastAPI:
                 "language": response.get("language") or current_settings.get("transcription_language", "auto"),
                 "duration": response.get("transcription_duration_ms", 0) / 1000.0,
                 "text": transcription_text,
-                "segments": []
+                "segments": [],
+                "keywords": response.get("keywords"),
             }
             
         return {"text": transcription_text}

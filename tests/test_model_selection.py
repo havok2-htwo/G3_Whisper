@@ -1201,7 +1201,12 @@ class ClientDiscoveryTests(unittest.TestCase):
     def test_shape_on_cohere(self) -> None:
         admin.local_model_components.update({"model": object(), "model_identifier": (COHERE_MODEL_ID, "auto", "", "fp16")})
         body = self.capabilities()
-        self.assertEqual(set(body), {"schema_version", "service", "model", "language", "modes", "embedding", "diarization"})
+        self.assertEqual(
+            set(body), {"schema_version", "service", "model", "language", "modes", "embedding", "diarization", "keywords"}
+        )
+        self.assertEqual(
+            body["keywords"], {"supported": False, "max_entries": 1000, "max_chars": 16000, "server_glossary_count": 0}
+        )
         self.assertEqual((body["schema_version"], body["service"]), ("2.0", "asr"))
         self.assertEqual(
             body["model"],

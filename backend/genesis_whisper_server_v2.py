@@ -40,6 +40,16 @@ from .genesis_whisper_server_globals import (
     uses_whole_audio_backend,
 )
 from .genesis_whisper_server_history import append_history_entry, capture_history_audio
+from .genesis_whisper_server_keywords import (
+    Glossary,
+    KeywordValidationError,
+    capabilities_block,
+    keywords_block,
+    parse_request_keywords,
+    resolve_glossary,
+    truncation_warnings,
+    with_keywords,
+)
 from .genesis_whisper_server_lid import (
     LID_MAX_POOL_SECONDS,
     LID_MIN_SPEECH_SECONDS,
@@ -176,7 +186,7 @@ def _parse_request_json(raw_value: str | None) -> dict[str, Any]:
         raise V2ApiError(400, "INVALID_JSON", "Multipart-Feld 'request' enthaelt kein gueltiges JSON.") from exc
     if not isinstance(payload, dict):
         raise V2ApiError(422, "INVALID_REQUEST", "Request-JSON muss ein Objekt sein.")
-    _validate_object_keys(payload, {"schema_version", "mode", "diarization", "language"}, "request")
+    _validate_object_keys(payload, {"schema_version", "mode", "diarization", "language", "keywords"}, "request")
     if payload.get("schema_version") != V2_SCHEMA_VERSION:
         raise V2ApiError(422, "INVALID_REQUEST", "schema_version muss '2.0' sein.")
     mode = str(payload.get("mode") or "").strip()
@@ -198,11 +208,18 @@ def _parse_request_json(raw_value: str | None) -> dict[str, Any]:
                 f"language '{normalized_language}' wird nicht unterstuetzt.",
             )
 
+    try:
+        keywords = parse_request_keywords(payload.get("keywords"))
+    except KeywordValidationError as exc:
+        raise V2ApiError(422, "INVALID_REQUEST", str(exc), details={"field": "request.keywords"}) from exc
+    if keywords is not None and mode == "embedding":
+        raise V2ApiError(422, "INVALID_REQUEST", "keywords ist im Modus 'embedding' nicht erlaubt.")
+
     diarization = payload.get("diarization")
     if mode != "diarization":
         if diarization is not None:
             raise V2ApiError(422, "INVALID_REQUEST", "diarization ist nur im Modus 'diarization' erlaubt.")
-        return {"schema_version": V2_SCHEMA_VERSION, "mode": mode, "language": normalized_language}
+        return {"schema_version": V2_SCHEMA_VERSION, "mode": mode, "language": normalized_language, "keywords": keywords}
     if diarization is None:
         diarization = {}
     if not isinstance(diarization, dict):
@@ -261,6 +278,7 @@ def _parse_request_json(raw_value: str | None) -> dict[str, Any]:
         "schema_version": V2_SCHEMA_VERSION,
         "mode": mode,
         "language": normalized_language,
+        "keywords": keywords,
         "diarization": {
             "expected_speakers": expected,
             "known_speakers": known,
@@ -415,17 +433,24 @@ def _ensure_asr_model(processing_key: tuple[str, str, str, str, str]) -> None:
     raise RuntimeError(detail)
 
 
-def _request_processing_key(language_override: str | None) -> tuple[str, str, str, str, str]:
-    """Server settings key, with the per-request language override applied.
+def _request_processing_key(language_override: str | None, glossary: Glossary | None = None) -> tuple:
+    """Server settings key, with the per-request language override and glossary applied.
 
     The batch worker groups requests by this key, so an overridden language
-    simply forms its own batch group and reaches the engine unchanged.
+    or a glossary simply forms its own batch group and reaches the engine
+    unchanged. Without glossary terms the key is the plain 5-tuple.
     """
 
     key = _processing_key()
     if language_override:
-        return (key[0], key[1], key[2], language_override, key[4])
-    return key
+        key = (key[0], key[1], key[2], language_override, key[4])
+    return with_keywords(key, glossary)
+
+
+def _glossary_or_server(glossary: Glossary | None) -> Glossary:
+    """The request's resolved glossary; a caller without one (history retry) gets the server glossary."""
+
+    return glossary if glossary is not None else resolve_glossary()
 
 
 # One GPU-lock hold of a bulk job may not exceed roughly a live request's own
@@ -511,16 +536,18 @@ async def _transcribe_audio(
     request: Request,
     audio: np.ndarray,
     language_override: str | None = None,
+    glossary: Glossary | None = None,
 ) -> tuple[str, int, int, str, LanguageDecision]:
     """(text, transcription ms, ASR items, served model, language decision).
 
     With Cohere or Granite and an effective "auto" the language is detected per ASR item before any job is submitted, so
     "auto" never reaches the engine: one item (up to WHOLE_AUDIO_MAX_S) gets one decision; a long file is
     detected per Silero speech piece in one batched pass, cut into superchunks that never mix two languages and
-    submitted as one job per language (decide_transcript_items).
+    submitted as one job per language (decide_transcript_items). The glossary rides in the processing key of every
+    job.
     """
 
-    processing_key = _request_processing_key(language_override)
+    processing_key = _request_processing_key(language_override, _glossary_or_server(glossary))
     model_id = processing_key[0]
     batch_manager = request.app.state.whisper_batch_manager
     started = time.monotonic()
@@ -836,8 +863,9 @@ async def _transcribe_turns(
     gate_enabled: bool = True,
     language_override: str | None = None,
     speaker_languages: SpeakerLanguages | None = None,
+    glossary: Glossary | None = None,
 ) -> tuple[list[dict[str, Any]], int, str]:
-    processing_key = _request_processing_key(language_override)
+    processing_key = _request_processing_key(language_override, _glossary_or_server(glossary))
     model_id = processing_key[0]
     turn_chunk_counts: list[int] = []
     prepared_chunks: list[np.ndarray] = []
@@ -901,6 +929,7 @@ async def _wxc_transcribe_segments(
     apply_repetition_filter: bool,
     language_override: str | None = None,
     speaker_languages: SpeakerLanguages | None = None,
+    glossary: Glossary | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, int], dict[str, Any], str]:
     """Transcribe-first WXC path: large Silero chunks -> ASR -> word alignment ->
     gated speaker skeleton -> sentence-level 192D verification.
@@ -917,7 +946,7 @@ async def _wxc_transcribe_segments(
     fall back to the legacy per-turn path instead of returning silence.
     """
 
-    processing_key = _request_processing_key(language_override)
+    processing_key = _request_processing_key(language_override, _glossary_or_server(glossary))
     timings: dict[str, int] = {}
 
     vad_started = time.monotonic()
@@ -1074,6 +1103,7 @@ async def _process_diarization(
     gate_enabled: bool = True,
     pipeline_mode: str = "wxc",
     language_override: str | None = None,
+    glossary: Glossary | None = None,
 ) -> tuple[dict[str, Any], dict[str, int], dict[str, Any], list[dict[str, Any]], str]:
     expected_speakers = configuration.get("expected_speakers")
     known_speakers = list(configuration.get("known_speakers") or [])
@@ -1158,6 +1188,7 @@ async def _process_diarization(
                     apply_repetition_filter,
                     language_override,
                     speaker_languages,
+                    glossary,
                 )
             )
             transcription_ms = extra_timings.get("transcription", 0)
@@ -1178,6 +1209,7 @@ async def _process_diarization(
             gate_enabled,
             language_override,
             speaker_languages,
+            glossary,
         )
 
     try:
@@ -1461,6 +1493,8 @@ def create_v2_capabilities_api(app: FastAPI) -> FastAPI:
             "modes": list(V2_MODES),
             "embedding": {"id": embedding_model_metadata()["id"]},
             "diarization": {"configured": dia_is_configured()},
+            # Always present: clients detect the request field "keywords" by this key.
+            "keywords": capabilities_block(model_id),
         }
 
     return app
@@ -1504,6 +1538,8 @@ def create_v2_api(app: FastAPI) -> FastAPI:
             form_data, file, request_json = await _parse_multipart_parts(http_request)
             parsed = _parse_request_json(request_json)
             mode = parsed["mode"]
+            # Server glossary first, the request's terms after it; resolved once, sent with every ASR job.
+            glossary = resolve_glossary(parsed.get("keywords")) if mode != "embedding" else None
             filename = file.filename or "upload"
             decode_started = time.monotonic()
             try:
@@ -1538,7 +1574,7 @@ def create_v2_api(app: FastAPI) -> FastAPI:
                 result = {"embedding": {"vector": vector}}
             elif mode == "transcript":
                 transcript_text, transcription_ms, _, asr_model_id, language_decision = await _transcribe_audio(
-                    http_request, audio, parsed.get("language")
+                    http_request, audio, parsed.get("language"), glossary
                 )
                 if filter_enabled:
                     transcript_text = filter_repeated_patterns(transcript_text)
@@ -1547,7 +1583,7 @@ def create_v2_api(app: FastAPI) -> FastAPI:
                 result = {"transcript": {"text": transcript_text, "language": language_decision.language}}
             elif mode == "transcript_embedding":
                 transcript_text, transcription_ms, _, asr_model_id, language_decision = await _transcribe_audio(
-                    http_request, audio, parsed.get("language")
+                    http_request, audio, parsed.get("language"), glossary
                 )
                 if filter_enabled:
                     transcript_text = filter_repeated_patterns(transcript_text)
@@ -1584,6 +1620,7 @@ def create_v2_api(app: FastAPI) -> FastAPI:
                     gate_enabled,
                     pipeline_mode,
                     parsed.get("language"),
+                    glossary,
                 )
                 timings.update(mode_timings)
                 transcription_ms = mode_timings.get("transcription")
@@ -1598,6 +1635,12 @@ def create_v2_api(app: FastAPI) -> FastAPI:
                     timings["language_detection"] = language_decision.duration_ms
             elif asr_model_id and isinstance(models.get("asr"), dict) and "language" not in models["asr"]:
                 models["asr"]["language"] = _static_language_decision(parsed.get("language")).language
+            if glossary is not None:
+                # applied follows the model that really served the request (a failover may have changed it).
+                asr_block = models.setdefault("asr", {})
+                if isinstance(asr_block, dict):
+                    asr_block["keywords"] = keywords_block(glossary, asr_model_id)
+                warnings.extend(truncation_warnings(glossary))
             total_ms = round((time.monotonic() - request_started) * 1000)
             timings["total"] = total_ms
             if api_key_id:

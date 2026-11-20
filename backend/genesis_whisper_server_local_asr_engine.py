@@ -1102,7 +1102,11 @@ def transcribe_local_asr(audio_data_np: np.ndarray, language: str) -> str:
     return transcribe_local_asr_batch([audio_data_np], language=language, batch_size=1)[0]
 
 
-def transcribe_local_asr_batch(audio_batch: List[np.ndarray], language: str, batch_size: int) -> List[str]:
+def transcribe_local_asr_batch(
+    audio_batch: List[np.ndarray], language: str, batch_size: int, keywords: Tuple[str, ...] = ()
+) -> List[str]:
+    """Texts in input order. ``keywords`` (the glossary) reach Granite only; other backends ignore them."""
+
     components = local_model_components
     model_backend = components.get("model_backend")
     # Parakeet (onnx-asr) has no separate processor object.
@@ -1120,5 +1124,7 @@ def transcribe_local_asr_batch(audio_batch: List[np.ndarray], language: str, bat
     if model_backend == "cohere_transcribe":
         return _transcribe_cohere_batch(processor, model, audio_batch, language=language, batch_size=batch_size)
     if model_backend == "granite_speech":
-        return transcribe_granite_batch(processor, model, audio_batch, language=language, batch_size=batch_size)
+        return transcribe_granite_batch(
+            processor, model, audio_batch, language=language, batch_size=batch_size, keywords=tuple(keywords or ())
+        )
     return _transcribe_whisper_batch(processor, model, audio_batch, language=language)
