@@ -22,6 +22,7 @@ COHERE_FALLBACK_LANGUAGE exactly as before and reports why in its warnings. It n
 from __future__ import annotations
 
 import asyncio
+import functools
 import math
 import os
 import sys
@@ -48,6 +49,7 @@ from .genesis_whisper_server_globals import (
 from .genesis_whisper_server_gpu import run_sliced_gpu_phase, shared_gpu_lease
 from .genesis_whisper_server_vid import resolve_local_device
 from .genesis_whisper_server_wxc import (
+    SUPERCHUNK_TARGET_S,
     build_language_superchunks,
     build_superchunks,
     padded_chunk_audio,
@@ -82,6 +84,9 @@ LID_TURN_MIN_SECONDS = 1.5
 # beyond it every wrong switch avoided costs about ten caught ones. All 14 languages, 607 clips: 3.5 %
 # wrong, 82 % caught (nl and zh TTS read as de with up to 0.99 carry most of the rest).
 LID_TURN_OVERRIDE_CONFIDENCE = 0.85
+# Long transcripts: a run of speech pieces shorter than LID_TURN_MIN_SECONDS is pooled into one detection
+# window up to this much speech (8 s crops were about 95 % right), so choppy speech still counts.
+LID_SHORT_POOL_SECONDS = 8.0
 # Windows per encoder call. whisper-base at 8 x 30 s is about 0.2 GB of activations in FP16.
 LID_BATCH_SIZE = 8
 # Windows per GPU-lock hold in request handlers (two encoder batches), so live requests get in between.
@@ -436,18 +441,47 @@ def _logits_to_result(logits: np.ndarray) -> LidResult:
     )
 
 
-def _run_batch(windows: Sequence[np.ndarray]) -> np.ndarray:
-    """Language logits [len(windows), 14] for one encoder batch. Caller holds ``_lid_lock`` and the lease."""
-
-    feature_extractor = _lid_components["feature_extractor"]
-    model = _lid_components["model"]
-    device: torch.device = _lid_components["device"]
-    dtype: torch.dtype = _lid_components["dtype"]
-    features = feature_extractor(
+def _extract_features(feature_extractor: Any, windows: Sequence[np.ndarray]) -> torch.Tensor:
+    return feature_extractor(
         [np.asarray(window, dtype=np.float32).reshape(-1) for window in windows],
         sampling_rate=SAMPLE_RATE,
         return_tensors="pt",
     ).input_features
+
+
+@dataclass(frozen=True)
+class LidFeatures:
+    """Log-mel features of some windows, computed off the GPU lock by the extractor that made them."""
+
+    extractor: Any
+    values: torch.Tensor
+
+
+def lid_features(windows: Sequence[np.ndarray]) -> Optional[LidFeatures]:
+    """The windows' log-mel features on a worker thread, or None before the detector was ever loaded.
+
+    The feature extraction (about 5 ms of CPU per 30 s window, more than the encoder itself) then no longer
+    runs inside the GPU lock. Read without ``_lid_lock`` (a single atomic dict read); detect_languages uses
+    the features only when the same extractor is still loaded, else it computes them itself as before.
+    """
+
+    extractor = _lid_components["feature_extractor"]
+    if extractor is None or not windows:
+        return None
+    try:
+        return LidFeatures(extractor=extractor, values=_extract_features(extractor, windows))
+    except Exception:
+        # The GPU phase extracts them itself and reports a real failure there.
+        return None
+
+
+def _run_batch(windows: Sequence[np.ndarray], precomputed: Optional[torch.Tensor] = None) -> np.ndarray:
+    """Language logits [len(windows), 14] for one encoder batch. Caller holds ``_lid_lock`` and the lease."""
+
+    model = _lid_components["model"]
+    device: torch.device = _lid_components["device"]
+    dtype: torch.dtype = _lid_components["dtype"]
+    features = precomputed if precomputed is not None else _extract_features(_lid_components["feature_extractor"], windows)
     input_features = None
     decoder_input_ids = None
     logits = None
@@ -467,10 +501,11 @@ def _run_batch(windows: Sequence[np.ndarray]) -> np.ndarray:
         del input_features, decoder_input_ids, logits
 
 
-def detect_languages(windows: Sequence[np.ndarray]) -> List[LidResult]:
+def detect_languages(windows: Sequence[np.ndarray], features: Optional[LidFeatures] = None) -> List[LidResult]:
     """One LidResult per 16 kHz mono window (at most 30 s each are seen), batched into few encoder calls.
 
-    Runs on the GPU phase thread. Raises LanguageDetectionUnavailable when the model cannot be loaded.
+    Runs on the GPU phase thread. ``features`` (lid_features of exactly these windows) are used when their
+    extractor is still the loaded one. Raises LanguageDetectionUnavailable when the model cannot be loaded.
     """
 
     items = list(windows)
@@ -482,6 +517,13 @@ def detect_languages(windows: Sequence[np.ndarray]) -> List[LidResult]:
                 f"Language detection model '{configured_lid_model()}' is unavailable: {_lid_failure['error']}"
             )
         device: torch.device = _lid_components["device"]
+        precomputed = (
+            features.values
+            if features is not None
+            and features.extractor is _lid_components["feature_extractor"]
+            and int(features.values.shape[0]) == len(items)
+            else None
+        )
         results: List[LidResult] = []
         with shared_gpu_lease():
             position = 0
@@ -489,7 +531,10 @@ def detect_languages(windows: Sequence[np.ndarray]) -> List[LidResult]:
                 batch_size = max(1, int(_lid_components["batch_size"]))
                 current = items[position : position + batch_size]
                 try:
-                    logits = _run_batch(current)
+                    logits = _run_batch(
+                        current,
+                        precomputed[position : position + len(current)] if precomputed is not None else None,
+                    )
                 except RuntimeError as exc:
                     if "out of memory" in str(exc).lower() and batch_size > 1:
                         # Halve and retry; the smaller size sticks until the model is moved or reloaded.
@@ -646,18 +691,21 @@ def smooth_piece_languages(
     results: Sequence[Optional[LidResult]],
     spans: Sequence[tuple[float, float]],
     fallback: str = COHERE_FALLBACK_LANGUAGE,
+    seconds: Optional[Sequence[float]] = None,
 ) -> List[str]:
-    """Per-piece languages for a long transcript's speech pieces (time order).
+    """Per-piece languages for a long transcript's speech pieces or detection units (time order).
 
     The file majority (confident pieces, weighted by seconds) is the prior. An anchor is a piece of at least
     LID_TURN_MIN_SECONDS with a confident result (LID_MIN_CONFIDENCE) for the majority, or with
     LID_TURN_OVERRIDE_CONFIDENCE for another language, the same bar a diarization turn needs to leave its
     speaker's language. Every other piece (short, weak, or a doubtful deviation) takes the language of the
     nearest anchor, the earlier one on a tie; without any anchor everything is the majority, without any
-    result at all ``fallback``.
+    result at all ``fallback``. ``seconds`` is each one's speech (a pooled unit spans pauses); without it the
+    span lengths.
     """
 
-    seconds = [max(0.0, float(end) - float(start)) for start, end in spans]
+    if seconds is None:
+        seconds = [max(0.0, float(end) - float(start)) for start, end in spans]
     usable = [
         result if result is not None and piece_seconds >= LID_TURN_MIN_SECONDS else None
         for result, piece_seconds in zip(results, seconds)
@@ -761,8 +809,22 @@ async def detect_windows(gpu_lock: asyncio.Lock, windows: Sequence[np.ndarray]) 
         raise LanguageDetectionUnavailable(
             f"Language detection model '{configured_lid_model()}' is unavailable: {_lid_failure['error']}"
         )
-    parts = await run_sliced_gpu_phase(gpu_lock, list(windows), detect_languages, LID_SLICE_WINDOWS)
-    return [result for part in parts for result in part]
+    items = list(windows)
+    results: List[LidResult] = []
+    for start in range(0, len(items), LID_SLICE_WINDOWS):
+        part = items[start : start + LID_SLICE_WINDOWS]
+        # The log-mel features of this slice are computed on a worker thread, outside the GPU lock; only the
+        # encoder step runs under it. Before the first load there is no extractor yet and the GPU phase makes
+        # them itself.
+        features = await asyncio.to_thread(lid_features, part)
+        function = detect_languages if features is None else functools.partial(_detect_with_features, features=features)
+        parts = await run_sliced_gpu_phase(gpu_lock, part, function, LID_SLICE_WINDOWS)
+        results.extend(result for chunk in parts for result in chunk)
+    return results
+
+
+def _detect_with_features(windows: Sequence[np.ndarray], features: LidFeatures) -> List[LidResult]:
+    return detect_languages(windows, features=features)
 
 
 async def decide_item_languages(gpu_lock: asyncio.Lock, items: Sequence[np.ndarray]) -> LanguageDecision:
@@ -829,10 +891,12 @@ async def decide_transcript_items(
 
     Audio up to WHOLE_AUDIO_MAX_S (or without any Silero speech) stays one item with one decision, exactly as
     decide_item_languages. A longer file is judged per speech piece instead of per superchunk: every Silero
-    region of split_audio_into_superchunks is one piece (longer ones in parts of at most 30 s), all pieces of
-    at least LID_TURN_MIN_SECONDS go through one batched detection pass, smooth_piece_languages labels them,
-    and the same builder as WXC diarization cuts superchunks that never mix two languages. One language gives
-    exactly the superchunks of split_audio_into_superchunks.
+    region of split_audio_into_superchunks is one piece (longer ones in parts of at most 30 s, cut at the
+    quietest moment near the even split), every piece of at least LID_TURN_MIN_SECONDS is one detection unit
+    and runs of shorter pieces are pooled into units (piece_detection_units), all units go through one batched
+    detection pass, smooth_piece_languages labels them, and the same builder as WXC diarization cuts
+    superchunks that never mix two languages. One language gives exactly the superchunks of
+    split_audio_into_superchunks. The CPU work around the detection runs on worker threads.
     """
 
     samples = np.asarray(audio, dtype=np.float32).reshape(-1)
@@ -843,32 +907,20 @@ async def decide_transcript_items(
 
     started = time.monotonic()
     model_id = configured_lid_model()
-    pieces = region_pieces(regions, LID_WINDOW_SECONDS)
-    detectable = [index for index, (start, end) in enumerate(pieces) if end - start >= LID_TURN_MIN_SECONDS]
+    pieces, units, windows, detectable = await asyncio.to_thread(_transcript_detection_plan, samples, regions)
     warnings: List[Dict[str, Any]] = []
-    results: List[Optional[LidResult]] = [None] * len(pieces)
+    results: List[Optional[LidResult]] = [None] * len(units)
     if detectable:
-        windows = [
-            samples[max(0, round(pieces[index][0] * SAMPLE_RATE)) : round(pieces[index][1] * SAMPLE_RATE)]
-            for index in detectable
-        ]
         try:
             for index, result in zip(detectable, await detect_windows(gpu_lock, windows)):
                 results[index] = result
         except Exception as exc:
             print(f"[WARNUNG-LID] Spracherkennung fehlgeschlagen, nutze '{COHERE_FALLBACK_LANGUAGE}': {exc}", file=sys.stderr)
             warnings.append(unavailable_warning(str(exc)))
-            results = [None] * len(pieces)
+            results = [None] * len(units)
+    del windows
 
-    piece_languages = smooth_piece_languages(results, pieces)
-    if len(set(piece_languages)) > 1:
-        chunks, languages = build_language_superchunks(
-            regions, [(start, end, language) for (start, end), language in zip(pieces, piece_languages)]
-        )
-    else:
-        chunks = build_superchunks(regions)
-        languages = [piece_languages[0]] * len(chunks)
-    items = padded_chunk_audio(samples, chunks)
+    items, chunks, languages = await asyncio.to_thread(_transcript_chunks, samples, regions, pieces, units, results)
     seconds: Dict[str, float] = {}
     for (start, end), language in zip(chunks, languages):
         seconds[language] = seconds.get(language, 0.0) + (end - start)
@@ -886,6 +938,86 @@ async def decide_transcript_items(
         [f"{result.language}:{result.probability:.2f}" if result is not None else "-" for result in results],
     )
     return items, decision
+
+
+def piece_detection_units(pieces: Sequence[tuple[float, float]]) -> List[List[int]]:
+    """Detection units over a long transcript's speech pieces (time order): lists of piece indices.
+
+    A piece of at least LID_TURN_MIN_SECONDS is a unit of its own. A run of shorter pieces (choppy speech,
+    dictated numbers, quick back-and-forth) is pooled, so its speech still counts: a unit grows until it holds
+    LID_SHORT_POOL_SECONDS of speech or would span more than SUPERCHUNK_TARGET_S (one old superchunk, which
+    was one detection window before). A pooled unit still under LID_TURN_MIN_SECONDS is not detected.
+    """
+
+    units: List[List[int]] = []
+    pooling = False
+    for index, (start, end) in enumerate(pieces):
+        if end - start >= LID_TURN_MIN_SECONDS:
+            units.append([index])
+            pooling = False
+            continue
+        if pooling:
+            unit = units[-1]
+            speech = sum(pieces[k][1] - pieces[k][0] for k in unit)
+            if speech < LID_SHORT_POOL_SECONDS and end - pieces[unit[0]][0] <= SUPERCHUNK_TARGET_S:
+                unit.append(index)
+                continue
+        units.append([index])
+        pooling = True
+    return units
+
+
+def _transcript_detection_plan(
+    samples: np.ndarray,
+    regions: Sequence[tuple[float, float]],
+) -> tuple[List[tuple[float, float]], List[List[int]], List[np.ndarray], List[int]]:
+    """(pieces, units, one window per detectable unit, the detectable unit indices). Worker thread.
+
+    A single piece's window is a view into ``samples``; only pooled short pieces (at most
+    LID_SHORT_POOL_SECONDS together) are copied.
+    """
+
+    pieces = region_pieces(regions, LID_WINDOW_SECONDS, audio=samples)
+    units = piece_detection_units(pieces)
+    windows: List[np.ndarray] = []
+    detectable: List[int] = []
+    for unit_index, unit in enumerate(units):
+        if sum(pieces[k][1] - pieces[k][0] for k in unit) < LID_TURN_MIN_SECONDS:
+            continue
+        parts = [samples[max(0, round(pieces[k][0] * SAMPLE_RATE)) : round(pieces[k][1] * SAMPLE_RATE)] for k in unit]
+        windows.append(parts[0] if len(parts) == 1 else np.concatenate(parts))
+        detectable.append(unit_index)
+    return pieces, units, windows, detectable
+
+
+def _transcript_chunks(
+    samples: np.ndarray,
+    regions: Sequence[tuple[float, float]],
+    pieces: Sequence[tuple[float, float]],
+    units: Sequence[Sequence[int]],
+    results: Sequence[Optional[LidResult]],
+) -> tuple[List[np.ndarray], List[tuple[float, float]], List[str]]:
+    """(ASR items, chunks, chunk languages) from the units' results. Worker thread."""
+
+    unit_spans = [(pieces[unit[0]][0], pieces[unit[-1]][1]) for unit in units]
+    unit_seconds = [sum(pieces[k][1] - pieces[k][0] for k in unit) for unit in units]
+    unit_languages = smooth_piece_languages(results, unit_spans, seconds=unit_seconds)
+    piece_languages: List[str] = [""] * len(pieces)
+    for unit, language in zip(units, unit_languages):
+        for k in unit:
+            piece_languages[k] = language
+    if len(set(piece_languages)) > 1:
+        chunks, languages = build_language_superchunks(
+            regions, [(start, end, language) for (start, end), language in zip(pieces, piece_languages)]
+        )
+        # A language change inside one long region leaves two touching chunks; padding both by CHUNK_PAD_S
+        # would decode the speech at the seam twice (transcript mode has no word-level dedupe).
+        items = padded_chunk_audio(samples, chunks, split_seams=True)
+    else:
+        chunks = build_superchunks(regions)
+        languages = [piece_languages[0]] * len(chunks)
+        items = padded_chunk_audio(samples, chunks)
+    return items, chunks, languages
 
 
 def log_decision(decision: LanguageDecision, confidences: Sequence[str]) -> None:
@@ -956,6 +1088,7 @@ __all__ = [
     "LID_MAX_POOL_SECONDS",
     "LID_MIN_CONFIDENCE",
     "LID_MIN_SPEECH_SECONDS",
+    "LID_SHORT_POOL_SECONDS",
     "LID_TURN_MIN_SECONDS",
     "LID_TURN_OVERRIDE_CONFIDENCE",
     "LanguageDecision",
@@ -968,8 +1101,10 @@ __all__ = [
     "detect_languages",
     "detect_windows",
     "dominant_language",
+    "lid_features",
     "lid_status",
     "load_lid_model",
+    "piece_detection_units",
     "pool_results",
     "prepare_lid_model",
     "resolve_speaker_languages",

@@ -653,6 +653,59 @@ class SharedSchedulerPathTests(unittest.TestCase):
                 self.assertEqual(log_transcription.call_args.args[0]["transcription_language"], "fr")
 
 
+    def test_legacy_long_cohere_auto_audio_is_cut_per_detected_piece_language(self) -> None:
+        from backend import genesis_whisper_server_lid as lid
+
+        # 70-82 s German, 82.5-94 s English: one superchunk before, now two jobs in chunk order.
+        regions = [(1.0, 24.0), (30.0, 52.0), (70.0, 82.0), (82.5, 94.0)]
+        audio = np.zeros(16000 * 100, dtype=np.float32)
+        for start, end in regions:
+            audio[int(start * 16000) : int(end * 16000)] = 0.1 if start > 80 else 0.2
+
+        def detect(windows):
+            return [
+                lid.LidResult(code, 0.97, {other: (0.97 if other == code else 0.03 / 13) for other in lid.COHERE_LANGUAGE_CODES})
+                for code in ("en" if float(np.mean(window)) < 0.15 else "de" for window in windows)
+            ]
+
+        async def submit(segments, request_id, key):
+            return [SimpleNamespace(text=f"{key[3]}{index}", batch_id=f"batch-{key[3]}") for index in range(len(segments))]
+
+        settings = {
+            "local_model": "CohereLabs/cohere-transcribe-03-2026",
+            "local_gpu_device": "cpu",
+            "local_model_cache_path": "",
+            "transcription_language": "auto",
+            "local_model_precision": "fp16",
+            "cohere_language_detection": True,
+        }
+        for endpoint, form in (("/transcribe/", {"engine": "local"}), ("/v1/audio/transcriptions", {"response_format": "verbose_json"})):
+            with self.subTest(endpoint=endpoint):
+                batch_manager = SimpleNamespace(submit_job=mock.AsyncMock(side_effect=submit))
+                with (
+                    mock.patch.dict(legacy_api.current_settings, settings, clear=True),
+                    mock.patch.object(legacy_api, "authorize_api_key", return_value=None),
+                    mock.patch.object(legacy_api, "load_audio_file", return_value=audio),
+                    mock.patch.object(legacy_api, "log_transcription") as log_transcription,
+                    mock.patch.object(legacy_api, "append_history_entry"),
+                    mock.patch.object(lid, "superchunk_speech_regions", return_value=regions),
+                    mock.patch.object(lid, "detect_languages", side_effect=detect) as detector,
+                    mock.patch.object(lid, "prepare_lid_model", return_value=True),
+                ):
+                    with TestClient(self._legacy_app(batch_manager)) as client:
+                        response = client.post(endpoint, files={"file": ("mixed.wav", b"fixture", "audio/wav")}, data=form)
+
+                self.assertEqual(response.status_code, 200, response.text)
+                detector.assert_called_once()  # one detection pass, no second per-item pass
+                self.assertEqual(
+                    sorted((call.args[2][3], len(call.args[0])) for call in batch_manager.submit_job.await_args_list),
+                    [("de", 3), ("en", 1)],
+                )
+                text = response.json().get("transcription", response.json().get("text"))
+                self.assertEqual(text, "de0 de1 de2 en0")
+                self.assertEqual(log_transcription.call_args.args[0]["segment_count"], 4)
+                self.assertEqual(log_transcription.call_args.args[0]["transcription_language"], "de")
+
 class SharedSchedulerAsyncPathTests(unittest.IsolatedAsyncioTestCase):
     async def test_v2_transcript_submits_whisper_chunks_as_one_job(self) -> None:
         audio = np.full(16000 * 65, 0.1, dtype=np.float32)

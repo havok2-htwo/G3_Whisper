@@ -737,7 +737,9 @@ async def _detect_speaker_languages(
     for index, turn in enumerate(asr_turns):
         if (int(turn["end_ms"]) - int(turn["start_ms"])) / 1000.0 < LID_TURN_MIN_SECONDS:
             continue
-        for window in split_windows(_spans_audio(audio, [(int(turn["start_ms"]), int(turn["end_ms"]))])):
+        # A view, not a copy: on a long meeting the turns cover most of the file.
+        turn_audio = audio[max(0, round(int(turn["start_ms"]) * 16)) : min(len(audio), round(int(turn["end_ms"]) * 16))]
+        for window in split_windows(turn_audio):
             if len(window):
                 windows.append(window)
                 turn_owners.append((index, len(window) / 16000.0))

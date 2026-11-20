@@ -203,6 +203,37 @@ class RestrictedDetectionTests(_LidCase):
         self.assertIsNone(lid._lid_components["device"])
 
 
+class FeaturesOutsideTheLockTests(_LidCase):
+    def test_features_are_computed_outside_the_gpu_lock_and_reach_the_encoder(self) -> None:
+        model = _FakeModel()
+        self.use_model(model)
+        self.assertTrue(lid.load_lid_model())
+        gpu_lock = asyncio.Lock()
+        seen: list[tuple[int, bool]] = []
+
+        class Recording(_FakeFeatureExtractor):
+            def __call__(self, windows, sampling_rate, return_tensors):
+                seen.append((len(windows), gpu_lock.locked()))
+                return super().__call__(windows, sampling_rate, return_tensors)
+
+        lid._lid_components["feature_extractor"] = Recording()
+        results = asyncio.run(lid.detect_windows(gpu_lock, [np.zeros(16000, dtype=np.float32)] * 20))
+
+        self.assertEqual(len(results), 20)
+        # One extraction per GPU slice, both while the GPU lock was free; the encoder got those features.
+        self.assertEqual(seen, [(lid.LID_SLICE_WINDOWS, False), (20 - lid.LID_SLICE_WINDOWS, False)])
+        self.assertEqual(model.batch_sizes, [8, 8, 4])
+
+    def test_features_of_another_extractor_are_not_used(self) -> None:
+        self.use_model(_FakeModel())
+        self.assertTrue(lid.load_lid_model())
+        stale = lid.LidFeatures(extractor=object(), values=torch.full((2, 80, 10), float("nan")))
+        with mock.patch.object(lid, "_extract_features", wraps=lid._extract_features) as extract:
+            results = lid.detect_languages([np.zeros(16000, dtype=np.float32)] * 2, features=stale)
+        extract.assert_called_once()
+        self.assertEqual([result.language for result in results], ["de", "de"])
+
+
 class LoadFailureTests(_LidCase):
     def test_failed_load_warns_once_and_is_not_retried_on_every_request(self) -> None:
         loader = mock.patch.object(lid, "_load_pretrained", side_effect=OSError("no snapshot and offline"))
@@ -503,6 +534,41 @@ class TurnRefinementTests(unittest.TestCase):
         pieces = wxc.region_pieces([(0.0, 61.0)], 30.0)
         self.assertEqual(len(pieces), 3)
         self.assertEqual((pieces[0][0], pieces[-1][1]), (0.0, 61.0))
+
+
+class TranscriptUnitTests(unittest.TestCase):
+    def test_with_audio_a_long_region_is_cut_at_its_quietest_moment(self) -> None:
+        audio = np.full(16000 * 70, 0.2, dtype=np.float32)
+        audio[int(21.6 * 16000) : int(21.64 * 16000)] = 0.0
+        pieces = wxc.region_pieces([(1.0, 61.0)], 30.0, audio=audio)
+
+        self.assertEqual(len(pieces), 3)
+        self.assertAlmostEqual(pieces[0][1], 21.61, places=3)
+        self.assertEqual((pieces[0][0], pieces[-1][1]), (1.0, 61.0))
+        self.assertTrue(all(a[1] == b[0] for a, b in zip(pieces, pieces[1:])))
+        self.assertTrue(all(end - start <= 30.0 for start, end in pieces))
+
+    def test_runs_of_short_pieces_are_pooled_and_long_pieces_stay_alone(self) -> None:
+        short = [(float(k), k + 1.2) for k in range(2, 20, 2)]  # nine 1.2 s pieces
+        pieces = [(0.0, 1.8), *short, (20.0, 30.0), (30.5, 31.3)]
+        units = lid.piece_detection_units(pieces)
+
+        self.assertEqual(units[0], [0])
+        # Pooled until LID_SHORT_POOL_SECONDS of speech: 7 x 1.2 s = 8.4 s, then the rest.
+        self.assertEqual(units[1], list(range(1, 8)))
+        self.assertEqual(units[2], [8, 9])
+        self.assertEqual(units[3], [10])
+        self.assertEqual(units[4], [11])  # a lone short piece after a long one is its own (undetected) unit
+
+    def test_touching_chunks_do_not_share_padded_audio(self) -> None:
+        audio = np.arange(16000 * 10, dtype=np.float32)
+        chunks = [(1.0, 4.0), (4.0, 6.0), (6.2, 9.0)]
+        split = wxc.padded_chunk_audio(audio, chunks, split_seams=True)
+        self.assertEqual(split[0][-1] + 1, split[1][0])  # the seam at 4.0 s is cut, not doubled
+        self.assertEqual((split[0][0], split[2][-1] + 1), (0.75 * 16000, 9.25 * 16000))  # outer pads unchanged
+        self.assertEqual(split[1][-1] + 1, 6.1 * 16000)  # a 0.2 s gap: half of it each
+        plain = wxc.padded_chunk_audio(audio, chunks)
+        self.assertEqual(plain[1][0], 3.75 * 16000)
 
 
 class PieceSmoothingTests(unittest.TestCase):

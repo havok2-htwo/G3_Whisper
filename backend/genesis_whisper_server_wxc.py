@@ -301,12 +301,30 @@ def build_language_superchunks(
     return [(a, b) for a, b in chunks], languages
 
 
-def padded_chunk_audio(audio: np.ndarray, chunks: Sequence[tuple[float, float]]) -> list[np.ndarray]:
+def padded_chunk_audio(
+    audio: np.ndarray,
+    chunks: Sequence[tuple[float, float]],
+    *,
+    split_seams: bool = False,
+) -> list[np.ndarray]:
+    """Each chunk's audio, CHUNK_PAD_S wider on both sides.
+
+    ``split_seams``: towards a neighbouring chunk closer than two pads, pad only half the gap, so touching
+    chunks (a language change inside one Silero region) never share audio. For callers without a word-level
+    dedupe at the seams (transcript mode); WXC keeps the full pad because its alignment dedupes.
+    """
+
     total_s = len(audio) / SAMPLE_RATE
     out = []
-    for a, b in chunks:
-        pa = max(0.0, a - CHUNK_PAD_S)
-        pb = min(total_s, b + CHUNK_PAD_S)
+    for index, (a, b) in enumerate(chunks):
+        pad_before = pad_after = CHUNK_PAD_S
+        if split_seams:
+            if index > 0:
+                pad_before = min(CHUNK_PAD_S, max(0.0, a - chunks[index - 1][1]) / 2.0)
+            if index + 1 < len(chunks):
+                pad_after = min(CHUNK_PAD_S, max(0.0, chunks[index + 1][0] - b) / 2.0)
+        pa = max(0.0, a - pad_before)
+        pb = min(total_s, b + pad_after)
         out.append(np.ascontiguousarray(audio[int(pa * SAMPLE_RATE) : int(pb * SAMPLE_RATE)]))
     return out
 
@@ -350,14 +368,53 @@ def superchunk_speech_regions(
     return regions or None
 
 
-def region_pieces(regions: Sequence[tuple[float, float]], max_seconds: float) -> list[tuple[float, float]]:
-    """Every region as one piece, a region longer than ``max_seconds`` as equal parts of at most that length."""
+# A long region is split near its even cut points, at the quietest 20 ms frame within this distance, so a
+# language change there does not cut through a word.
+REGION_CUT_SEARCH_S = 1.0
+REGION_CUT_FRAME_S = 0.02
+
+
+def _quietest_moment(audio: np.ndarray, lo: float, hi: float) -> float:
+    """Centre (s) of the 20 ms frame with the least energy in [lo, hi]; on a tie the one nearest the middle."""
+
+    frame = max(1, int(REGION_CUT_FRAME_S * SAMPLE_RATE))
+    first = max(0, int(lo * SAMPLE_RATE))
+    last = min(len(audio), int(hi * SAMPLE_RATE))
+    count = (last - first) // frame
+    if count < 1:
+        return (lo + hi) / 2.0
+    frames = np.asarray(audio[first : first + count * frame], dtype=np.float32).reshape(count, frame)
+    centres = (first + np.arange(count) * frame + frame / 2.0) / SAMPLE_RATE
+    energy = np.einsum("ij,ij->i", frames, frames)
+    best = int(np.lexsort((np.abs(centres - (lo + hi) / 2.0), energy))[0])
+    return float(centres[best])
+
+
+def region_pieces(
+    regions: Sequence[tuple[float, float]],
+    max_seconds: float,
+    audio: np.ndarray | None = None,
+) -> list[tuple[float, float]]:
+    """Every region as one piece, a region longer than ``max_seconds`` as parts of at most that length.
+
+    Without ``audio`` the parts are equal. With it each cut moves to the quietest moment within
+    REGION_CUT_SEARCH_S of its even position (the parts are planned REGION_CUT_SEARCH_S shorter, so they stay
+    within ``max_seconds``).
+    """
 
     pieces: list[tuple[float, float]] = []
+    search = REGION_CUT_SEARCH_S if audio is not None and max_seconds > 4 * REGION_CUT_SEARCH_S else 0.0
     for start, end in regions:
-        count = max(1, int(np.ceil((end - start) / max_seconds - 1e-9)))
+        if end - start <= max_seconds:
+            pieces.append((start, end))
+            continue
+        count = max(1, int(np.ceil((end - start) / (max_seconds - 2 * search) - 1e-9)))
         size = (end - start) / count
-        pieces.extend((start + index * size, end if index == count - 1 else start + (index + 1) * size) for index in range(count))
+        cuts = [start + index * size for index in range(1, count)]
+        if search:
+            cuts = [_quietest_moment(audio, cut - search, cut + search) for cut in cuts]
+        bounds = [start, *cuts, end]
+        pieces.extend(zip(bounds, bounds[1:]))
     return pieces
 
 

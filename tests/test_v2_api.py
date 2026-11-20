@@ -1776,5 +1776,35 @@ class TranscriptPieceLanguageTests(unittest.TestCase):
         self.assertEqual({code: round(value, 1) for code, value in decision.seconds.items()}, {"de": 47.5, "en": 29.7})
 
 
+    def test_choppy_speech_of_only_short_regions_is_still_detected(self) -> None:
+        # English back-and-forth: 1.2 s regions with 0.5 s pauses, none of them LID_TURN_MIN_SECONDS long.
+        regions = [(1.0 + 1.7 * k, 2.2 + 1.7 * k) for k in range(50)]
+        audio = _audio_with_levels(100, [(start, end, 0.1) for start, end in regions])
+        (_, _, count, _, decision), detect = self.transcribe(audio, regions)
+
+        detect.assert_called_once()
+        windows = detect.call_args.args[0]
+        self.assertLess(len(windows), len(regions))  # pooled short pieces, not one window per region
+        self.assertTrue(all(len(window) >= lid.LID_TURN_MIN_SECONDS * 16000 for window in windows))
+        self.assertEqual((decision.source, set(decision.languages)), ("detected", {"en"}))
+        self.assertEqual([key[3] for _, key in self.manager.calls], ["en"])
+        self.assertEqual(count, len(v2.build_superchunks(regions)))
+
+    def test_a_language_change_inside_one_long_region_does_not_decode_the_seam_twice(self) -> None:
+        # One 60 s Silero region (no pause of 0.3 s): German to 21.6 s, then English. It is detected in three
+        # parts; the first cut moves to the quiet moment at 21.6 s.
+        regions = [(1.0, 61.0)]
+        audio = _audio_with_levels(70, [(1, 21.6, 0.2), (21.64, 61, 0.1)])
+        (_, _, count, _, decision), _ = self.transcribe(audio, regions)
+
+        self.assertEqual(decision.languages, ["de", "en"])
+        self.assertEqual(count, 2)
+        de_job = next(segments for segments, key in self.manager.calls if key[3] == "de")
+        en_job = next(segments for segments, key in self.manager.calls if key[3] == "en")
+        # Outer edges keep CHUNK_PAD_S; the seam is not padded into the other language's chunk.
+        self.assertEqual(len(de_job[0]), int(21.61 * 16000) - int(0.75 * 16000))
+        self.assertEqual(len(en_job[0]), int(61.25 * 16000) - int(21.61 * 16000))
+
+
 if __name__ == "__main__":
     unittest.main()

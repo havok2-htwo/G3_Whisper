@@ -112,16 +112,22 @@ never run it.
   (one window up to 30 s, two windows pooled for 30-60 s). A longer file is
   detected per speech piece in one batched pass: every Silero speech region the
   superchunking finds is one piece (a region over 30 s in parts of at most
-  30 s). The file's duration-weighted majority is the prior. A piece of at least
-  1.5 s keeps its own result when it is confident (0.5) for the majority
-  language, or reaches 0.85 for another language; every other piece (shorter,
-  weaker, or a doubtful deviation) takes the language of the nearest such
-  piece. The superchunks are then cut like the WXC chunks below, so a German
-  sentence followed by English is no longer one chunk decoded in one language.
-  With a single language the chunks are exactly those without detection. Each
-  language is submitted as its own ASR job and the texts are joined in the
-  original order. A language change inside one Silero region (no pause of at
-  least 0.3 s) is not seen.
+  30 s, cut at the quietest 20 ms within 1 s of the even split). A piece of at
+  least 1.5 s is detected on its own; a run of shorter pieces (choppy speech,
+  quick back-and-forth) is pooled into one window of up to 8 s of speech within
+  25 s, so a file made only of short phrases is still detected. The file's
+  duration-weighted majority is the prior. A piece (or pooled run) keeps its
+  own result when it is confident (0.5) for the majority language, or reaches
+  0.85 for another language; every other one (under 1.5 s of speech, weaker, or
+  a doubtful deviation) takes the language of the nearest such piece. The
+  superchunks are then cut like the WXC chunks below, so a German sentence
+  followed by English is no longer one chunk decoded in one language. Where a
+  language change cuts one Silero region, the two chunks touch and are not
+  padded into each other (no audio is decoded twice). With a single language
+  the chunks are exactly those without detection. Each language is submitted
+  as its own ASR job and the texts are joined in the original order. A language
+  change inside one Silero region of up to 30 s (no pause of at least 0.3 s) is
+  not seen.
 - `diarization`: the language is decided once per DIA speaker, from up to 30 s
   of that speaker's best clean windows. A speaker with under 1 s of speech or
   below 0.5 confidence takes the majority of the confidently detected speakers,
@@ -148,6 +154,14 @@ never run it.
   interrupted download is resumed), so a first download never blocks other
   requests; until it is complete, requests run with `de` plus the warning. A
   failed download is retried after 5 minutes.
+- Cost: one batched detection pass per request, none when detection does not
+  apply. Its windows grow with the speech: one per speaker plus one per turn of
+  at least 1.5 s in diarization, one per piece or pooled run in a long
+  transcript. Each window costs a full 30 s whisper-base encoder step (about
+  12 ms per batch of 8 on an RTX 3090) and about 5 ms of CPU for its log-mel
+  features, which are computed on a worker thread outside the GPU lock, so for
+  an hour of conversation (roughly 1000-2000 windows) expect a few seconds of
+  CPU and 1.5-3 s of GPU before ASR. The GPU lock is released every 16 windows.
 - Scheduling: each language of one request is its own scheduler job. A long
   bilingual file therefore takes one long-job slot per language
   (`scheduler_max_parallel_long_jobs`), and a small language group under

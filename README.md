@@ -431,7 +431,8 @@ one encoder pass per 30 s window, one decoder step, a softmax over only the 14 C
 
 - Clips up to 60 s get one decision. Long files are detected per Silero speech region (over 30 s in parts): the file
   majority is the prior, a piece of at least 1.5 s keeps its own language when confident (0.5 for the majority, 0.85 for
-  another one), the rest take the nearest confident neighbour's; superchunks never mix two languages. Each language
+  another one), runs of shorter pieces are pooled into one window of up to 8 s, the rest take the nearest confident
+  neighbour's; superchunks never mix two languages. Each language
   becomes its own ASR job, texts keep their order; a single-language file is chunked exactly as before.
 - Diarization decides once per DIA speaker from up to 30 s of the speaker's clean windows; weak speakers take the
   confident speakers' majority. The speaker's language is the prior per turn: a turn of at least 1.5 s whose own detection
@@ -439,7 +440,7 @@ one encoder pass per 30 s window, one decoder step, a softmax over only the 14 C
   for a sentence). WXC chunks are cut at language changes, a single-language file is chunked exactly as before.
 - An explicit language always wins. Whisper detects by itself, Parakeet ignores the language: neither runs detection.
 - The detector loads from the model cache (downloaded on first use on a worker thread, outside the GPU lock), follows
-  `local_gpu_device` (FP16 on CUDA, FP32 on CPU), runs under the GPU lock in slices and is warmed at startup when Cohere
+  `local_gpu_device` (FP16 on CUDA, FP32 on CPU), runs under the GPU lock in slices (features computed outside it) and is warmed at startup when Cohere
   is active; it is unloaded when another ASR model is selected. If it cannot be loaded, Cohere falls back to `de`
   (`COHERE_FALLBACK_LANGUAGE`); a v2 response then carries `LANGUAGE_DETECTION_UNAVAILABLE` (v1 only logs it).
 - Measured on the owner's recordings on CPU, whisper-base: 100 % on 30 s windows, 95.5 % on 4 s crops, 83.6 % on 2 s.
