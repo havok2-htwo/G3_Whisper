@@ -46,6 +46,7 @@ from .genesis_whisper_server_globals import (
     LANGUAGE_DETECTION_MODEL_OPTIONS,
     current_settings,
     language_detection_fallback,
+    model_applied_language,
     resolve_local_model_cache_path,
     settings_lock,
     uses_language_detection_backend,
@@ -610,6 +611,12 @@ def _weighted_majority(languages_and_seconds: Sequence[tuple[str, float]]) -> Op
     return max(totals, key=lambda code: (totals[code], -order.get(code, len(order))))
 
 
+def _weak_majority_allowed() -> bool:
+    """Whether unconfident results may still decide a file majority. Not for a model whose fallback is "auto"
+    (Granite): there a weak guess as a hard prompt hint is worse than no hint."""
+    return language_detection_fallback() != "auto"
+
+
 def _is_confident(result: Optional[LidResult], seconds: float) -> bool:
     return result is not None and seconds >= LID_MIN_SPEECH_SECONDS and result.probability >= LID_MIN_CONFIDENCE
 
@@ -631,17 +638,19 @@ def smooth_chunk_languages(
         for result, chunk_seconds in zip(results, seconds)
         if _is_confident(result, chunk_seconds)
     ]
-    majority = _weighted_majority(confident) or _weighted_majority(
-        [
-            (result.language, chunk_seconds)
-            for result, chunk_seconds in zip(results, seconds)
-            if result is not None and chunk_seconds >= LID_MIN_SPEECH_SECONDS
-        ]
-    )
+    majority = _weighted_majority(confident)
+    if majority is None and _weak_majority_allowed():
+        majority = _weighted_majority(
+            [
+                (result.language, chunk_seconds)
+                for result, chunk_seconds in zip(results, seconds)
+                if result is not None and chunk_seconds >= LID_MIN_SPEECH_SECONDS
+            ]
+        )
     if majority is None:
         return [fallback or language_detection_fallback() for _ in results]
     return [
-        result.language if _is_confident(result, chunk_seconds) else majority
+        model_applied_language(result.language if _is_confident(result, chunk_seconds) else majority)
         for result, chunk_seconds in zip(results, seconds)
     ]
 
@@ -667,9 +676,9 @@ def resolve_speaker_languages(
     resolved: Dict[str, tuple[str, str]] = {}
     for speaker in results:
         if speaker in detected:
-            resolved[speaker] = (detected[speaker], SOURCE_DETECTED)
+            resolved[speaker] = (model_applied_language(detected[speaker]), SOURCE_DETECTED)
         elif majority is not None:
-            resolved[speaker] = (majority, SOURCE_MAJORITY)
+            resolved[speaker] = (model_applied_language(majority), SOURCE_MAJORITY)
         else:
             resolved[speaker] = (fallback or language_detection_fallback(), SOURCE_FALLBACK)
     return resolved
@@ -687,9 +696,9 @@ def turn_language(result: Optional[LidResult], seconds: float, prior: str) -> tu
         result is not None
         and seconds >= LID_TURN_MIN_SECONDS
         and result.probability >= LID_TURN_OVERRIDE_CONFIDENCE
-        and result.language != prior
+        and model_applied_language(result.language) != prior
     ):
-        return result.language, True
+        return model_applied_language(result.language), True
     return prior, False
 
 
@@ -721,11 +730,19 @@ def smooth_piece_languages(
         for result, piece_seconds in zip(usable, seconds)
         if result is not None and result.probability >= LID_MIN_CONFIDENCE
     ]
-    majority = _weighted_majority(confident) or _weighted_majority(
-        [(result.language, piece_seconds) for result, piece_seconds in zip(usable, seconds) if result is not None]
-    )
+    majority = _weighted_majority(confident)
+    if majority is None and _weak_majority_allowed():
+        majority = _weighted_majority(
+            [(result.language, piece_seconds) for result, piece_seconds in zip(usable, seconds) if result is not None]
+        )
     if majority is None:
         return [fallback or language_detection_fallback() for _ in spans]
+    return [model_applied_language(language) for language in _anchor_languages(usable, spans, majority)]
+
+
+def _anchor_languages(usable: Sequence[Optional[LidResult]], spans: Sequence[tuple[float, float]], majority: str) -> List[str]:
+    """Each piece's anchor language, or the nearest anchor's; the majority without any anchor."""
+
     anchors: List[Optional[str]] = [
         result.language
         if result is not None

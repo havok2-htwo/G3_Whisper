@@ -27,7 +27,9 @@ from .genesis_whisper_server_cohere_cuda_graphs import (
 from .genesis_whisper_server_granite_speech import (
     GRANITE_INT8_SKIP_MODULES,
     ensure_left_padding,
+    release_idle_cache,
     release_speed_state,
+    speed_stats,
     transcribe_granite_batch,
 )
 from .genesis_whisper_server_globals import (
@@ -655,6 +657,22 @@ def _store_local_model_components(model, processor, model_identifier, model_back
             "model_backend": model_backend,
         }
     )
+
+
+def release_idle_model_caches() -> bool:
+    """Idle trim hook: free per-batch caches the loaded model keeps (Granite's StaticCache). Call under the GPU lock."""
+
+    if local_model_components.get("model_backend") != "granite_speech":
+        return False
+    return release_idle_cache(local_model_components.get("model"))
+
+
+def granite_speed_stats() -> Optional[Dict[str, Any]]:
+    """Granite speed-mode counters while Granite is the loaded backend, else None."""
+
+    if local_model_components.get("model_backend") != "granite_speech":
+        return None
+    return speed_stats(local_model_components.get("model"))
 
 
 def get_last_local_asr_load_error() -> Optional[str]:

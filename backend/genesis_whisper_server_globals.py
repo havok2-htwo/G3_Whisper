@@ -205,6 +205,18 @@ def language_detection_fallback(model_id: str | None = None) -> str:
     return "auto" if uses_granite_backend(model_id) else COHERE_FALLBACK_LANGUAGE
 
 
+def model_applied_language(language: str, model_id: str | None = None) -> str:
+    """The language code a model really decodes ``language`` with: Granite runs a code outside its six as "auto"
+    (plain prompt). Without ``model_id`` the configured ASR model decides."""
+    if model_id is None:
+        with settings_lock:
+            model_id = str(current_settings.get("local_model") or "")
+    code = (language or "auto").strip().lower()
+    if uses_granite_backend(model_id) and code not in GRANITE_LANGUAGE_NAMES:
+        return "auto"
+    return code
+
+
 def uses_whole_audio_backend(model_id: str) -> bool:
     """Backends that take a whole recording per request (no 30 s Whisper windows).
 
@@ -245,6 +257,8 @@ def get_effective_transcription_language(model_id: str, configured_language: str
     normalized_language = (configured_language or "auto").strip().lower()
     if uses_cohere_backend(model_id) and normalized_language == "auto":
         return "auto" if detection else COHERE_FALLBACK_LANGUAGE
+    if uses_granite_backend(model_id):
+        return model_applied_language(normalized_language, model_id)
     if normalized_language:
         return normalized_language
     return get_local_model_spec(model_id).get("default_language", "auto")

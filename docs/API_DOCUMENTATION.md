@@ -89,7 +89,8 @@ backends `auto` enables Whisper's own detection; Parakeet ignores the language.
 Granite Speech (`ibm-granite/granite-speech-5.0-2b`) takes `en`, `fr`, `de`, `es`,
 `pt` and `ja` as a prompt hint ("The speech is in German. Transcribe it exactly;
 do not translate."); every other code and `auto` run its plain transcription
-prompt without a hint, so they stay valid requests.
+prompt without a hint, so they stay valid requests, and the applied language is
+reported as `auto` (`models.asr.language`, segment `language`, history).
 Note that Cohere treats the language as a decoder prompt prior, not a hard
 constraint: clearly spoken passages in another supported language may still be
 transcribed in that language (relevant for code-switched meetings).
@@ -113,8 +114,10 @@ server setting) always wins and runs no detection; Whisper and Parakeet backends
 never run it.
 
 Granite Speech uses the same detection with the same switch and detector for its
-prompt hint. A detected language outside Granite's six runs the plain prompt;
-the response still names the detected code. When detection has no answer
+prompt hint. Only confident results (and a majority of confident results) become
+a hint: unlike Cohere, a file without any confident result runs the plain prompt
+instead of the majority of weak guesses. A detected language outside Granite's six
+runs the plain prompt and is reported as `auto`. When detection has no answer
 (too little speech, detector unavailable), Granite's fallback is `auto` (plain
 prompt, reported as `language: "auto"` with source `fallback`), never `de`.
 
@@ -1164,7 +1167,7 @@ Notes:
 - `scheduler_first_chunk_fast_path` (default `true`) gives a request that has not been served yet a small batch of its own instead of a seat in a full batch of a long recording; batches are always shared round-robin between active requests.
 - `cuda_memory_trim_after_batch` defaults to `true`: once every local GPU phase (ASR batches, ReDimNet clouds, MMS_FA alignment, verification, embeddings, startup warmups, model reloads) has been quiet for 5 s, Whisper releases the unused process-wide CUDA allocator pool so the idle footprint stays near the model floor on a shared GPU; the next request re-reserves its pool (about +80 ms once for a ReDimNet batch). Disable it only on a dedicated GPU.
 - `cohere_cuda_graphs` defaults to `true`: for the Cohere model on CUDA in `fp16`/`bf16`, encoder and greedy decoder run as captured CUDA graphs (2 s clip ~270 -> 30 ms, 14 s file ~0.9 -> 0.12 s on an RTX 4090, identical transcripts) for ~0.55 GB of graph memory after warmup and a hard cap of 1.5 GB. Changing it does not reload the model (`model_reloaded` stays `false`); it applies on the next model load (server restart or a change of model, device, precision or cache path). Other precisions and Whisper models ignore it. A snapshot without `generation_config.json` no longer disables the graphs: the missing eos/pad token ids are taken from the model config or the tokenizer (logged as a warning).
-- `granite_compile` (default `"off"`, allowed `"off"`, `"static_cache"`, `"compile"`; anything else becomes `"off"`) is the Granite Speech speed mode. `static_cache` runs `generate` with a StaticCache that stays in the model between batches (at most 1.5 GB; a batch that would need more runs eager), `compile` adds HF's `torch.compile` of the decode step with mode `reduce-overhead` (CUDA graphs; needs CUDA, Triton and a C++ compiler, otherwise eager). Any failure of a fast mode is logged once and the process runs eager until restart. It applies to the next batch, no reload. Other backends ignore it. Not measured yet, so the default stays off.
+- `granite_compile` (default `"off"`, allowed `"off"`, `"static_cache"`, `"compile"`; anything else becomes `"off"`) is the Granite Speech speed mode. `static_cache` runs `generate` with a StaticCache that stays in the model between batches (at most 1.5 GB; a batch that would need more runs eager; the idle trim frees it), `compile` adds HF's `torch.compile` of the decode step with mode `reduce-overhead` (CUDA graphs; needs CUDA, Triton and a C++ compiler, otherwise eager; int8 runs `static_cache`). Fast modes pad sub-batches to 1/2/4/8/16 rows and the cache to 256-token steps and stop at the same token budget as eager. A CUDA OOM runs that sub-batch eager and keeps the mode; any other failure of a fast mode is logged once and the process runs eager until restart. `granite_speed` in `GET /api/admin/stats` and the benchmark shows what really ran. It applies to the next batch, no reload. Other backends ignore it. Not measured yet, so the default stays off.
 - `cohere_language_detection` (strict boolean, default `true`) turns on language detection for Cohere and Granite Speech with an effective language `auto` (see [Language detection on Cohere](#language-detection-on-cohere-auto)); off, Cohere's `auto` is `de` as before. `language_detection_model` picks the detector: `openai/whisper-base` (default, about 0.15 GB), `openai/whisper-small` or `openai/whisper-large-v3-turbo`; an unknown id falls back to the default. The detector is loaded from the model cache (`local_model_cache_path`, downloaded on first use with the saved Hugging Face token), follows `local_gpu_device` (FP16 on CUDA, FP32 on CPU) and is warmed at startup when Cohere is active. Changing either key never reloads the ASR model (`model_reloaded` stays `false`): a changed model, the switch turned off or a switch to a non-Cohere ASR model unloads the old detector right away, the next request loads the new one. Neither key is a preset key, so loading a preset never turns detection off.
 - `redimnet_max_batch_size` (default `8`, allowed `1`/`2`/`4`/`8`; other numbers snap down to the next allowed value, a non-number falls back to `8`) is the largest ReDimNet CUDA batch for speaker clouds, verification and embeddings. The reserved pool scales with it (RTX 5090: 746 / 1442 / 2816 MiB for 2 / 4 / 8; 60-min diarization 23.2 s at 4 vs 19.6 s at 8). It applies on save without a restart: a loaded ReDimNet is re-warmed for the new buckets and its old pool released (`model_reloaded` stays `false`).
 - ReDimNet and MMS_FA alignment run on the `local_gpu_device` card like the ASR model; changing the device moves them on save.
@@ -1436,6 +1439,7 @@ Response fields:
 - `summary.avg_total_duration_ms`
 - `summary.avg_transcription_duration_ms`
 - `history` with up to 25 recent log entries
+- `granite_speed` (only while Granite Speech is the loaded backend, else `null`): `requested` (the setting), `last_mode` (the mode the last sub-batch really ran: `off`, `static_cache` or `compile`), `failure` (the sticky fast-mode error, `null` without one), the counters `fast_calls`, `eager_calls`, `budget_skips`, `oom_fallbacks`, `truncated_rows` (rows that hit `max_new_tokens` without an end token), `compiled_shapes` (distinct (rows, cache length) shapes of the compiled decode step) with `recompile_limit`, `kept_cache_mb` (the StaticCache held between batches) and `kv_budget_mb`
 
 History entry fields currently include:
 
@@ -1619,11 +1623,15 @@ Response fields:
 - `transcript`
 - `peak_vram_reserved_mb`
 - `peak_vram_allocated_mb`
+- `granite_speed` (Granite Speech only): the same block as in `GET /api/admin/stats`, with the counters showing what
+  this run added
 
 Workflow values currently used:
 
 - `whisper_chunk_queue`
 - `cohere_audio_batch`
+- `granite_audio_batch`
+- `parakeet_audio_batch`
 
 ## Frontend and SPA Delivery
 

@@ -45,6 +45,8 @@ PAD = 0
 
 class _FakeTokenizer:
     padding_side = "left"
+    eos_token_id = EOS
+    pad_token_id = PAD
 
     def apply_chat_template(self, messages, tokenize, add_generation_prompt):
         assert tokenize is False and add_generation_prompt is True
@@ -77,20 +79,23 @@ class _FakeProcessor:
 
 
 class _FakeModel(torch.nn.Module):
-    def __init__(self, fail_static=False):
+    def __init__(self, fail_static=False, dtype=torch.float32, error=None):
         super().__init__()
-        self.weight = torch.nn.Parameter(torch.zeros(1))
+        self.weight = torch.nn.Parameter(torch.zeros(1, dtype=dtype))
         self.config = mock.Mock(
             text_config=mock.Mock(num_hidden_layers=40, num_attention_heads=16, num_key_value_heads=4, head_dim=128)
         )
         self.fail_static = fail_static
+        self.error = error or RuntimeError("static cache broke")
         self.generate_calls = []
+        self.batch_rows = []
 
     def generate(self, **kwargs):
         self.generate_calls.append({key: value for key, value in kwargs.items() if not torch.is_tensor(value)})
+        self.batch_rows.append(int(kwargs["input_ids"].shape[0]))
         if self.fail_static and kwargs.get("cache_implementation") == "static":
             self._cache = object()
-            raise RuntimeError("static cache broke")
+            raise self.error
         input_ids = kwargs["input_ids"]
         new = torch.stack([input_ids[:, 0], torch.full_like(input_ids[:, 0], EOS)], dim=1)
         return torch.cat([input_ids, new], dim=1)
@@ -106,8 +111,9 @@ def name(seconds):
 
 class _SpeedStateCase(unittest.TestCase):
     def setUp(self):
-        self.saved_state = dict(granite._speed_state, logged=set(granite._speed_state["logged"]))
-        granite._speed_state.update({"failure": None, "logged": set(), "fast_calls": 0, "eager_calls": 0, "budget_skips": 0})
+        self.saved_state = dict(granite._speed_state)
+        granite._speed_state.clear()
+        granite._speed_state.update(granite._fresh_speed_state())
         self.settings = mock.patch.dict(current_settings, {"granite_compile": "off"})
         self.settings.start()
 
@@ -196,6 +202,31 @@ class GraniteLanguageTests(unittest.TestCase):
             self.assertEqual(lid.smooth_piece_languages([None], [(0.0, 10.0)]), ["auto"])
         with mock.patch.dict(current_settings, {"local_model": COHERE_MODEL_ID}):
             self.assertEqual(lid.smooth_chunk_languages([None], [10.0]), ["de"])
+
+    def test_weak_detections_give_granite_no_hint(self):
+        weak = lid.LidResult(language="de", probability=0.3, probs={})
+        strong = lid.LidResult(language="en", probability=0.9, probs={})
+        with mock.patch.dict(current_settings, {"local_model": GRANITE_SPEECH_MODEL_ID}):
+            self.assertEqual(lid.smooth_chunk_languages([weak, weak], [10.0, 10.0]), ["auto", "auto"])
+            self.assertEqual(lid.smooth_piece_languages([weak], [(0.0, 10.0)]), ["auto"])
+            # A confident majority still covers the weak chunks.
+            self.assertEqual(lid.smooth_chunk_languages([weak, strong], [10.0, 10.0]), ["en", "en"])
+        with mock.patch.dict(current_settings, {"local_model": COHERE_MODEL_ID}):
+            self.assertEqual(lid.smooth_chunk_languages([weak, weak], [10.0, 10.0]), ["de", "de"])
+            self.assertEqual(lid.smooth_piece_languages([weak], [(0.0, 10.0)]), ["de"])
+
+    def test_a_language_granite_cannot_take_is_reported_as_auto(self):
+        italian = lid.LidResult(language="it", probability=0.95, probs={})
+        self.assertEqual(get_effective_transcription_language(GRANITE_SPEECH_MODEL_ID, "it"), "auto")
+        self.assertEqual(get_effective_transcription_language(GRANITE_SPEECH_MODEL_ID, " JA "), "ja")
+        self.assertEqual(get_effective_transcription_language(COHERE_MODEL_ID, "it"), "it")
+        with mock.patch.dict(current_settings, {"local_model": GRANITE_SPEECH_MODEL_ID}):
+            self.assertEqual(lid.smooth_chunk_languages([italian], [10.0]), ["auto"])
+            self.assertEqual(lid.smooth_piece_languages([italian], [(0.0, 10.0)]), ["auto"])
+            self.assertEqual(lid.resolve_speaker_languages({"A": italian}, {"A": 10.0}), {"A": ("auto", "detected")})
+            self.assertEqual(lid.turn_language(italian, 5.0, "de"), ("auto", True))
+        with mock.patch.dict(current_settings, {"local_model": COHERE_MODEL_ID}):
+            self.assertEqual(lid.smooth_chunk_languages([italian], [10.0]), ["it"])
 
     def test_prompt_with_hint_for_the_six_granite_languages(self):
         expected = {"en": "English", "fr": "French", "de": "German", "es": "Spanish", "pt": "Portuguese", "ja": "Japanese"}
@@ -287,13 +318,37 @@ class GraniteBatchTests(_SpeedStateCase):
         self.assertNotIn("t7", texts[0])
 
     def test_max_new_tokens_follow_the_longest_clip_of_the_sub_batch(self):
-        self.assertEqual(granite.max_new_tokens_for(0.0), 32)
-        self.assertEqual(granite.max_new_tokens_for(25.0), 282)
-        self.assertEqual(granite.max_new_tokens_for(60.0), 632)
-        self.assertEqual(granite.max_new_tokens_for(1000.0), granite.GRANITE_MAX_NEW_TOKENS_CAP)
+        self.assertEqual(granite.max_new_tokens_for(0.0, "de"), 32)
+        self.assertEqual(granite.max_new_tokens_for(25.0, "de"), 282)
+        self.assertEqual(granite.max_new_tokens_for(60.0, "en"), 632)
+        self.assertEqual(granite.max_new_tokens_for(1000.0, "de"), granite.GRANITE_MAX_NEW_TOKENS_CAP)
         model = _FakeModel()
         granite.transcribe_granite_batch(_FakeProcessor(), model, [clip(2), clip(25)], "de", 16)
         self.assertEqual(model.generate_calls[0]["max_new_tokens"], 282)
+
+    def test_japanese_and_auto_get_the_dense_token_rate(self):
+        # Fast Japanese runs ~11 tokens/s; "auto" may be Japanese.
+        for language in ("ja", "auto", None, "it"):
+            with self.subTest(language=language):
+                self.assertEqual(granite.max_new_tokens_for(60.0, language), 60 * 16 + 32)
+        self.assertEqual(granite.max_new_tokens_for(100.0, "ja"), granite.GRANITE_MAX_NEW_TOKENS_CAP)
+
+    def test_a_row_cut_at_the_token_limit_is_counted_and_warned(self):
+        class _Looping(_FakeModel):
+            def generate(self, **kwargs):
+                input_ids = kwargs["input_ids"]
+                new = torch.full((input_ids.shape[0], kwargs["max_new_tokens"]), 5, dtype=torch.long)
+                new[1:, 0] = EOS
+                return torch.cat([input_ids, new], dim=1)
+
+        with contextlib.redirect_stderr(io.StringIO()) as log:
+            granite.transcribe_granite_batch(_FakeProcessor(), _Looping(), [clip(3), clip(2)], "de", 8)
+        self.assertEqual(granite.speed_stats()["truncated_rows"], 1)
+        self.assertIn("1 von 2 Clips am Token-Limit 62", log.getvalue())
+
+    def test_rows_that_end_with_eos_are_not_counted_as_cut(self):
+        granite.transcribe_granite_batch(_FakeProcessor(), _FakeModel(), [clip(3), clip(2)], "de", 8)
+        self.assertEqual(granite.speed_stats()["truncated_rows"], 0)
 
     def test_long_clips_are_split_at_quiet_moments_and_joined(self):
         processor, model = _FakeProcessor(), _FakeModel()
@@ -334,9 +389,30 @@ class GraniteSpeedModeTests(_SpeedStateCase):
         generate = model.generate_calls[0]
         self.assertEqual(generate["cache_implementation"], "static")
         self.assertTrue(generate["disable_compile"])
+        # The cache gets the bucketed length, generation stops at the eager budget.
         self.assertEqual((PROMPT_LENGTH + generate["max_new_tokens"]) % granite.GRANITE_CACHE_LENGTH_BUCKET, 0)
-        self.assertGreaterEqual(generate["max_new_tokens"], granite.max_new_tokens_for(2))
-        self.assertEqual(granite.speed_stats()["fast_calls"], 1)
+        (criterion,) = generate["stopping_criteria"]
+        self.assertEqual(criterion.max_length, PROMPT_LENGTH + granite.max_new_tokens_for(2, "de"))
+        self.assertTrue(bool(criterion(torch.zeros(2, criterion.max_length, dtype=torch.long), None).all()))
+        self.assertFalse(bool(criterion(torch.zeros(2, criterion.max_length - 1, dtype=torch.long), None).any()))
+        stats = granite.speed_stats()
+        self.assertEqual((stats["fast_calls"], stats["last_mode"]), (1, "static_cache"))
+
+    def test_fast_modes_pad_a_sub_batch_to_a_row_bucket_and_drop_the_padding_rows(self):
+        current_settings["granite_compile"] = "static_cache"
+        processor, model = _FakeProcessor(), _FakeModel()
+        texts = granite.transcribe_granite_batch(processor, model, [clip(2), clip(5), clip(3)], "de", 16)
+        self.assertEqual(texts, [name(2), name(5), name(3)])
+        self.assertEqual(processor.calls[0]["lengths"], [80000, 48000, 32000, 32000])
+        self.assertEqual(model.batch_rows, [4])
+
+    def test_eager_fallback_runs_only_the_real_rows(self):
+        current_settings["granite_compile"] = "static_cache"
+        model = _FakeModel(fail_static=True)
+        with contextlib.redirect_stderr(io.StringIO()):
+            texts = granite.transcribe_granite_batch(_FakeProcessor(), model, [clip(2), clip(5), clip(3)], "de", 16)
+        self.assertEqual(texts, [name(2), name(5), name(3)])
+        self.assertEqual(model.batch_rows, [4, 3])
 
     def test_a_static_cache_failure_falls_back_to_eager_for_the_process_lifetime(self):
         current_settings["granite_compile"] = "static_cache"
@@ -349,6 +425,22 @@ class GraniteSpeedModeTests(_SpeedStateCase):
         self.assertEqual(log.getvalue().count("fehlgeschlagen"), 1)
         self.assertIn("static cache broke", granite.speed_stats()["failure"])
         self.assertFalse(hasattr(model, "_cache"))
+
+    def test_a_cuda_oom_runs_that_batch_eager_and_keeps_the_mode(self):
+        current_settings["granite_compile"] = "static_cache"
+        model = _FakeModel(fail_static=True, error=torch.cuda.OutOfMemoryError("CUDA out of memory"))
+        model._compiled_call = object()
+        with contextlib.redirect_stderr(io.StringIO()):
+            first = granite.transcribe_granite_batch(_FakeProcessor(), model, [clip(2)], "de", 8)
+        self.assertEqual(first, [name(2)])
+        stats = granite.speed_stats()
+        self.assertIsNone(stats["failure"])
+        self.assertEqual((stats["oom_fallbacks"], stats["eager_calls"]), (1, 1))
+        self.assertFalse(hasattr(model, "_cache"))
+        self.assertTrue(hasattr(model, "_compiled_call"))
+        model.fail_static = False
+        granite.transcribe_granite_batch(_FakeProcessor(), model, [clip(2)], "de", 8)
+        self.assertEqual(model.generate_calls[-1]["cache_implementation"], "static")
 
     def test_compile_without_cuda_runs_eager(self):
         current_settings["granite_compile"] = "compile"
@@ -369,22 +461,134 @@ class GraniteSpeedModeTests(_SpeedStateCase):
         self.assertFalse(generate["disable_compile"])
         self.assertEqual(generate["compile_config"].mode, "reduce-overhead")
         self.assertFalse(generate["compile_config"].fullgraph)
+        self.assertGreaterEqual(torch._dynamo.config.recompile_limit, granite.GRANITE_COMPILE_RECOMPILE_LIMIT)
+        self.assertEqual(granite.speed_stats()["compiled_shapes"], 1)
+
+    def test_compile_shapes_are_bounded_by_the_row_and_length_buckets(self):
+        current_settings["granite_compile"] = "compile"
+        model = _FakeModel(dtype=torch.bfloat16)
+        with mock.patch.object(granite, "_inductor_unavailable_reason", return_value=None):
+            for rows in range(1, 17):
+                granite.transcribe_granite_batch(_FakeProcessor(), model, [clip(2)] * rows, "de", 16)
+        # 16 batch sizes, one length bucket: five row buckets.
+        self.assertEqual(sorted(set(model.batch_rows)), [1, 2, 4, 8, 16])
+        self.assertEqual(granite.speed_stats()["compiled_shapes"], 5)
+        buckets = len(granite.GRANITE_BATCH_BUCKETS)
+        longest = granite.bucket_cache_length(granite.estimated_total_tokens(granite.GRANITE_MAX_ITEM_SECONDS, "ja"))
+        self.assertLessEqual(buckets * longest // granite.GRANITE_CACHE_LENGTH_BUCKET, granite.GRANITE_COMPILE_RECOMPILE_LIMIT)
+
+    def test_compile_on_an_int8_model_is_reported_as_static_cache(self):
+        current_settings["granite_compile"] = "compile"
+        model = _FakeModel()
+        model.hf_quantizer = mock.Mock(is_compileable=False)
+        with mock.patch.object(granite, "_inductor_unavailable_reason", return_value=None), contextlib.redirect_stderr(io.StringIO()):
+            granite.transcribe_granite_batch(_FakeProcessor(), model, [clip(2)], "de", 8)
+        self.assertTrue(model.generate_calls[0]["disable_compile"])
+        self.assertEqual(granite.speed_stats()["last_mode"], "static_cache")
 
     def test_a_static_cache_over_the_budget_runs_eager(self):
         current_settings["granite_compile"] = "static_cache"
         model = _FakeModel()
-        with contextlib.redirect_stderr(io.StringIO()), mock.patch.object(granite, "GRANITE_STATIC_CACHE_BUDGET_MB", 1):
+        with contextlib.redirect_stderr(io.StringIO()), mock.patch.object(granite, "GRANITE_KV_BUDGET_MB", 1):
             granite.transcribe_granite_batch(_FakeProcessor(), model, [clip(2)], "de", 8)
         self.assertNotIn("cache_implementation", model.generate_calls[0])
         self.assertEqual(granite.speed_stats()["budget_skips"], 1)
 
-    def test_switching_off_releases_a_kept_static_cache(self):
+    def test_a_budget_skip_drops_the_cache_but_keeps_the_compiled_step(self):
+        current_settings["granite_compile"] = "static_cache"
         model = _FakeModel()
         model._cache = object()
         model._compiled_call = object()
-        granite.transcribe_granite_batch(_FakeProcessor(), model, [clip(2)], "de", 8)
+        with contextlib.redirect_stderr(io.StringIO()), mock.patch.object(granite, "GRANITE_KV_BUDGET_MB", 1):
+            granite.transcribe_granite_batch(_FakeProcessor(), model, [clip(2)], "de", 8)
+        self.assertFalse(hasattr(model, "_cache"))
+        self.assertTrue(hasattr(model, "_compiled_call"))
+
+    def test_kv_sizing_with_the_real_budget(self):
+        # 40 layers x 4 KV heads x 128 x 2 (K and V) x 2 bytes = 80 KiB per token.
+        model = _FakeModel(dtype=torch.bfloat16)
+        self.assertEqual(granite._kv_bytes_per_token(model), 80 * 1024)
+        self.assertEqual(granite.kv_cache_mb(model, 16, 1280), 1600.0)
+        self.assertEqual(granite.kv_cache_mb(model, 1, 256), 20.0)
+        # A live clip and sixteen 45 s German clips fit one sub-batch in every mode; sixteen 60 s clips do not.
+        self.assertEqual(granite.sub_batch_sizes([5.0], 16, "de", model, True), [1])
+        self.assertEqual(granite.sub_batch_sizes([45.0] * 16, 16, "de", model, False), [16])
+        self.assertEqual(granite.sub_batch_sizes([45.0] * 16, 16, "de", model, True), [16])
+        self.assertEqual(granite.sub_batch_sizes([60.0] * 16, 16, "de", model, False), [15, 1])
+        self.assertEqual(granite.sub_batch_sizes([60.0] * 16, 16, "de", model, True), [8, 8])
+        for fast in (False, True):
+            start = 0
+            seconds = [60.0] * 6 + [2.0] * 10
+            for size in granite.sub_batch_sizes(seconds, 16, "auto", model, fast):
+                tokens = granite.estimated_total_tokens(seconds[start], "auto")
+                rows = size
+                if fast:
+                    tokens, rows = granite.bucket_cache_length(tokens), granite.bucket_batch_size(size)
+                self.assertLessEqual(granite.kv_cache_mb(model, rows, tokens), granite.GRANITE_KV_BUDGET_MB)
+                start += size
+            self.assertEqual(start, 16)
+
+    def test_eager_sub_batches_follow_the_kv_budget(self):
+        processor, model = _FakeProcessor(), _FakeModel(dtype=torch.bfloat16)
+        clips = [clip(59.0)] * 6 + [clip(2.0)] * 10
+        texts = granite.transcribe_granite_batch(processor, model, clips, "auto", 16)
+        self.assertEqual(len(texts), 16)
+        self.assertEqual([len(call["lengths"]) for call in processor.calls], [12, 4])
+        self.assertTrue(all(call.get("cache_implementation") is None for call in model.generate_calls))
+
+    def test_switching_off_releases_a_kept_static_cache_and_the_compiled_graphs(self):
+        model = _FakeModel()
+        model._cache = object()
+        model._compiled_call = object()
+        with mock.patch.object(granite, "_reset_compiled_graphs") as reset:
+            granite.transcribe_granite_batch(_FakeProcessor(), model, [clip(2)], "de", 8)
         self.assertFalse(hasattr(model, "_cache"))
         self.assertFalse(hasattr(model, "_compiled_call"))
+        reset.assert_called_once()
+
+    def test_release_without_a_compiled_step_leaves_dynamo_alone(self):
+        model = _FakeModel()
+        model._cache = object()
+        with mock.patch.object(granite, "_reset_compiled_graphs") as reset:
+            granite.release_speed_state(model)
+        self.assertFalse(hasattr(model, "_cache"))
+        reset.assert_not_called()
+
+    def test_idle_trim_frees_a_static_cache_but_not_one_with_captured_graphs(self):
+        model = _FakeModel()
+        model._cache = object()
+        components = {"model": model, "processor": _FakeProcessor(), "model_backend": "granite_speech"}
+        with mock.patch.dict(engine.local_model_components, components, clear=True):
+            self.assertTrue(engine.release_idle_model_caches())
+            self.assertFalse(hasattr(model, "_cache"))
+            model._cache = object()
+            model._compiled_call = object()
+            self.assertFalse(engine.release_idle_model_caches())
+            self.assertTrue(hasattr(model, "_cache"))
+        with mock.patch.dict(engine.local_model_components, {"model": model, "model_backend": "cohere_transcribe"}, clear=True):
+            self.assertFalse(engine.release_idle_model_caches())
+
+    def test_the_scheduler_trim_releases_idle_model_caches(self):
+        from backend import genesis_whisper_server_batching as batching
+
+        with mock.patch.object(engine, "release_idle_model_caches") as release:
+            batching.WhisperBatchManager._trim_cuda_cache()
+        release.assert_called_once()
+
+    def test_speed_stats_reach_admin_stats_and_the_benchmark(self):
+        model = _FakeModel(dtype=torch.bfloat16)
+        model._cache = mock.Mock(max_batch_size=4, max_cache_len=512)
+        components = {"model": model, "processor": _FakeProcessor(), "model_backend": "granite_speech"}
+        with mock.patch.dict(engine.local_model_components, components, clear=True):
+            before = engine.granite_speed_stats()
+            granite._speed_state["eager_calls"] += 3
+            block = admin._granite_speed_delta(before)["granite_speed"]
+        self.assertEqual(block["eager_calls"], 3)
+        self.assertEqual(block["kept_cache_mb"], 160.0)
+        self.assertEqual(block["requested"], "off")
+        with mock.patch.dict(engine.local_model_components, {"model": None, "model_backend": "whisper"}, clear=True):
+            self.assertIsNone(engine.granite_speed_stats())
+            self.assertEqual(admin._granite_speed_delta(None), {})
 
     def test_setting_is_normalised(self):
         self.assertEqual(storage.DEFAULT_SETTINGS["granite_compile"], "off")

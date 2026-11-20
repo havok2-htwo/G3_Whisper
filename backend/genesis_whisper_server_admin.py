@@ -5,7 +5,7 @@ import sys
 import time
 import uuid
 from statistics import mean
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 from urllib.parse import urlsplit
 
 import requests
@@ -60,7 +60,11 @@ from .genesis_whisper_server_history import (
     get_history_snapshot,
     set_history_audio_enabled,
 )
-from .genesis_whisper_server_local_asr_engine import get_last_local_asr_load_error, load_local_asr_model
+from .genesis_whisper_server_local_asr_engine import (
+    get_last_local_asr_load_error,
+    granite_speed_stats,
+    load_local_asr_model,
+)
 from .genesis_whisper_server_gpu import run_blocking_gpu_phase, shared_gpu_lease
 from .genesis_whisper_server_model_manager import (
     delete_model_cache,
@@ -443,6 +447,19 @@ def _benchmark_workflow(model_id: str) -> str:
     return "whisper_chunk_queue"
 
 
+def _granite_speed_delta(before: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """``granite_speed`` of a benchmark: the mode state now plus the counters this run added."""
+
+    after = granite_speed_stats()
+    if after is None:
+        return {}
+    block = dict(after)
+    if before is not None:
+        for key in ("fast_calls", "eager_calls", "budget_skips", "oom_fallbacks", "truncated_rows"):
+            block[key] = after[key] - before.get(key, 0)
+    return {"granite_speed": block}
+
+
 async def _run_admin_benchmark(request: Request, audio_data, repeat_count: int) -> Dict[str, Any]:
     processing_key = _get_local_processing_key()
     model_id, _, _, configured_language, _ = processing_key
@@ -459,6 +476,7 @@ async def _run_admin_benchmark(request: Request, audio_data, repeat_count: int) 
 
     cuda_index = _get_loaded_model_cuda_index()
     _reset_peak_vram_tracking(cuda_index)
+    granite_speed_before = granite_speed_stats()
     batch_started_at = time.perf_counter()
 
     audio_seconds = round(get_audio_duration_seconds(audio_data), 3)
@@ -491,6 +509,7 @@ async def _run_admin_benchmark(request: Request, audio_data, repeat_count: int) 
             "transcripts_match": True,
             "transcript": "",
             **peak_metrics,
+            **_granite_speed_delta(granite_speed_before),
         }
 
     batch_manager = request.app.state.whisper_batch_manager
@@ -553,6 +572,7 @@ async def _run_admin_benchmark(request: Request, audio_data, repeat_count: int) 
         "transcripts_match": len(normalized_transcripts) <= 1,
         "transcript": transcripts[0] if transcripts else "",
         **peak_metrics,
+        **_granite_speed_delta(granite_speed_before),
     }
 
 
@@ -938,6 +958,7 @@ def create_admin_api(app: FastAPI) -> FastAPI:
                 "avg_transcription_duration_ms": round(mean(transcription_values), 2) if transcription_values else None,
             },
             "history": recent_history,
+            "granite_speed": granite_speed_stats(),
         }
 
     @app.get("/api/admin/history/{history_id}/audio")

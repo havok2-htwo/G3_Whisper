@@ -506,18 +506,27 @@ default for this backend. Only the 100 s bound is verified; larger values are un
 - Attention: left to transformers (`sdpa` for the LLM and encoder, `eager` for the Q-Former projector). An explicit
   `sdpa` or `flash_attention_2` makes the projector refuse to load, so the flash-attn choice of the other backends is
   not passed.
-- Batching: one scheduler batch becomes one processor call and one greedy `generate` (`num_beams=1`) per sub-batch of at
-  most 16 clips, left padded, each clip with its own number of audio tokens (10 per second). Clips are sorted by length
-  first because the encoder has no padding mask; results come back in input order. `max_new_tokens` is
-  `10 x seconds of the longest clip + 32` (cap 1024). Clips over 60 s are cut at the quietest moment and their texts joined.
+- Batching: one scheduler batch becomes one processor call and one greedy `generate` (`num_beams=1`) per sub-batch,
+  left padded, each clip with its own number of audio tokens (10 per second). Clips are sorted by length first because
+  the encoder has no padding mask; results come back in input order. A sub-batch holds at most 16 clips and at most
+  1.5 GB of KV cache (rows x the longest clip's prompt, audio and new tokens), in every speed mode. `max_new_tokens` is
+  `10 x seconds of the longest clip + 32` for `en`/`fr`/`de`/`es`/`pt` and `16 x seconds + 32` for `ja`, `auto` and
+  everything else (fast Japanese needs about 11 tokens/s), cap 1024. A row that reaches the limit without an end token
+  is logged as cut and counted. Clips over 60 s are cut at the quietest moment and their texts joined.
 - Language: see "Cohere Language Detection". The language-id prompt is
   `The speech is in <Language>. Transcribe it exactly; do not translate. transcribe the speech with proper punctuation and capitalization.`
 - Long audio takes the same superchunk path as Cohere.
 - `granite_compile` (per model, default `off`, admin "Granite speed mode"): `static_cache` runs `generate` with a
   StaticCache (kept in the model between batches, at most 1.5 GB, larger batches run eager); `compile` adds HF's
   `torch.compile` of the decode step with mode `reduce-overhead` (CUDA graphs; needs CUDA, Triton and a C++ compiler,
-  otherwise eager). Any failure of a fast mode is logged once and the process stays eager until restart. Applies to the
-  next batch. Not measured yet.
+  otherwise eager; an int8 model runs `static_cache`, transformers does not compile it). Fast modes pad a sub-batch to
+  1/2/4/8/16 rows (repeating the shortest clip) and the cache to 256-token steps, so the cache is reused and compile
+  sees at most 5 x 7 shapes (dynamo's recompile limit is raised to 64); generation still stops at the eager token budget,
+  so all modes return the same text length. The idle trim frees a `static_cache` cache; a cache with captured CUDA graphs
+  stays until the mode is switched off or the model unloads (then dynamo and the CUDA-graph pool are reset too). A CUDA
+  OOM runs that sub-batch eager and keeps the mode; any other failure is logged once and the process stays eager until
+  restart. Applies to the next batch. `GET /api/admin/stats` and the benchmark report what really ran (`granite_speed`).
+  Not measured yet; compile pays a compile and graph capture per new shape inside the GPU phase.
 
 ## Optimizations
 

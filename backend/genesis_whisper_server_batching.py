@@ -562,6 +562,12 @@ class WhisperBatchManager:
         """Release the reserved CUDA cache pool back to the driver so idle VRAM drops to
         the model floor (leaves room for the other GPU tenants). Best-effort."""
         try:
+            from .genesis_whisper_server_local_asr_engine import release_idle_model_caches
+
+            release_idle_model_caches()
+        except Exception:
+            pass
+        try:
             import gc
 
             import torch
