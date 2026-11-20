@@ -528,6 +528,24 @@ default for this backend. Only the 100 s bound is verified; larger values are un
   restart. Applies to the next batch. `GET /api/admin/stats` and the benchmark report what really ran (`granite_speed`).
   Not measured yet; compile pays a compile and graph capture per new shape inside the GPU phase.
 
+#### Glossary (keywords)
+
+Names and terms Granite should spell as given (people, products, jargon). Two sources, merged in this order:
+
+- the server glossary `asr_keywords` (admin "ASR Glossary", service-wide, one term per line), and
+- the request: v2 `keywords` (a list of strings, modes `transcript`, `transcript_embedding`, `diarization`; 422 in
+  `embedding`), v1 form field `keywords` on `/transcribe/` and `/v1/audio/transcriptions` (newlines or commas; the
+  OpenAI `prompt` stays unused).
+
+Terms are trimmed, empty ones and ones over 100 characters dropped, duplicates removed case-insensitively (first
+spelling wins), then capped at 1000 terms / 16000 characters from the end (`KEYWORDS_TRUNCATED` warning on v2).
+Granite gets them as ` Keywords: a, b, c` at the end of its prompt; every other model accepts and ignores them.
+Responses report `{"applied", "count", "truncated"}` (v2 `models.asr.keywords`, v1 `keywords`), and
+`GET /v2/capabilities` has `keywords.supported`. A non-empty glossary is part of the processing key (a short digest),
+so the scheduler never mixes two glossaries in a batch; requests without terms batch as before. The prompt's token count
+enters the KV sizing, so long glossaries mean smaller sub-batches; a fast-mode sub-batch beyond the largest static-cache
+bucket (1792 tokens) runs eager (`granite_speed.length_skips`).
+
 ## Optimizations
 
 The local ASR path already utilizes several optimizations:
@@ -845,6 +863,7 @@ Plain defaults:
 - `language_detection_model`: `openai/whisper-base` (or `openai/whisper-small`, `openai/whisper-large-v3-turbo`; applies on save, never reloads the ASR model)
 - `redimnet_max_batch_size`: `8` (1/2/4/8; applies on save, no restart)
 - `debug_retain_history_audio`: `false`
+- `asr_keywords`: `[]` (server glossary, Granite Speech only, see "Glossary (keywords)")
 - `huggingface_token`: empty string
 - `dia_server_base_url`: empty string = use the default: `DIA_SERVER_BASE_URL` if set, else `http://127.0.0.1:7864`
 - `dia_api_key`: empty string (write-only; falls back to `DIA_SERVER_API_KEY`)

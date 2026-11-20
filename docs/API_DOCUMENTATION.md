@@ -101,6 +101,53 @@ mode it is rejected with HTTP 422 because no ASR runs. The heavy diarization
 pipeline never runs in the other modes; their processing is unchanged apart from
 the optional language override.
 
+#### Glossary (`keywords`)
+
+The request JSON accepts an optional top-level `keywords`: a list of strings with
+names and terms the transcript should spell exactly as written (people, products,
+jargon). It is allowed in `transcript`, `transcript_embedding` and `diarization`;
+in `embedding` mode it is rejected with HTTP 422 `INVALID_REQUEST`, like
+`language`. A value that is not a list, or a list with a non-string entry, is also
+422 `INVALID_REQUEST`.
+
+```json
+{ "schema_version": "2.0", "mode": "transcript", "keywords": ["Genesis", "Optimus", "OmniVoice"] }
+```
+
+Processing:
+
+1. The server glossary (admin setting `asr_keywords`) comes first, the request's
+   terms after it.
+2. Each term is trimmed; empty terms are dropped, terms over 100 characters are
+   dropped (counts as truncated); duplicates are removed case-insensitively, the
+   first spelling and order are kept.
+3. Limits: at most 1000 terms and 16000 characters in all (sum of the term
+   lengths). The excess is cut from the end, so request terms go before server
+   terms. Any cut or dropped term sets `truncated: true` and adds the warning
+   `{"code": "KEYWORDS_TRUNCATED"}` (the response status is then `partial`, as for
+   every warning).
+
+The field is accepted with every model, but only Granite Speech applies it: the
+terms end its prompt as ` Keywords: a, b, c` (after the language hint and the
+punctuation prompt). Other models transcribe as before and report
+`applied: false`; no error.
+
+Every response of a mode that runs ASR reports what happened in
+`models.asr.keywords`, also without terms:
+
+```json
+{ "applied": true, "count": 3, "truncated": false }
+```
+
+- `applied`: Granite served the request and there was at least one term
+- `count`: terms after merge, normalisation and limits (the terms sent to the model when applied)
+- `truncated`: a term was dropped for its length or cut by the limits
+
+A glossary costs prompt tokens: long lists make Granite's sub-batches smaller (KV
+budget) and a sub-batch whose cache would outgrow the largest static-cache bucket
+runs eager. Jobs with different glossaries are never batched together; jobs without
+terms batch exactly as before.
+
 #### Language detection on Cohere (`auto`)
 
 Cohere cannot detect a language. When the effective language is `auto` (the
@@ -748,11 +795,14 @@ Response shape:
   },
   "modes": ["embedding", "transcript", "transcript_embedding", "diarization"],
   "embedding": { "id": "ReDimNet2-B6" },
-  "diarization": { "configured": true }
+  "diarization": { "configured": true },
+  "keywords": { "supported": false, "max_entries": 1000, "max_chars": 16000, "server_glossary_count": 0 }
 }
 ```
 
 Notes:
+
+- `keywords` is always present on servers that accept the request field `keywords`; its absence means an older server (do not send the field). `supported` is true only while the active model is Granite Speech; `server_glossary_count` is the number of saved server terms (see [Glossary](#glossary-keywords)).
 
 - `model` is the admin's selection. `loaded` is false while another model or no model is resident, the next request then loads it.
 - `language.effective` is what `auto` means on this model: detection (`auto`) on Whisper, and on Cohere while `language.detection.enabled` is true and its model has not failed to load; `de` on Cohere otherwise.
@@ -780,6 +830,7 @@ Form fields:
 - `file` (required): audio or video upload
 - `engine` (optional): defaults to `local`; only `local` / `lokal` are accepted
 - `voice_ident` (optional): boolean, defaults to `false`
+- `keywords` (optional): glossary terms separated by newlines or commas; merged after the server glossary, normalised and limited like the v2 field (see [Glossary](#glossary-keywords)), applied only by Granite Speech
 
 Runtime behavior:
 
@@ -799,9 +850,12 @@ Success response without voice embedding:
   "transcription": "Hallo Welt",
   "language": "de",
   "total_duration_ms": 842,
-  "transcription_duration_ms": 611
+  "transcription_duration_ms": 611,
+  "keywords": { "applied": false, "count": 0, "truncated": false }
 }
 ```
+
+`keywords` (additive) has the meaning of v2 `models.asr.keywords`; it is present with and without `voice_ident`. A truncated glossary adds no warning here (v1 has no warnings), only `truncated: true`.
 
 `language` (additive) is the language the ASR model ran with: the detected one for Cohere with the saved language `auto` (see [Language detection on Cohere](#language-detection-on-cohere-auto)), else the effective saved language.
 
@@ -879,8 +933,11 @@ Accepted form fields:
 - `prompt` (optional)
 - `response_format` (optional, default `json`)
 - `temperature` (optional, default `0.0`)
+- `keywords` (optional, Genesis extension): glossary terms separated by newlines or commas, as on `/transcribe/`
 
 Compatibility notes:
+
+- the OpenAI `prompt` field is not used as a glossary; send the terms in `keywords`
 
 - internally this route calls the native transcription path with `engine=local` and `voice_ident=false`
 - it always uses the active local server model
@@ -913,9 +970,12 @@ Hallo Welt
   "language": "de",
   "duration": 0.611,
   "text": "Hallo Welt",
-  "segments": []
+  "segments": [],
+  "keywords": { "applied": false, "count": 0, "truncated": false }
 }
 ```
+
+`keywords` appears only in `verbose_json`; `json` and `text` keep the OpenAI shape.
 
 ## Admin API
 
@@ -1034,6 +1094,7 @@ Response shape:
     "language_detection_model": "openai/whisper-base",
     "redimnet_max_batch_size": 8,
     "debug_retain_history_audio": false,
+    "asr_keywords": ["Genesis", "Optimus"],
     "huggingface_token": "hf_xxx",
     "dia_server_base_url": "http://dia:7864",
     "dia_server_base_url_effective": "http://dia:7864",
@@ -1104,7 +1165,8 @@ Response shape:
     "huggingface_token",
     "dia_server_base_url",
     "dia_api_key",
-    "debug_retain_history_audio"
+    "debug_retain_history_audio",
+    "asr_keywords"
   ]
 }
 ```
@@ -1172,6 +1234,7 @@ Notes:
 - `redimnet_max_batch_size` (default `8`, allowed `1`/`2`/`4`/`8`; other numbers snap down to the next allowed value, a non-number falls back to `8`) is the largest ReDimNet CUDA batch for speaker clouds, verification and embeddings. The reserved pool scales with it (RTX 5090: 746 / 1442 / 2816 MiB for 2 / 4 / 8; 60-min diarization 23.2 s at 4 vs 19.6 s at 8). It applies on save without a restart: a loaded ReDimNet is re-warmed for the new buckets and its old pool released (`model_reloaded` stays `false`).
 - ReDimNet and MMS_FA alignment run on the `local_gpu_device` card like the ASR model; changing the device moves them on save.
 - `debug_retain_history_audio` defaults to `false`. When enabled, successful public API requests may retain their byte-identical original upload for the 25-row admin history; disabling it blocks access immediately and purges retained audio after active readers finish.
+- `asr_keywords` (default `[]`, service-wide, not a preset key) is the server glossary: a list of terms merged before every request's own `keywords` (see [Glossary](#glossary-keywords)). On save each term is trimmed, empty ones and ones over 100 characters are dropped, duplicates removed case-insensitively and the list capped at 1000 terms / 16000 characters; nothing is rejected. A non-string entry is a 422 from the payload validation. Only Granite Speech uses it; it applies to the next request.
 - updates are partial merges; omitted fields keep their saved value, so older admin clients cannot remove newer settings
 - `local_gpu_device` `cuda:N` follows nvidia-smi numbering: the server sets `CUDA_DEVICE_ORDER=PCI_BUS_ID` (unless the environment sets it) before torch initialises CUDA; device options show index, name and memory size
 - `dia_server_base_url` configures the DIA service used by diarization requests; empty means "use the default": `DIA_SERVER_BASE_URL` if set, else `http://127.0.0.1:7864` (G3_DIA on the same machine). `dia_server_base_url_effective` shows the URL in use and `dia_server_base_url_source` is `settings`, `environment` or `default`
@@ -1439,7 +1502,7 @@ Response fields:
 - `summary.avg_total_duration_ms`
 - `summary.avg_transcription_duration_ms`
 - `history` with up to 25 recent log entries
-- `granite_speed` (only while Granite Speech is the loaded backend, else `null`): `requested` (the setting), `last_mode` (the mode the last sub-batch really ran: `off`, `static_cache` or `compile`), `failure` (the sticky fast-mode error, `null` without one), the counters `fast_calls`, `eager_calls`, `budget_skips`, `oom_fallbacks`, `truncated_rows` (rows that hit `max_new_tokens` without an end token), `compiled_shapes` (distinct (rows, cache length) shapes of the compiled decode step) with `recompile_limit`, `kept_cache_mb` (the StaticCache held between batches) and `kv_budget_mb`
+- `granite_speed` (only while Granite Speech is the loaded backend, else `null`): `requested` (the setting), `last_mode` (the mode the last sub-batch really ran: `off`, `static_cache` or `compile`), `failure` (the sticky fast-mode error, `null` without one), the counters `fast_calls`, `eager_calls`, `budget_skips`, `length_skips` (fast-mode sub-batches run eager because a long keyword prompt outgrew `max_cache_length`, the largest static-cache bucket), `oom_fallbacks`, `truncated_rows` (rows that hit `max_new_tokens` without an end token), `compiled_shapes` (distinct (rows, cache length) shapes of the compiled decode step) with `recompile_limit`, `kept_cache_mb` (the StaticCache held between batches), `kv_budget_mb` and `max_cache_length`
 
 History entry fields currently include:
 
