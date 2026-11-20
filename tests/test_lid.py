@@ -13,6 +13,7 @@ import numpy as np
 import torch
 
 from backend import genesis_whisper_server_lid as lid
+from backend import genesis_whisper_server_wxc as wxc
 from backend.genesis_whisper_server_globals import COHERE_LANGUAGE_CODES, current_settings
 
 # A Whisper-like vocabulary: the 14 Cohere languages plus languages Cohere cannot take.
@@ -279,6 +280,42 @@ class SubmitByLanguageTests(unittest.IsolatedAsyncioTestCase):
                 manager, [np.zeros(1)] * 2, ("m", "cpu", "", "auto", "fp16"), ["en", "de"]
             )
         self.assertTrue(cancelled.is_set())
+
+
+class WxcLanguageChunkTests(unittest.TestCase):
+    def test_one_language_is_exactly_the_old_chunking(self) -> None:
+        rng = np.random.default_rng(3)
+        for _ in range(20):
+            starts = np.cumsum(rng.uniform(0.3, 9.0, size=30))
+            regions = [(float(a), float(a + rng.uniform(0.2, 6.0))) for a in starts]
+            regions = [region for index, region in enumerate(regions) if index == 0 or region[0] > regions[index - 1][1]]
+            spans = [(a - 0.1, b + 0.05, "en") for a, b in regions[::2]]
+            chunks, languages = wxc.build_language_superchunks(regions, spans)
+            self.assertEqual(chunks, wxc.build_superchunks(regions))
+            self.assertEqual(set(languages), {"en"})
+
+    def test_no_chunk_crosses_a_language_change(self) -> None:
+        regions = [(0.0, 9.0), (9.4, 40.0)]
+        spans = [(0.0, 4.0, "de"), (4.0, 20.0, "en"), (20.0, 40.0, "de")]
+        chunks, languages = wxc.build_language_superchunks(regions, spans)
+        self.assertEqual(chunks, [(0.0, 4.0), (4.0, 20.0), (20.0, 40.0)])
+        self.assertEqual(languages, ["de", "en", "de"])
+        for (start, end), language in zip(chunks, languages):
+            covering = {lang for a, b, lang in spans if a < end and b > start}
+            self.assertEqual(covering, {language})
+
+    def test_a_long_language_run_still_splits_at_the_target_length(self) -> None:
+        regions = [(float(index), index + 0.8) for index in range(0, 60)]
+        chunks, languages = wxc.build_language_superchunks(regions, [(0.0, 60.0, "fr")])
+        self.assertEqual(chunks, wxc.build_superchunks(regions))
+        self.assertTrue(all(end - start <= wxc.SUPERCHUNK_TARGET_S for start, end in chunks))
+
+    def test_dia_slivers_and_uncovered_speech_join_a_neighbour(self) -> None:
+        # A 0.2 s "en" sliver inside a German region and speech after the last turn.
+        regions = [(0.0, 10.0)]
+        spans = [(0.0, 5.0, "de"), (5.0, 5.2, "en"), (5.2, 8.0, "de")]
+        chunks, languages = wxc.build_language_superchunks(regions, spans)
+        self.assertEqual((chunks, languages), ([(0.0, 10.0)], ["de"]))
 
 
 if __name__ == "__main__":

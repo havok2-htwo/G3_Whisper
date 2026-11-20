@@ -23,6 +23,10 @@ from backend.genesis_whisper_server_globals import (
     settings_lock,
     transcription_history,
 )
+from backend.genesis_whisper_server_lid import LanguageDecision
+
+# What _transcribe_audio reports for a request that ran with the de setting.
+_GERMAN = LanguageDecision(languages=[], language="de", source="setting")
 
 
 class AdminHistoryRouteTests(unittest.TestCase):
@@ -52,6 +56,8 @@ class AdminHistoryRouteTests(unittest.TestCase):
                     {
                         **storage.DEFAULT_SETTINGS,
                         "debug_retain_history_audio": True,
+                        # History capture is under test here; language detection has its own tests.
+                        "cohere_language_detection": False,
                     }
                 )
             )
@@ -264,7 +270,7 @@ class AdminHistoryRouteTests(unittest.TestCase):
                     mock.patch.object(
                         v2,
                         "_transcribe_audio",
-                        new=mock.AsyncMock(return_value=(f"Retried {mode}", 12, 1, "mock-asr")),
+                        new=mock.AsyncMock(return_value=(f"Retried {mode}", 12, 1, "mock-asr", _GERMAN)),
                     ),
                     mock.patch.object(v2, "_generate_embedding", new=embedding),
                     mock.patch.object(v2, "log_transcription"),
@@ -352,7 +358,7 @@ class AdminHistoryRouteTests(unittest.TestCase):
             mock.patch.object(
                 v2,
                 "_transcribe_audio",
-                new=mock.AsyncMock(return_value=("Public transcript", 9, 1, "mock-asr")),
+                new=mock.AsyncMock(return_value=("Public transcript", 9, 1, "mock-asr", _GERMAN)),
             ),
             mock.patch.object(v2, "log_transcription"),
             TestClient(self.app) as client,
@@ -441,7 +447,7 @@ class AdminHistoryRouteTests(unittest.TestCase):
                     mock.patch.object(
                         v2,
                         "_transcribe_audio",
-                        new=mock.AsyncMock(return_value=("Transcript", 9, 1, "mock-asr")),
+                        new=mock.AsyncMock(return_value=("Transcript", 9, 1, "mock-asr", _GERMAN)),
                     ),
                     mock.patch.object(
                         v2,

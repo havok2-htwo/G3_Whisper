@@ -974,7 +974,7 @@ def create_admin_api(app: FastAPI) -> FastAPI:
             except Exception as exc:
                 raise HTTPException(status_code=400, detail=f"Retained audio could not be decoded: {exc}") from exc
 
-            transcript, transcription_ms, _, model_id = await _transcribe_audio(request, audio)
+            transcript, transcription_ms, _, model_id, _language = await _transcribe_audio(request, audio)
             transcript = filter_repeated_patterns(transcript)
             embedding_ms: int | None = None
             warnings: list[dict[str, str]] = []

@@ -579,7 +579,7 @@ class SharedSchedulerPathTests(unittest.TestCase):
             mock.patch.object(v2, "_processing_key", return_value=("openai/whisper-tiny", "cpu", "", "de", "fp32")),
             mock.patch.object(v2, "split_audio_for_whisper", return_value=[audio]),
         ):
-            *_, model_id = asyncio.run(v2._transcribe_audio(request, audio))
+            _, _, _, model_id, _ = asyncio.run(v2._transcribe_audio(request, audio))
         self.assertEqual(model_id, "restored/model")
 
     def test_legacy_transcribe_splits_long_cohere_audio_into_superchunks(self) -> None:
@@ -617,6 +617,41 @@ class SharedSchedulerPathTests(unittest.TestCase):
         self.assertIs(batch_manager.submit_job.await_args.args[0], segments)
 
 
+    def test_legacy_transcribe_detects_cohere_auto_and_echoes_it_on_v1(self) -> None:
+        from backend import genesis_whisper_server_lid as lid
+
+        audio = np.full(16000 * 5, 0.1, dtype=np.float32)
+        detected = lid.LidResult("fr", 0.95, {code: (0.95 if code == "fr" else 0.05 / 13) for code in lid.COHERE_LANGUAGE_CODES})
+        settings = {
+            "local_model": "CohereLabs/cohere-transcribe-03-2026",
+            "local_gpu_device": "cpu",
+            "local_model_cache_path": "",
+            "transcription_language": "auto",
+            "local_model_precision": "fp16",
+            "cohere_language_detection": True,
+        }
+        for endpoint, form in (("/transcribe/", {"engine": "local"}), ("/v1/audio/transcriptions", {"response_format": "verbose_json"})):
+            with self.subTest(endpoint=endpoint):
+                batch_manager = SimpleNamespace(
+                    submit_job=mock.AsyncMock(return_value=[SimpleNamespace(text="Bonjour", batch_id="batch")])
+                )
+                with (
+                    mock.patch.dict(legacy_api.current_settings, settings, clear=True),
+                    mock.patch.object(legacy_api, "authorize_api_key", return_value=None),
+                    mock.patch.object(legacy_api, "load_audio_file", return_value=audio),
+                    mock.patch.object(legacy_api, "log_transcription") as log_transcription,
+                    mock.patch.object(legacy_api, "append_history_entry"),
+                    mock.patch.object(lid, "detect_languages", return_value=[detected]),
+                ):
+                    with TestClient(self._legacy_app(batch_manager)) as client:
+                        response = client.post(endpoint, files={"file": ("fr.wav", b"fixture", "audio/wav")}, data=form)
+
+                self.assertEqual(response.status_code, 200, response.text)
+                self.assertEqual(batch_manager.submit_job.await_args.args[2][3], "fr")
+                self.assertEqual(response.json()["language"], "fr")
+                self.assertEqual(log_transcription.call_args.args[0]["transcription_language"], "fr")
+
+
 class SharedSchedulerAsyncPathTests(unittest.IsolatedAsyncioTestCase):
     async def test_v2_transcript_submits_whisper_chunks_as_one_job(self) -> None:
         audio = np.full(16000 * 65, 0.1, dtype=np.float32)
@@ -631,7 +666,7 @@ class SharedSchedulerAsyncPathTests(unittest.IsolatedAsyncioTestCase):
             mock.patch.object(v2, "uses_whole_audio_backend", return_value=False),
             mock.patch.object(v2, "split_audio_for_whisper", return_value=segments),
         ):
-            text, _, segment_count, model_id = await v2._transcribe_audio(request, audio)
+            text, _, segment_count, model_id, _language = await v2._transcribe_audio(request, audio)
 
         self.assertEqual(text, "V2 0 V2 1 V2 2")
         self.assertEqual(segment_count, 3)
@@ -651,7 +686,7 @@ class SharedSchedulerAsyncPathTests(unittest.IsolatedAsyncioTestCase):
             mock.patch.object(v2, "_processing_key", return_value=processing_key),
             mock.patch.object(v2, "split_audio_into_superchunks", return_value=segments) as splitter,
         ):
-            text, _, segment_count, _ = await v2._transcribe_audio(request, audio)
+            text, _, segment_count, _, _language = await v2._transcribe_audio(request, audio)
 
         self.assertEqual(text, "C 0 C 1")
         self.assertEqual(segment_count, 2)

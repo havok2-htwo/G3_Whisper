@@ -16,7 +16,13 @@ from starlette.datastructures import FormData, UploadFile
 
 from backend import genesis_whisper_server_v2 as v2
 from backend.genesis_whisper_server_speaker_matching import build_robust_cloud
+from backend import genesis_whisper_server_lid as lid
+from backend.genesis_whisper_server_globals import COHERE_LANGUAGE_CODES
+from backend.genesis_whisper_server_lid import LanguageDecision
 from backend.genesis_whisper_server_vid import EmbeddedVoiceWindow
+
+# What _transcribe_audio reports for a request that ran with the de setting.
+_GERMAN = LanguageDecision(languages=[], language="de", source="setting")
 
 
 def _vector(index: int) -> np.ndarray:
@@ -463,14 +469,15 @@ class V2EndpointTests(unittest.TestCase):
         with patches[0], patches[1], patches[2], mock.patch.object(
             v2,
             "_transcribe_audio",
-            new=mock.AsyncMock(return_value=("Ein Transkript", 7, 1, "asr-model")),
+            new=mock.AsyncMock(return_value=("Ein Transkript", 7, 1, "asr-model", _GERMAN)),
         ):
             response = self._call({"schema_version": "2.0", "mode": "transcript"})
 
         payload = _payload(response)
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(payload["result"], {"transcript": {"text": "Ein Transkript"}})
-        self.assertEqual(payload["models"], {"asr": {"id": "asr-model"}})
+        self.assertEqual(payload["result"], {"transcript": {"text": "Ein Transkript", "language": "de"}})
+        # The language the ASR ran with; no detection block when no detection ran.
+        self.assertEqual(payload["models"], {"asr": {"id": "asr-model", "language": "de"}})
 
     def test_explicit_invalid_api_key_is_not_hidden_by_admin_session(self) -> None:
         with (
@@ -497,7 +504,7 @@ class V2EndpointTests(unittest.TestCase):
             mock.patch.object(
                 v2,
                 "_transcribe_audio",
-                new=mock.AsyncMock(return_value=("Ein Transkript", 7, 1, "asr-model")),
+                new=mock.AsyncMock(return_value=("Ein Transkript", 7, 1, "asr-model", _GERMAN)),
             ),
             mock.patch.object(
                 v2, "_generate_embedding", new=mock.AsyncMock(return_value=(normalized, 11))
@@ -522,7 +529,7 @@ class V2EndpointTests(unittest.TestCase):
             mock.patch.object(
                 v2,
                 "_transcribe_audio",
-                new=mock.AsyncMock(return_value=("Trotzdem transkribiert", 7, 1, "asr-model")),
+                new=mock.AsyncMock(return_value=("Trotzdem transkribiert", 7, 1, "asr-model", _GERMAN)),
             ),
             mock.patch.object(
                 v2,
@@ -544,7 +551,7 @@ class V2EndpointTests(unittest.TestCase):
         self.assertEqual(
             payload["result"],
             {
-                "transcript": {"text": "Trotzdem transkribiert"},
+                "transcript": {"text": "Trotzdem transkribiert", "language": "de"},
                 "embedding": None,
             },
         )
@@ -572,7 +579,7 @@ class V2EndpointTests(unittest.TestCase):
                 "Diarisiert",
             )
         )
-        transcribe = mock.AsyncMock(return_value=("Text", 7, 1, "asr"))
+        transcribe = mock.AsyncMock(return_value=("Text", 7, 1, "asr", _GERMAN))
         embedding = mock.AsyncMock(return_value=(_vector(0).tolist(), 4))
         patches = self._base_patches()
         with (
@@ -1265,6 +1272,303 @@ class V2DiarizationAssemblyTests(unittest.TestCase):
             },
             warnings,
         )
+
+
+
+COHERE = "CohereLabs/cohere-transcribe-03-2026"
+WHISPER_TURBO = "openai/whisper-large-v3-turbo"
+
+
+def _lid_result(language: str, probability: float = 0.97) -> lid.LidResult:
+    rest = (1.0 - probability) / (len(COHERE_LANGUAGE_CODES) - 1)
+    return lid.LidResult(
+        language=language,
+        probability=probability,
+        probs={code: (probability if code == language else rest) for code in COHERE_LANGUAGE_CODES},
+    )
+
+
+def _lid_settings(**values) -> dict:
+    return {
+        "local_model": COHERE,
+        "local_gpu_device": "cpu",
+        "local_model_cache_path": "",
+        "transcription_language": "auto",
+        "local_model_precision": "fp16",
+        "cohere_language_detection": True,
+        "language_detection_model": "openai/whisper-base",
+        **values,
+    }
+
+
+class _TextPerChunkManager:
+    """submit_job fake: one job per call, the text names the language and the chunk's first sample."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[list[np.ndarray], tuple]] = []
+
+    async def submit_job(self, segments, request_id, key):
+        self.calls.append((list(segments), key))
+        return [types.SimpleNamespace(text=f"{key[3]}{int(round(float(segment[0])))}") for segment in segments]
+
+
+class TranscriptLanguageDetectionTests(unittest.TestCase):
+    """Cohere + effective "auto": detect before ASR, submit with the detected language, echo what ran."""
+
+    def setUp(self) -> None:
+        self.manager = _TextPerChunkManager()
+        self.app = _CapturingApp()
+        self.app.state.whisper_batch_manager = self.manager
+        v2.create_v2_api(self.app)
+        self.endpoint = self.app.routes[("POST", "/v2/audio/process")]
+        self.request = _request(self.app)
+
+    def settings(self, **values):
+        return mock.patch.dict(v2.current_settings, _lid_settings(**values), clear=True)
+
+    def transcribe(self, audio, language=None):
+        return asyncio.run(v2._transcribe_audio(self.request, audio, language))
+
+    def test_cohere_auto_submits_the_detected_language(self) -> None:
+        audio = np.full(16000 * 8, 0.1, dtype=np.float32)
+        with self.settings(), mock.patch.object(lid, "detect_languages", return_value=[_lid_result("en")]) as detect:
+            text, _, _, _, decision = self.transcribe(audio)
+
+        detect.assert_called_once()
+        [(segments, key)] = self.manager.calls
+        self.assertEqual(key[3], "en")
+        self.assertEqual(text, "en0")
+        self.assertEqual((decision.language, decision.source), ("en", "detected"))
+        self.assertEqual(
+            decision.detection_block(),
+            {"model": "openai/whisper-base", "source": "detected", "languages": {"en": 8.0}},
+        )
+
+    def test_an_explicit_language_skips_detection(self) -> None:
+        audio = np.full(16000 * 8, 0.1, dtype=np.float32)
+        for settings, override in (({}, "fr"), ({"transcription_language": "it"}, None)):
+            with self.subTest(settings=settings, override=override):
+                self.manager.calls.clear()
+                with self.settings(**settings), mock.patch.object(lid, "detect_languages") as detect:
+                    _, _, _, _, decision = self.transcribe(audio, override)
+                detect.assert_not_called()
+                self.assertEqual(self.manager.calls[0][1][3], override or "it")
+                self.assertIsNone(decision.detection_block())
+                self.assertEqual(decision.source, "request" if override else "setting")
+
+    def test_non_cohere_and_detection_off_never_detect(self) -> None:
+        audio = np.full(16000 * 8, 0.1, dtype=np.float32)
+        for settings, applied in (({"local_model": WHISPER_TURBO}, "auto"), ({"cohere_language_detection": False}, "de")):
+            with self.subTest(settings=settings):
+                self.manager.calls.clear()
+                with (
+                    self.settings(**settings),
+                    mock.patch.object(lid, "detect_languages") as detect,
+                    mock.patch.object(v2, "split_audio_for_whisper", return_value=[audio]),
+                ):
+                    _, _, _, _, decision = self.transcribe(audio)
+                detect.assert_not_called()
+                # Whisper detects itself; Cohere without detection keeps the engine's de fallback.
+                self.assertEqual(self.manager.calls[0][1][3], "auto")
+                self.assertEqual(decision.language, applied)
+
+    def test_long_audio_with_two_languages_is_two_jobs_in_chunk_order(self) -> None:
+        audio = np.zeros(16000 * 100, dtype=np.float32)
+        chunks = [np.full(16000 * 20, float(index), dtype=np.float32) for index in range(4)]
+        detected = [_lid_result("de"), _lid_result("en"), _lid_result("de", 0.3), _lid_result("en")]
+        with (
+            self.settings(),
+            mock.patch.object(v2, "split_audio_into_superchunks", return_value=chunks),
+            mock.patch.object(lid, "detect_languages", return_value=detected),
+        ):
+            text, _, count, _, decision = self.transcribe(audio)
+
+        self.assertEqual(count, 4)
+        self.assertEqual(sorted(key[3] for _, key in self.manager.calls), ["de", "en"])
+        # The weak third chunk takes the file majority (de 20 s vs en 40 s -> en).
+        self.assertEqual(decision.languages, ["de", "en", "en", "en"])
+        self.assertEqual(text, "de0 en1 en2 en3")
+        self.assertEqual((decision.language, decision.seconds), ("en", {"de": 20.0, "en": 60.0}))
+
+    def test_endpoint_echoes_the_applied_language_and_the_detection_block(self) -> None:
+        audio = np.full(16000 * 6, 0.1, dtype=np.float32)
+        upload = _upload()
+        raw_request = json.dumps({"schema_version": "2.0", "mode": "transcript"})
+        form = FormData([("file", upload), ("request", raw_request)])
+        with (
+            self.settings(),
+            mock.patch.object(
+                v2, "_parse_multipart_parts", new=mock.AsyncMock(return_value=(form, upload, raw_request))
+            ),
+            mock.patch.object(v2, "authorize_api_key", return_value=None),
+            mock.patch.object(v2, "load_audio_file", return_value=audio),
+            mock.patch.object(v2, "_record_log"),
+            mock.patch.object(lid, "detect_languages", return_value=[_lid_result("pl")]),
+        ):
+            payload = _payload(asyncio.run(self.endpoint(self.request)))
+
+        self.assertEqual(payload["status"], "completed", payload)
+        self.assertEqual(payload["models"]["asr"]["language"], "pl")
+        self.assertEqual(
+            payload["models"]["asr"]["language_detection"],
+            {"model": "openai/whisper-base", "source": "detected", "languages": {"pl": 6.0}},
+        )
+        self.assertEqual(payload["result"]["transcript"]["language"], "pl")
+        self.assertIn("language_detection", payload["timings_ms"])
+
+    def test_unavailable_detection_transcribes_german_and_warns(self) -> None:
+        audio = np.full(16000 * 6, 0.1, dtype=np.float32)
+        failure = lid.LanguageDetectionUnavailable("Language detection model 'openai/whisper-base' is unavailable")
+        with self.settings(), mock.patch.object(lid, "detect_languages", side_effect=failure):
+            _, _, _, _, decision = self.transcribe(audio)
+        self.assertEqual(self.manager.calls[0][1][3], "de")
+        self.assertEqual((decision.language, decision.source), ("de", "fallback"))
+        self.assertEqual(decision.warnings[0]["code"], "LANGUAGE_DETECTION_UNAVAILABLE")
+
+
+class DiarizationLanguageDetectionTests(unittest.TestCase):
+    """Per-speaker language: decided once per DIA speaker before ASR, carried on segments and assignments."""
+
+    TURNS = [
+        {"start_ms": 0, "end_ms": 6000, "speaker_id": "SPEAKER_A"},
+        {"start_ms": 6000, "end_ms": 12000, "speaker_id": "SPEAKER_B"},
+        {"start_ms": 12000, "end_ms": 18000, "speaker_id": "SPEAKER_A"},
+    ]
+
+    def run_diarization(self, detected, *, pipeline="turns", settings=None, language=None):
+        clouds = {
+            "SPEAKER_A": _ready_cloud("SPEAKER_A", _vector(0)),
+            "SPEAKER_B": _ready_cloud("SPEAKER_B", _vector(1)),
+        }
+        dia_response = {
+            "model": {"id": "community-1"},
+            "diarization": self.TURNS,
+            "exclusive_diarization": self.TURNS,
+            "overlaps": [],
+        }
+        self.manager = _TextPerChunkManager()
+        app = _CapturingApp()
+        app.state.whisper_batch_manager = self.manager
+        audio = np.full(16000 * 18, 0.1, dtype=np.float32)
+        with (
+            mock.patch.dict(v2.current_settings, _lid_settings(**(settings or {})), clear=True),
+            mock.patch.object(v2, "diarize_v2", new=mock.AsyncMock(return_value=dia_response)),
+            mock.patch.object(v2, "_extract_speaker_clouds", new=mock.AsyncMock(return_value=clouds)),
+            mock.patch.object(lid, "detect_languages", return_value=detected) as detect,
+        ):
+            processed = asyncio.run(
+                v2._process_diarization(
+                    _request(app),
+                    _upload(),
+                    audio,
+                    {"expected_speakers": 2, "known_speakers": [], "speaker_refinement": "off"},
+                    False,
+                    False,
+                    pipeline,
+                    language,
+                )
+            )
+        return processed, detect
+
+    def test_each_speaker_is_transcribed_and_reported_in_its_language(self) -> None:
+        (result, timings, models, warnings, _), detect = self.run_diarization([_lid_result("en"), _lid_result("de")])
+
+        detect.assert_called_once()
+        self.assertEqual(len(detect.call_args.args[0]), 2)  # one pooled window per speaker, one pass
+        self.assertEqual(sorted(key[3] for _, key in self.manager.calls), ["de", "en"])
+        self.assertEqual(
+            [
+                (segment["diarization_speaker_id"], segment["language"], segment["text"])
+                for segment in result["transcript"]["segments"]
+            ],
+            [("SPEAKER_A", "en", "en0"), ("SPEAKER_B", "de", "de0"), ("SPEAKER_A", "en", "en0")],
+        )
+        assignments = {item["diarization_speaker_id"]: item for item in result["speaker_assignments"]}
+        self.assertEqual(
+            (assignments["SPEAKER_A"]["language"], assignments["SPEAKER_A"]["language_source"]), ("en", "detected")
+        )
+        self.assertEqual(
+            (assignments["SPEAKER_B"]["language"], assignments["SPEAKER_B"]["language_source"]), ("de", "detected")
+        )
+        self.assertEqual(models["asr"]["language"], "en")
+        self.assertEqual(
+            models["asr"]["language_detection"],
+            {"model": "openai/whisper-base", "source": "detected", "languages": {"de": 6.0, "en": 12.0}},
+        )
+        self.assertEqual(result["transcript"]["language"], "en")
+        self.assertIn("language_detection", timings)
+        self.assertEqual(warnings, [])
+
+    def test_a_weak_speaker_takes_the_majority_of_the_confident_ones(self) -> None:
+        (result, _, _, _, _), _ = self.run_diarization([_lid_result("fr"), _lid_result("de", 0.2)])
+        assignments = {item["diarization_speaker_id"]: item for item in result["speaker_assignments"]}
+        self.assertEqual(
+            (assignments["SPEAKER_B"]["language"], assignments["SPEAKER_B"]["language_source"]), ("fr", "majority")
+        )
+        self.assertEqual([key[3] for _, key in self.manager.calls], ["fr"])
+
+    def test_an_explicit_language_runs_no_detection(self) -> None:
+        (result, _, models, _, _), detect = self.run_diarization([], language="it")
+        detect.assert_not_called()
+        self.assertEqual([key[3] for _, key in self.manager.calls], ["it"])
+        self.assertTrue(all(segment["language"] == "it" for segment in result["transcript"]["segments"]))
+        self.assertEqual(
+            {(item["language"], item["language_source"]) for item in result["speaker_assignments"]},
+            {("it", "request")},
+        )
+        self.assertNotIn("language_detection", models["asr"])
+
+    def _run_wxc(self, regions, speaker_languages, settings=None):
+        manager = _TextPerChunkManager()
+        app = _CapturingApp()
+        app.state.whisper_batch_manager = manager
+        align = mock.AsyncMock(return_value=[])
+        with (
+            mock.patch.dict(v2.current_settings, _lid_settings(**(settings or {})), clear=True),
+            mock.patch.object(v2, "silero_frame_probs", return_value=np.ones(4)),
+            mock.patch.object(v2, "speech_regions_from_probs", return_value=regions),
+            mock.patch.object(v2, "_align_words_sliced", new=align),
+            mock.patch.object(v2, "plan_verification_windows", return_value=([], [])),
+            mock.patch.object(v2, "finish_verification", return_value={}),
+        ):
+            _, _, diagnostics, _ = asyncio.run(
+                v2._wxc_transcribe_segments(
+                    _request(app),
+                    np.zeros(16000 * 18, dtype=np.float32),
+                    self.TURNS,
+                    [],
+                    False,
+                    None,
+                    speaker_languages,
+                )
+            )
+        return manager, align, diagnostics
+
+    def test_wxc_with_one_language_keeps_todays_chunking(self) -> None:
+        regions = [(0.2, 5.8), (6.1, 11.7), (12.2, 17.5)]
+        single = v2.SpeakerLanguages({"SPEAKER_A": "en", "SPEAKER_B": "en"}, {}, "en")
+        before, before_align, _ = self._run_wxc(regions, None, {"transcription_language": "de"})
+        after, after_align, _ = self._run_wxc(regions, single)
+
+        self.assertEqual(len(before.calls), 1)
+        self.assertEqual(len(after.calls), 1)
+        self.assertEqual(before_align.await_args.args[2], after_align.await_args.args[2])
+        self.assertEqual(
+            [len(segment) for segment in before.calls[0][0]], [len(segment) for segment in after.calls[0][0]]
+        )
+        self.assertEqual((before.calls[0][1][3], after.calls[0][1][3]), ("de", "en"))
+
+    def test_wxc_with_two_languages_never_mixes_them_in_one_chunk(self) -> None:
+        languages = v2.SpeakerLanguages({"SPEAKER_A": "en", "SPEAKER_B": "de"}, {}, "en")
+        manager, align, diagnostics = self._run_wxc([(0.2, 17.5)], languages)
+
+        chunks = align.await_args.args[2]
+        texts = align.await_args.args[3]
+        # Chunks in time order, cut at the turn boundaries, each transcribed in its speaker's language.
+        self.assertEqual(chunks, [(0.2, 6.0), (6.0, 12.0), (12.0, 17.5)])
+        self.assertEqual([text[:2] for text in texts], ["en", "de", "en"])
+        self.assertEqual(sorted(key[3] for _, key in manager.calls), ["de", "en"])
+        self.assertEqual(diagnostics["superchunk_languages"], {"de": 1, "en": 2})
 
 
 if __name__ == "__main__":

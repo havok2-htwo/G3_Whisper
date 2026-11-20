@@ -48,6 +48,9 @@ CHUNK_PAD_S = 0.25                 # never clip a word at chunk edges
 # the recording is cut into superchunks so the scheduler can interleave other
 # requests between them instead of holding the GPU for one monolithic call.
 WHOLE_AUDIO_MAX_S = 60.0
+# A language piece shorter than this inside one Silero region joins its
+# neighbour instead of becoming its own chunk (see _absorb_language_slivers).
+WXC_LANGUAGE_MIN_PIECE_S = 0.5
 
 # --- sentence-level 192D verification (validated: words <0.6s are noise,
 # sentences >=2s reach ~0.82 median cosine to their own speaker core) ---
@@ -178,6 +181,86 @@ def build_superchunks(regions: Sequence[tuple[float, float]]) -> list[tuple[floa
         else:
             chunks.append([a, b])
     return [(a, b) for a, b in chunks]
+
+
+def _language_at(moment: float, language_spans: Sequence[tuple[float, float, str]]) -> str:
+    """Language of the span covering ``moment``, else of the nearest span (as words find their speaker)."""
+
+    for start, end, language in language_spans:
+        if start <= moment <= end:
+            return language
+    return min(
+        language_spans,
+        key=lambda span: (span[0] - moment) if moment < span[0] else (moment - span[1]),
+    )[2]
+
+
+def _absorb_language_slivers(pieces: list[list[Any]]) -> list[list[Any]]:
+    """Fold sub-WXC_LANGUAGE_MIN_PIECE_S pieces into a neighbour of the same region.
+
+    A turn boundary a few hundred ms inside a Silero region is DIA jitter, not a
+    language change; as its own chunk it would reach Cohere as a sliver it fills
+    with hallucinated text.
+    """
+
+    out: list[list[Any]] = []
+    for piece in pieces:
+        if out and piece[1] - piece[0] < WXC_LANGUAGE_MIN_PIECE_S:
+            out[-1][1] = piece[1]
+        elif len(out) == 1 and out[0][1] - out[0][0] < WXC_LANGUAGE_MIN_PIECE_S:
+            out[0] = [out[0][0], piece[1], piece[2]]
+        else:
+            out.append(list(piece))
+        if len(out) >= 2 and out[-2][2] == out[-1][2]:
+            out[-2][1] = out[-1][1]
+            out.pop()
+    return out
+
+
+def build_language_superchunks(
+    regions: Sequence[tuple[float, float]],
+    language_spans: Sequence[tuple[float, float, str]],
+) -> tuple[list[tuple[float, float]], list[str]]:
+    """Superchunks that never mix two languages, plus each chunk's language, in time order.
+
+    ``language_spans`` are the gated turns as (start s, end s, language of their
+    speaker). Every Silero region is cut where the covering turn's language
+    changes (speech outside any turn belongs to the nearest one), then the
+    pieces merge to ~SUPERCHUNK_TARGET_S exactly like build_superchunks, but a
+    chunk only grows while the language stays the same. With a single language
+    the result equals build_superchunks(regions).
+    """
+
+    spans = sorted(language_spans)
+    if not spans:
+        chunks = build_superchunks(regions)
+        return chunks, []
+    pieces: list[list[Any]] = []
+    for region_start, region_end in regions:
+        cuts = sorted(
+            {region_start, region_end}
+            | {point for start, end, _ in spans for point in (start, end) if region_start < point < region_end}
+        )
+        region_pieces: list[list[Any]] = []
+        for start, end in zip(cuts, cuts[1:]):
+            if end <= start:
+                continue
+            language = _language_at((start + end) / 2.0, spans)
+            if region_pieces and region_pieces[-1][2] == language:
+                region_pieces[-1][1] = end
+            else:
+                region_pieces.append([start, end, language])
+        pieces.extend(_absorb_language_slivers(region_pieces))
+
+    chunks: list[list[float]] = []
+    languages: list[str] = []
+    for start, end, language in pieces:
+        if chunks and languages[-1] == language and end - chunks[-1][0] <= SUPERCHUNK_TARGET_S:
+            chunks[-1][1] = end
+        else:
+            chunks.append([start, end])
+            languages.append(language)
+    return [(a, b) for a, b in chunks], languages
 
 
 def padded_chunk_audio(audio: np.ndarray, chunks: Sequence[tuple[float, float]]) -> list[np.ndarray]:

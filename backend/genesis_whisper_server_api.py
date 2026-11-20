@@ -15,6 +15,7 @@ from .genesis_whisper_server_chunking import combine_transcription_chunks, split
 from .genesis_whisper_server_globals import (
     current_settings,
     get_effective_transcription_language,
+    language_detection_applies,
     settings_lock,
     uses_whole_audio_backend,
 )
@@ -24,6 +25,7 @@ from .genesis_whisper_server_local_asr_engine import (
     load_local_asr_model,
     transcribe_local_asr_batch,
 )
+from .genesis_whisper_server_lid import decide_item_languages, submit_by_language
 from .genesis_whisper_server_storage import log_transcription
 from .genesis_whisper_server_vid import generate_voice_vector
 from .genesis_whisper_server_wxc import split_audio_into_superchunks
@@ -122,13 +124,21 @@ def create_api(app: FastAPI) -> FastAPI:
         else:
             segmented_audio = await asyncio.to_thread(split_audio_for_whisper, audio_data)
         segment_count = len(segmented_audio)
+        # Cohere + "auto": detect per ASR item (one job per detected language), exactly like /v2/audio/process.
+        item_languages = None
+        if segment_count and language_detection_applies(model_id, local_processing_key[3]):
+            decision = await decide_item_languages(request.app.state.local_gpu_lock, segmented_audio)
+            item_languages = decision.languages
+            effective_language = decision.language
 
         if segment_count == 0:
             transcription_text = ""
             transcription_duration_ms = 0
         else:
             try:
-                batch_results = await batch_manager.submit_job(segmented_audio, request_id, local_processing_key)
+                batch_results = await submit_by_language(
+                    batch_manager, segmented_audio, local_processing_key, item_languages, request_id
+                )
             except ModelFailoverError as exc:
                 raise HTTPException(status_code=503, detail=str(exc)) from exc
             model_id = served_model_id(batch_results, model_id)
@@ -203,6 +213,8 @@ def create_api(app: FastAPI) -> FastAPI:
 
         response_data = {
             "transcription": transcription_text,
+            # The language the ASR model ran with (the detected one for Cohere + "auto").
+            "language": effective_language,
             "total_duration_ms": total_duration_ms,
             "transcription_duration_ms": transcription_duration_ms,
         }
@@ -258,7 +270,7 @@ def create_api(app: FastAPI) -> FastAPI:
         elif response_format == "verbose_json":
             return {
                 "task": "transcribe",
-                "language": current_settings.get("transcription_language", "auto"),
+                "language": response.get("language") or current_settings.get("transcription_language", "auto"),
                 "duration": response.get("transcription_duration_ms", 0) / 1000.0,
                 "text": transcription_text,
                 "segments": []

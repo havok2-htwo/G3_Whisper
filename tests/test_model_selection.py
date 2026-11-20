@@ -1181,11 +1181,24 @@ class ClientDiscoveryTests(unittest.TestCase):
             {"id": COHERE_MODEL_ID, "label": "Cohere Transcribe 03/2026", "backend": "cohere_transcribe", "loaded": True},
         )
         language = body["language"]
-        self.assertEqual((language["configured"], language["effective"], language["applied"]), ("auto", "de", True))
+        # Detection is on by default: Cohere's "auto" is resolved per request, not pinned to German.
+        self.assertEqual((language["configured"], language["effective"], language["applied"]), ("auto", "auto", True))
+        self.assertEqual(language["detection"], {"enabled": True, "model": "openai/whisper-base", "loaded": False})
         self.assertEqual(language["options"][:2], ["auto", "de"])
         self.assertEqual(body["modes"], ["embedding", "transcript", "transcript_embedding", "diarization"])
         self.assertEqual(body["embedding"], {"id": "ReDimNet2-B6"})
         self.assertTrue(body["diarization"]["configured"])
+
+    def test_cohere_auto_is_german_when_detection_is_off_or_its_model_broken(self) -> None:
+        self.use_settings(cohere_language_detection=False)
+        language = self.capabilities()["language"]
+        self.assertEqual((language["effective"], language["detection"]["enabled"]), ("de", False))
+
+        self.use_settings()
+        broken = {"model": "openai/whisper-base", "loaded": False, "error": "OSError: no snapshot"}
+        with mock.patch.object(v2, "lid_status", return_value=broken):
+            language = self.capabilities()["language"]
+        self.assertEqual((language["effective"], language["detection"]["enabled"]), ("de", True))
 
     def test_language_is_not_applied_on_parakeet_but_options_stay_global(self) -> None:
         cohere_options = self.capabilities()["language"]["options"]
