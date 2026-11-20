@@ -421,6 +421,27 @@ Currently available:
 - `openai/whisper-base`
 - `openai/whisper-tiny`
 
+### Cohere Language Detection
+
+Cohere Transcribe takes the language as its decoder prompt and cannot detect it. With an effective language `auto`
+(request `auto` or none, server setting `auto`) and `cohere_language_detection` on (default), the server asks a small
+Whisper model (`language_detection_model`, default `openai/whisper-base`, about 0.15 GB) for the language before ASR:
+one encoder pass per 30 s window, one decoder step, a softmax over only the 14 Cohere languages
+([backend/genesis_whisper_server_lid.py](x:/dev/G3_WHISPER/backend/genesis_whisper_server_lid.py)).
+
+- Clips up to 60 s get one decision; long files one per ~25 s superchunk, smoothed over the file (a chunk below 0.5
+  confidence takes the duration-weighted majority). Each language becomes its own ASR job, texts keep their order.
+- Diarization decides once per DIA speaker from up to 30 s of the speaker's clean windows (the speaker keeps one language);
+  weak speakers take the confident speakers' majority. WXC chunks are cut at language changes, a single-language file is
+  chunked exactly as before.
+- An explicit language always wins. Whisper detects by itself, Parakeet ignores the language: neither runs detection.
+- The detector loads from the model cache (downloaded on first use), follows `local_gpu_device` (FP16 on CUDA, FP32 on
+  CPU), runs under the GPU lock in slices and is warmed at startup when Cohere is active. If it cannot be loaded, Cohere
+  falls back to `de` (`COHERE_FALLBACK_LANGUAGE`) and the response carries `LANGUAGE_DETECTION_UNAVAILABLE`.
+- Measured on the owner's recordings on CPU, whisper-base: 100 % on 30 s windows, 95.5 % on 4 s crops, 83.6 % on 2 s.
+- Known limitation: the diarization text cleanup drops CJK/kana/Hangul and WXC alignment keeps only Latin-letter words,
+  so `zh`/`ja`/`ko`/`ar`/`el` diarization text is lossy.
+
 Voice embedding is not an admin-selectable ASR model. Every public embedding path uses
 the fixed ReDimNet2-B6 LM checkpoint described above; it is downloaded lazily into the
 configured model cache and verified against its pinned SHA-256 before use.
@@ -773,6 +794,8 @@ Plain defaults:
 - `batch_max_audio_seconds`: `100.0`
 - `cuda_memory_trim_after_batch`: `true`
 - `cohere_cuda_graphs`: `true` (applies on the next model load)
+- `cohere_language_detection`: `true` (Cohere + `auto` detects the language per request; off means `de`)
+- `language_detection_model`: `openai/whisper-base` (or `openai/whisper-small`, `openai/whisper-large-v3-turbo`; applies on save, never reloads the ASR model)
 - `redimnet_max_batch_size`: `8` (1/2/4/8; applies on save, no restart)
 - `debug_retain_history_audio`: `false`
 - `huggingface_token`: empty string
@@ -831,7 +854,8 @@ order in the admin is: pick the model, then its presets, then its settings.
 - A model selected for the first time starts from the tier it owns (Cohere `24GB VRAM`,
   Parakeet `Parakeet 8GB VRAM`), a Whisper size keeps the current values. In both cases it
   takes the old model's effective language, so clients keep getting the same language:
-  `/transcribe/` and `/v1/audio/transcriptions` cannot send one, and Cohere's `auto` means `de`.
+  `/transcribe/` and `/v1/audio/transcriptions` cannot send one. Cohere's `auto` stays `auto` while
+  language detection is on (the next model detects too) and means `de` when it is off.
 - `model_profiles` is one extra key in the settings file. All other keys stay top-level, so
   provisioning scripts keep editing them directly, and `PUT` with `local_model` keeps working.
 - The admin form sends `expected_local_model` with `PUT`. When another model became active

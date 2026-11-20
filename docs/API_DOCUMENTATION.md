@@ -84,19 +84,65 @@ The request JSON accepts an optional top-level `language`. Accepted values are
 `ar`, `de`, `el`, `en`, `es`, `fr`, `it`, `ja`, `ko`, `nl`, `pl`, `pt`, `vi`, `zh`
 
 which are exactly the 14 languages the Cohere Transcribe model supports (its
-remote code hard-validates this list and raises on anything else). Cohere has no
-automatic language detection, so `auto` resolves to `de` on the Cohere backend;
-on Whisper backends `auto` enables Whisper's own detection. Note that Cohere
-treats the language as a decoder prompt prior, not a hard constraint: clearly
-spoken passages in another supported language may still be transcribed in that
-language (relevant for code-switched meetings).
+remote code hard-validates this list and raises on anything else). On Whisper
+backends `auto` enables Whisper's own detection; Parakeet ignores the language.
+Note that Cohere treats the language as a decoder prompt prior, not a hard
+constraint: clearly spoken passages in another supported language may still be
+transcribed in that language (relevant for code-switched meetings).
 
 The field overrides the saved server language for the ASR of this request in
 `transcript`, `transcript_embedding`, and `diarization` mode. In `embedding`
-mode it is rejected with HTTP 422 because no ASR runs. `models.asr.language` in
-the response echoes the effective value. The heavy diarization pipeline never
-runs in the other modes; their processing is unchanged apart from the optional
-language override.
+mode it is rejected with HTTP 422 because no ASR runs. The heavy diarization
+pipeline never runs in the other modes; their processing is unchanged apart from
+the optional language override.
+
+#### Language detection on Cohere (`auto`)
+
+Cohere cannot detect a language. When the effective language is `auto` (the
+request sends `auto` or no `language`, and the server setting is `auto`) and the
+admin setting `cohere_language_detection` is on (default), the server detects
+the language before ASR with a small Whisper model (`language_detection_model`,
+default `openai/whisper-base`). It only reads Whisper's language token: one
+encoder pass per 30 s window, restricted to the 14 Cohere languages, so the
+result is always a language Cohere accepts. An explicit language (request or
+server setting) always wins and runs no detection; Whisper and Parakeet backends
+never run it.
+
+- `transcript` / `transcript_embedding`: a clip up to 60 s gets one decision
+  (one window up to 30 s, two windows pooled for 30-60 s). A longer file is
+  detected per ~25 s superchunk in one batched pass; a chunk below 0.5 confidence
+  takes the file's duration-weighted majority. Each language is submitted as its
+  own ASR job and the texts are joined in the original order.
+- `diarization`: the language is decided once per DIA speaker (a speaker keeps
+  one language for the file), from up to 30 s of that speaker's best clean
+  windows. A speaker with under 1 s of speech or below 0.5 confidence takes the
+  majority of the confidently detected speakers, else `de`. The WXC chunks are
+  cut at every language change, so no ASR chunk mixes two languages; with a
+  single language the chunking is exactly the same as without detection.
+- Less than 1 s of audio, or a detection model that cannot be loaded, gives `de`
+  as before. A load or runtime failure adds the warning
+  `LANGUAGE_DETECTION_UNAVAILABLE` (status `partial`); it never fails the request.
+
+Response fields (all additive):
+
+- `models.asr.language`: the language the ASR really ran with (the dominant one
+  by speech seconds when several were used), never `auto` on Cohere.
+- `models.asr.language_detection`, only when detection ran:
+  `{"model": "openai/whisper-base", "source": "detected" | "fallback", "languages": {"en": 42.5, "de": 12.0}}`.
+  `languages` are speech seconds per applied language; `fallback` means nothing
+  could be detected and `de` was used.
+- `result.transcript.language`: the same dominant language.
+- `diarization` segments carry `language`; every `speaker_assignments[]` entry
+  carries `language` and `language_source` (`detected`, `majority`, `fallback`,
+  or `request` / `setting` when no detection ran).
+- `timings_ms.language_detection` when detection ran;
+  `result.chunking.superchunk_languages` (chunks per language) on the WXC path.
+
+Known limitations: the turn gate's text cleanup removes CJK, kana and Hangul,
+and WXC word alignment keeps only words with Latin letters, so `zh`/`ja`/`ko`
+and `ar`/`el` diarization text is lossy even when the language is detected
+correctly (`transcript` modes are not affected). `known_speakers[].language` is
+not accepted yet; a client-side language hint per profile is a possible follow-up.
 
 Only `diarization` contacts the configured DIA server. Recording-level embeddings in
 the other modes use VAD, fixed three-second windows, batched inference, quality
@@ -628,8 +674,9 @@ Response shape:
   },
   "language": {
     "configured": "auto",
-    "effective": "de",
+    "effective": "auto",
     "applied": true,
+    "detection": { "enabled": true, "model": "openai/whisper-base", "loaded": true },
     "options": ["auto", "de", "en"]
   },
   "modes": ["embedding", "transcript", "transcript_embedding", "diarization"],
@@ -641,7 +688,8 @@ Response shape:
 Notes:
 
 - `model` is the admin's selection. `loaded` is false while another model or no model is resident, the next request then loads it.
-- `language.effective` is what `auto` means on this model: `de` on Cohere, detection (`auto`) on Whisper.
+- `language.effective` is what `auto` means on this model: detection (`auto`) on Whisper, and on Cohere while `language.detection.enabled` is true and its model has not failed to load; `de` on Cohere otherwise.
+- `language.detection` describes the Cohere language detection: the admin switch, the configured model and whether it is resident (it loads at startup on Cohere, otherwise on first use).
 - `language.applied` is false on Parakeet: that engine detects the language itself and ignores the setting and a v2 `language`.
 - `language.options` is the global list `POST /v2/audio/process` validates against, it does not change with the model.
 - `diarization.configured` means a usable DIA URL exists, the built-in default counts. It does not test that the DIA server is up, `POST /api/admin/dia/test` does.
@@ -682,10 +730,13 @@ Success response without voice embedding:
 ```json
 {
   "transcription": "Hallo Welt",
+  "language": "de",
   "total_duration_ms": 842,
   "transcription_duration_ms": 611
 }
 ```
+
+`language` (additive) is the language the ASR model ran with: the detected one for Cohere with the saved language `auto` (see [Language detection on Cohere](#language-detection-on-cohere-auto)), else the effective saved language.
 
 Success response with voice embedding:
 
@@ -768,6 +819,7 @@ Compatibility notes:
 - it always uses the active local server model
 - `response_format` affects the response body
 - `model`, `language`, `prompt`, and `temperature` are currently accepted for compatibility but are not applied independently from the saved server settings yet
+- with Cohere and the saved language `auto`, the language is detected per request like on `/v2/audio/process`; `verbose_json` reports the language that was applied
 - exact-pattern repetition filtering is enabled by default; `X-G3-Repetition-Filter: off` disables it without changing the selected response shape
 
 Response shapes:
@@ -911,6 +963,8 @@ Response shape:
     "batch_max_audio_seconds": 100.0,
     "cuda_memory_trim_after_batch": true,
     "cohere_cuda_graphs": true,
+    "cohere_language_detection": true,
+    "language_detection_model": "openai/whisper-base",
     "redimnet_max_batch_size": 8,
     "debug_retain_history_audio": false,
     "huggingface_token": "hf_xxx",
@@ -944,6 +998,9 @@ Response shape:
     ],
     "languages": [
       { "label": "German (de)", "value": "de" }
+    ],
+    "language_detection_models": [
+      { "label": "Whisper Base (74M, about 0.15 GB)", "value": "openai/whisper-base" }
     ]
   },
   "models": [
@@ -971,7 +1028,7 @@ Response shape:
   ],
   "model_fields": {
     "whisper": ["local_gpu_device", "batch_wait_time_ms", "local_model_precision", "transcription_language"],
-    "cohere_transcribe": ["local_gpu_device", "local_model_precision", "transcription_language", "cohere_cuda_graphs"],
+    "cohere_transcribe": ["local_gpu_device", "local_model_precision", "transcription_language", "cohere_cuda_graphs", "cohere_language_detection", "language_detection_model"],
     "parakeet": ["local_gpu_device", "batch_wait_time_ms"]
   },
   "service_fields": [
@@ -1007,6 +1064,8 @@ Request body:
   "batch_max_audio_seconds": 100.0,
   "cuda_memory_trim_after_batch": true,
   "cohere_cuda_graphs": true,
+  "cohere_language_detection": true,
+  "language_detection_model": "openai/whisper-base",
   "redimnet_max_batch_size": 8,
   "debug_retain_history_audio": false,
   "huggingface_token": "hf_xxx",
@@ -1040,6 +1099,7 @@ Notes:
 - `scheduler_first_chunk_fast_path` (default `true`) gives a request that has not been served yet a small batch of its own instead of a seat in a full batch of a long recording; batches are always shared round-robin between active requests.
 - `cuda_memory_trim_after_batch` defaults to `true`: once every local GPU phase (ASR batches, ReDimNet clouds, MMS_FA alignment, verification, embeddings, startup warmups, model reloads) has been quiet for 5 s, Whisper releases the unused process-wide CUDA allocator pool so the idle footprint stays near the model floor on a shared GPU; the next request re-reserves its pool (about +80 ms once for a ReDimNet batch). Disable it only on a dedicated GPU.
 - `cohere_cuda_graphs` defaults to `true`: for the Cohere model on CUDA in `fp16`/`bf16`, encoder and greedy decoder run as captured CUDA graphs (2 s clip ~270 -> 30 ms, 14 s file ~0.9 -> 0.12 s on an RTX 4090, identical transcripts) for ~0.55 GB of graph memory after warmup and a hard cap of 1.5 GB. Changing it does not reload the model (`model_reloaded` stays `false`); it applies on the next model load (server restart or a change of model, device, precision or cache path). Other precisions and Whisper models ignore it. A snapshot without `generation_config.json` no longer disables the graphs: the missing eos/pad token ids are taken from the model config or the tokenizer (logged as a warning).
+- `cohere_language_detection` (strict boolean, default `true`) turns on language detection for Cohere with an effective language `auto` (see [Language detection on Cohere](#language-detection-on-cohere-auto)); off, Cohere's `auto` is `de` as before. `language_detection_model` picks the detector: `openai/whisper-base` (default, about 0.15 GB), `openai/whisper-small` or `openai/whisper-large-v3-turbo`; an unknown id falls back to the default. The detector is loaded from the model cache (`local_model_cache_path`, downloaded on first use with the saved Hugging Face token), follows `local_gpu_device` (FP16 on CUDA, FP32 on CPU) and is warmed at startup when Cohere is active. Changing either key never reloads the ASR model (`model_reloaded` stays `false`): a changed model or the switch turned off unloads the old detector right away, the next request loads the new one. Neither key is a preset key, so loading a preset never turns detection off.
 - `redimnet_max_batch_size` (default `8`, allowed `1`/`2`/`4`/`8`; other numbers snap down to the next allowed value, a non-number falls back to `8`) is the largest ReDimNet CUDA batch for speaker clouds, verification and embeddings. The reserved pool scales with it (RTX 5090: 746 / 1442 / 2816 MiB for 2 / 4 / 8; 60-min diarization 23.2 s at 4 vs 19.6 s at 8). It applies on save without a restart: a loaded ReDimNet is re-warmed for the new buckets and its old pool released (`model_reloaded` stays `false`).
 - ReDimNet and MMS_FA alignment run on the `local_gpu_device` card like the ASR model; changing the device moves them on save.
 - `debug_retain_history_audio` defaults to `false`. When enabled, successful public API requests may retain their byte-identical original upload for the 25-row admin history; disabling it blocks access immediately and purges retained audio after active readers finish.
@@ -1229,7 +1289,7 @@ Behavior:
 
 - the tuned values of the old model go to its profile in `model_profiles`, the target's profile applies. Tuned are the preset keys without `local_model` and `local_gpu_device`, plus `transcription_language`.
 - a target without a profile starts from the tier it owns (Cohere `24GB VRAM`, Parakeet `Parakeet 8GB VRAM`), a Whisper size keeps the current values
-- the language must not change for clients: a target without a profile takes the old model's effective language, so Cohere with `auto` hands `de` to the next model
+- the language must not change for clients: a target without a profile takes the old model's effective language. Cohere with `auto` and language detection on hands `auto` to the next model (Whisper then detects by itself); with detection off it hands `de`
 - device, cache path, token, DIA settings and the debug audio switch do not move
 - the settings are saved first, then the model loads under the GPU lock and ReDimNet and MMS_FA are re-prepared when needed, the same path as `PUT /api/admin/settings`
 - the same model while it is loaded is a no-op with `ok: true` and `model_reloaded: false`
@@ -1520,7 +1580,7 @@ Special case:
 - upload decoding runs outside the async request loop and does not first copy the complete upload into a second in-memory bytes object
 - v2 diarization rewinds and streams the original spooled upload to DIA without creating another full-file RAM copy
 - Whisper chunking currently uses the energy-based speech detector
-- Cohere uses the active saved language, and when the server setting is `auto`, it falls back to `de`
+- Cohere uses the active saved language; with `auto` it detects the language per request (see [Language detection on Cohere](#language-detection-on-cohere-auto)) and falls back to `de` when detection is off, impossible or unavailable
 - For gated Cohere models, the runtime loader reuses the saved Hugging Face token and completes incomplete local snapshots before loading from the finished local snapshot.
 - admin benchmark and public transcription log into [`logs`](x:/dev/G3_WHISPER/logs)
 - optional history debug audio lives under `logs/debug-audio`, is never written into JSONL, and is purged on start, shutdown, or setting disable; capture time is reported separately and is excluded from pipeline phase timings
