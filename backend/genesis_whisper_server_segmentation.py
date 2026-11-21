@@ -6,9 +6,9 @@ classifier over 3 local speakers with at most 2 active at once. It answers, per 
 up to three local speakers talks. The server uses it for the speech/overlap count of the DIA-free diarization and for
 the live ``speaker_turns`` speech mask; speaker identity comes from ReDimNet (``genesis_whisper_server_vid``).
 
-Neither pyannote.audio nor asteroid are dependencies: the network is rebuilt here with the same parameter names, and
+Neither the pyannote library nor asteroid is a dependency: the network is rebuilt here with the same parameter names, and
 the weights are read from the pyannote Lightning checkpoint through a restricted unpickler (see
-``load_checkpoint_state``). Inference slides exactly like ``pyannote.audio.Inference`` with ``skip_aggregation``:
+``load_checkpoint_state``). Inference slides exactly like pyannote's ``Inference`` with ``skip_aggregation``:
 10 s chunks, 1 s step, the last incomplete chunk zero-padded, powerset output converted to hard multilabel.
 Nothing is ever downloaded; the checkpoint comes from the ``segmentation_model_path`` setting or the local HF cache.
 """
@@ -201,7 +201,7 @@ def _plain(value: Any) -> Any:
 
 
 # ---------------------------------------------------------------------------
-# Network (parameter names follow pyannote.audio PyanNet / asteroid ParamSincFB)
+# Network (parameter names follow pyannote's PyanNet / asteroid ParamSincFB)
 # ---------------------------------------------------------------------------
 
 class ParamSincFB(nn.Module):
