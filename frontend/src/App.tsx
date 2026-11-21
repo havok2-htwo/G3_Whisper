@@ -123,6 +123,9 @@ const emptySettings: AdminSettings = {
   huggingface_token: "",
   dia_server_base_url: "",
   dia_api_key: "",
+  diarization_engine: "dia",
+  segmentation_model_path: "",
+  speaker_turns_enabled: true,
   dia_api_key_configured: false,
   dia_api_key_source: "none",
   dia_server_base_url_effective: "",
@@ -2853,6 +2856,84 @@ export default function App() {
                           </p>
                         )}
                       </div>
+                    </div>
+                  </div>
+                )}
+
+                {(serviceFields.includes("diarization_engine")
+                  || serviceFields.includes("segmentation_model_path")
+                  || serviceFields.includes("speaker_turns_enabled")) && (
+                  <div className="dia-settings full-width">
+                    <div className="settings-subheading">
+                      <div>
+                        <span className="eyebrow">Diarization</span>
+                        <h3>Engine and Live Speaker Turns</h3>
+                      </div>
+                    </div>
+
+                    <div className="dia-settings-grid">
+                      {serviceFields.includes("diarization_engine") && (
+                        <>
+                          <label className="full-width">
+                            <span>Diarization engine</span>
+                            <select
+                              value={settingsForm.diarization_engine}
+                              onChange={(event) =>
+                                updateSetting("diarization_engine", event.target.value === "local" ? "local" : "dia")
+                              }
+                            >
+                              {(settingsOptions.diarization_engines ?? [
+                                { label: "G3_DIA server", value: "dia" },
+                                { label: "Local (seg-3.0 + ReDimNet2)", value: "local" },
+                              ]).map((option) => (
+                                <option key={option.value} value={option.value}>
+                                  {option.label}
+                                </option>
+                              ))}
+                            </select>
+                          </label>
+                          <p className="field-note full-width">
+                            G3_DIA server: diarization mode asks the DIA server above. Local: this server runs the
+                            pyannote segmentation-3.0 network and ReDimNet2 itself, no DIA server needed; without a
+                            segmentation checkpoint diarization answers 503 MODEL_UNAVAILABLE (no fallback to DIA).
+                          </p>
+                        </>
+                      )}
+
+                      {serviceFields.includes("segmentation_model_path") && (
+                        <>
+                          <label className="full-width">
+                            <span>Segmentation checkpoint</span>
+                            <input
+                              type="text"
+                              placeholder="Empty: pyannote segmentation-3.0 from the local Hugging Face cache"
+                              value={settingsForm.segmentation_model_path}
+                              onChange={(event) => updateSetting("segmentation_model_path", event.target.value)}
+                            />
+                          </label>
+                          <p className="field-note full-width">
+                            Path to a <code>pytorch_model.bin</code> of pyannote segmentation-3.0 (about 6 MB). Empty
+                            searches the model cache; nothing is ever downloaded.
+                          </p>
+                        </>
+                      )}
+
+                      {serviceFields.includes("speaker_turns_enabled") && (
+                        <label className="settings-checkbox full-width">
+                          <input
+                            type="checkbox"
+                            checked={settingsForm.speaker_turns_enabled}
+                            onChange={(event) => updateSetting("speaker_turns_enabled", event.target.checked)}
+                          />
+                          <span>
+                            Offer live speaker turns
+                            <small>
+                              Transcript requests may carry <code>speaker_turns</code> (live text speakers in Genesis3).
+                              Offered in <code>/v2/capabilities</code> only while the segmentation checkpoint loads.
+                            </small>
+                          </span>
+                        </label>
+                      )}
                     </div>
                   </div>
                 )}

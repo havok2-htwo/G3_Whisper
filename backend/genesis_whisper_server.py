@@ -175,6 +175,19 @@ def _warmup_lid() -> None:
         print(f"[WARMUP-LID] nicht-kritischer Warmup-Fehler ({type(exc).__name__}: {exc}).", file=sys.stderr)
 
 
+def _warmup_segmentation() -> None:
+    """Eager-load seg-3.0 and warm ReDimNet's 1.5 s shapes, only when the local diarization engine or speaker_turns
+    uses them. Best-effort like the other warmups: a failure leaves the lazy load in place (speaker_turns is then
+    not offered while the checkpoint cannot be loaded)."""
+
+    try:
+        from .genesis_whisper_server_diarization_engine import warmup_segmentation
+
+        warmup_segmentation()
+    except Exception as exc:
+        print(f"[WARMUP-SEG] nicht-kritischer Warmup-Fehler ({type(exc).__name__}: {exc}).", file=sys.stderr)
+
+
 async def startup_server(app: FastAPI):
     print("--- GENESIS Transcription Server wird gestartet (FastAPI + React + lokales ASR-Batching) ---", file=sys.stderr)
 
@@ -216,6 +229,8 @@ async def startup_server(app: FastAPI):
     # Its first download runs on a worker thread first, so the GPU phase only loads from disk.
     await asyncio.to_thread(_prepare_lid)
     await run_blocking_gpu_phase(_warmup_lid)
+    # seg-3.0 (about 6 MB of weights) and the 1.5 s ReDimNet buckets last; the idle trim releases their pool.
+    await run_blocking_gpu_phase(_warmup_segmentation)
 
 
 async def shutdown_server(app: FastAPI):

@@ -86,7 +86,9 @@ from .genesis_whisper_server_storage import (
     save_settings,
     with_model_profiles,
 )
+from .genesis_whisper_server_diarization_engine import segmentation_needed
 from .genesis_whisper_server_lid import apply_lid_device_setting, configured_lid_model, lid_status
+from .genesis_whisper_server_segmentation import apply_segmentation_settings
 from .genesis_whisper_server_vid import apply_vid_settings
 from .genesis_whisper_server_wxc import apply_mms_device_setting
 
@@ -117,7 +119,9 @@ class AdminSettingsPayload(BaseModel):
     huggingface_token: str | None = None
     dia_server_base_url: str | None = None
     dia_api_key: str | None = None
+    diarization_engine: str | None = None
     segmentation_model_path: str | None = None
+    speaker_turns_enabled: StrictBool | None = None
 
 
 class PresetPayload(BaseModel):
@@ -232,6 +236,10 @@ def _settings_options() -> Dict[str, List[Dict[str, Any]]]:
         "languages": languages,
         "precisions": precisions,
         "language_detection_models": language_detection_models,
+        "diarization_engines": [
+            {"label": "G3_DIA server", "value": "dia"},
+            {"label": "Local (seg-3.0 + ReDimNet2)", "value": "local"},
+        ],
     }
 
 
@@ -335,6 +343,7 @@ def _apply_voice_model_settings() -> Dict[str, bool]:
         "redimnet": apply_vid_settings(),
         "mms_fa": apply_mms_device_setting(),
         "language_detection": apply_lid_device_setting(),
+        "segmentation": apply_segmentation_settings(segmentation_needed()),
     }
 
 
@@ -355,6 +364,9 @@ async def _reprepare_voice_models(
             "redimnet_max_batch_size",
             "language_detection_model",
             "cohere_language_detection",
+            "segmentation_model_path",
+            "diarization_engine",
+            "speaker_turns_enabled",
         )
     )
     # Leaving Cohere makes a resident detector dead weight next to the new ASR model (up to 1.6 GB with turbo).

@@ -293,6 +293,71 @@ Mode-specific result:
 The full response wraps this object in the common success envelope and identifies the
 active ASR model in `models.asr.id`.
 
+#### `transcript` mit `speaker_turns` (Live-Sprecher)
+
+Vertrag mit Genesis3 (docs/243 §8.8). Nur wenn `GET /v2/capabilities` `speaker_turns.supported: true` meldet, nur im
+Modus `transcript`. Der Server ist zustandslos: der Client schickt je Abschnitt die laufenden Sprecher-Zentroide
+seiner Aufnahme mit.
+
+```json
+{
+  "schema_version": "2.0",
+  "mode": "transcript",
+  "speaker_turns": {
+    "known_speakers": [{ "id": "s1", "vector": [0.01, "... 192 Werte"], "weight": 12.4 }]
+  }
+}
+```
+
+- `known_speakers`: hoechstens 16 Eintraege, je `id` (nicht leerer Text, hoechstens 64 Zeichen, eindeutig, nicht mit
+  `new:` beginnend), `vector` (genau 192 endliche Zahlen, kein Nullvektor; der Server normiert ihn) und optional
+  `weight` (positive Zahl, Stuetzsekunden). Leere Liste erlaubt.
+- Ungueltig, in einem anderen Modus oder nicht angeboten (Schalter aus, kein seg-3.0-Checkpoint) ist
+  `422 INVALID_REQUEST` mit `error.details.field = "request.speaker_turns"` (bei "nicht angeboten" zusaetzlich
+  `reason: "not_supported"`), immer vor dem Dekodieren des Audios. Der Genesis3-Client schickt dann genau einmal ohne
+  das Feld.
+- `transcript_embedding`, `embedding` und `diarization` kennen das Feld nicht (422).
+
+Ergebnis: `result.transcript` wie ohne das Feld, dazu
+
+```json
+{
+  "speaker_turns": [
+    { "start_ms": 0, "end_ms": 4020, "text": "Guten Morgen.", "speaker_ref": "s1", "cos": 0.91,
+      "vector": [0.02, "... 192 Werte"], "support_s": 3.86 },
+    { "start_ms": 4980, "end_ms": 9600, "text": "Hallo zusammen.", "speaker_ref": "new:1", "cos": 0.88,
+      "vector": [-0.01, "... 192 Werte"], "support_s": 4.4 }
+  ]
+}
+```
+
+- `speaker_ref`: eine gesendete `id` (bekannt ab cos 0,6 zum Zentroid) oder `new:1`, `new:2` ... fuer neue Stimmen
+  dieses Abschnitts. `vector` ist der L2-normierte Mittelwert der Fenster des Turns, `cos` seine Naehe zum Zustand,
+  `support_s` die Sprechsekunden. `speaker_ref`, `vector` und `cos` sind `null`, wenn der Abschnitt fuer kein
+  Embedding-Fenster reicht oder Woerter ausserhalb jeder erkannten Sprache liegen (ein Turn ohne Sprecherdaten).
+- `text`: die ASR-Woerter, deren Mitte im Turn liegt (sonst der naechste Turn). Die Wortzeiten kommen aus einer
+  MMS_FA-Zwangsausrichtung (der WXC-Aligner) des ganzen Transkripts ueber den ganzen Abschnitt; Woerter ohne
+  lateinische Buchstaben (Zahlen, Zeichen) bekommen die Zeit ihres Nachbarn. Hoechstens 64 Turns.
+- Ablauf: ASR und Sprecherteil laufen parallel und stehen beide an derselben GPU-Sperre an. Sprecherteil = seg-3.0 auf
+  dem Abschnitt (Sprachmaske), ReDimNet2-Fenster 1,5 s (Schritt 0,5 s) und 3 s (Schritt 1,0 s) in Server-Batches
+  <= 8, eingefrorene Logik: jeder bekannte Zentroid ist ein Viterbi-Zustand, bekannt ab cos 0,6, AHC 0,4 innerhalb
+  des Abschnitts, neue Stimme ab 1 s Stuetze, Wechselstrafe 3, Turns unter 0,5 s Sprache werden eingegliedert.
+- Teilerfolg statt Fehler: scheitert der Sprecherteil (`SPEAKER_TURNS_UNAVAILABLE`), ist das Audio laenger als 60 s
+  (`SPEAKER_TURNS_AUDIO_TOO_LONG`), ist `result.speaker_turns` `null`; liefert die Ausrichtung keine Wortzeiten
+  (`SPEAKER_TURNS_WORDS_UNALIGNED`, z. B. Text ohne lateinische Buchstaben), haben die Turns leeren `text`. In allen
+  Faellen bleibt `result.transcript.text`, `status` ist `partial`; Genesis3 nimmt dann den Abschnitt als eine Zeile.
+- `models` nennt zusaetzlich `embedding` (ReDimNet2-B6) und `segmentation` (`pyannote/segmentation-3.0`),
+  `timings_ms` zusaetzlich `speaker_turns` (Segmentierung, Fenster, Logik) und `alignment`.
+- Messung (Forschungsbench, Live-Schnitt von Genesis3 04a7cbe07, 3520 Abschnitte, Median 8,5 s; DER ohne Collar mit
+  Overlap): gehaltene AMI-Meetings DER 27,3 % / Verwechslung 3,2 % (Schritt 0,5/1,0 s) gegen 35,2 % / 10,6 % der
+  bisherigen Bruecke ueber `transcript_embedding`; synthetische Meetings Verwechslung 0,8-1,8 % (Bench-Schritt 0,25/0,5 s). Der CPU-Teil ist
+  bitgleich zum Prototyp (3520 von 3520 Abschnitten).
+- Kosten je Abschnitt (RTX 2070S, Bench): Fenster-Embeddings Median 197 ms, p99 326 ms; seg-3.0 Median 13 ms; dazu
+  die MMS_FA-Ausrichtung und die CPU-Logik (wenige ms).
+- Grenzen: Overlap gibt jedem Frame nur einen Sprecher, der zweite Sprecher im Overlap fehlt in den Turns (AMI: 13,7 %
+  der Referenz-Sprechzeit). Ein Abschnitt mit zu wenig Sprache fuer ein 1,5-s-Fenster bekommt einen Turn ohne Sprecher. Das Feld ist fuer Live-Abschnitte
+  (Genesis3 schneidet bei 15 s) gedacht; lange Dateien gehoeren in den Modus `diarization`.
+
 #### `transcript_embedding`
 
 Request:
@@ -682,7 +747,7 @@ Relevant status codes:
 - `401`: missing/invalid Whisper client API key after public API protection is enabled
 - `413`: `request` JSON exceeds 16 MiB
 - `422`: invalid schema/mode, IDs, counts, profile vectors, or insufficient usable speech
-- `503`: the effective DIA URL is invalid for a `diarization` request (`DIA_NOT_CONFIGURED`; without a saved URL or `DIA_SERVER_BASE_URL` the default `http://127.0.0.1:7864` is used), or a required local model is unavailable
+- `503`: the effective DIA URL is invalid for a `diarization` request (`DIA_NOT_CONFIGURED`; without a saved URL or `DIA_SERVER_BASE_URL` the default `http://127.0.0.1:7864` is used), or a required local model is unavailable (`MODEL_UNAVAILABLE`; mit `diarization_engine: "local"` auch ohne ladbaren seg-3.0-Checkpoint, `retryable: false`, kein Rueckfall auf DIA)
 - `502`: DIA rejected Whisper authentication, returned an upstream error, or violated the v2 response contract
 - `504`: DIA request timeout
 - `500`: unexpected local processing failure
@@ -735,7 +800,8 @@ Response shape:
   },
   "modes": ["embedding", "transcript", "transcript_embedding", "diarization"],
   "embedding": { "id": "ReDimNet2-B6" },
-  "diarization": { "configured": true }
+  "diarization": { "configured": true, "engine": "dia" },
+  "speaker_turns": { "supported": true, "embedding_model": "ReDimNet2-B6", "dimension": 192, "max_known_speakers": 16 }
 }
 ```
 
@@ -747,6 +813,8 @@ Notes:
 - `language.applied` is false on Parakeet: that engine detects the language itself and ignores the setting and a v2 `language`.
 - `language.options` is the global list `POST /v2/audio/process` validates against, it does not change with the model.
 - `diarization.configured` means a usable DIA URL exists, the built-in default counts. It does not test that the DIA server is up, `POST /api/admin/dia/test` does.
+- `diarization.engine` ist `dia` (G3_DIA-Server) oder `local` (seg-3.0 + ReDimNet2 im Prozess). Bei `local` heisst `configured`: ein seg-3.0-Checkpoint ist vorhanden und sein letzter Ladeversuch ist nicht gescheitert; dazu `model: "g3-whisper/seg3-redimnet2-v4"`.
+- `speaker_turns` (siehe [`transcript` mit `speaker_turns`](#transcript-mit-speaker_turns-live-sprecher)): `supported: true` nur bei `speaker_turns_enabled` und nutzbarem seg-3.0-Checkpoint, sonst `{ "supported": false }`. Die Abfrage laedt kein Modell.
 - Older servers answer this path with the HTML landing page and status 200, not with 404. A client must treat a non-JSON answer as "not available".
 
 ## Public Transcription API
@@ -1167,6 +1235,8 @@ Notes:
 - saved DIA values take precedence over the `DIA_SERVER_BASE_URL` and `DIA_SERVER_API_KEY` environment fallbacks
 - the key is sent upstream only in `X-API-Key` and is never returned or written to application logs
 - DIA settings affect only v2 requests whose mode is `diarization`
+- `diarization_engine` (`dia` Standard, `local`; anderes faellt auf `dia`): `local` rechnet den Modus `diarization` ohne DIA-Server im Prozess (seg-3.0-Sprecherzahl, ReDimNet2-Fenster 3 s/0,5 s und 1,5 s/0,25 s mit Silero-Filter, AHC, Viterbi-Nachsegmentierung, Pruefung der lokalen Sprecher, Overlap-Fuellung) und liefert danach denselben Ablauf wie mit DIA (Speaker-Clouds, Verfeinerung, WXC, Abgleich bekannter Sprecher). Bestehende Installationen bleiben auf `dia`. Ohne ladbares Modell antwortet `local` mit `503 MODEL_UNAVAILABLE`, ohne Rueckfall auf DIA (der Betreiber hat die Engine gewaehlt; ein stiller Rueckfall wuerde einen kaputten Checkpoint verbergen). Gemessen (Forschungsbench, gleiche Merkmale, DER ohne Collar): synthetische DE/EN-Meetings 8,53 % gegen 12,31 % mit DIA, AMI-Abstimmung 19,66 % gegen 19,36 %, gehaltene AMI-Meetings 16,11 % gegen 16,10 %, Sprecherzahl dort 12 von 12 gegen 9 von 12. CPU-Teil etwa 0,2 s je Audiominute.
+- `segmentation_model_path` (leer = HF-Cache, siehe Laufzeithinweise) und `speaker_turns_enabled` (strikter Boolean, Standard `true`; wirkt nur mit nutzbarem Checkpoint) gehoeren wie `diarization_engine` zu den Dienstfeldern, nicht zu Presets. Speichern laedt kein ASR-Modell neu; ein geladenes seg-3.0 mit anderem Pfad oder Geraet, oder ohne nutzende Funktion, wird freigegeben und beim naechsten Gebrauch neu geladen.
 
 ### `GET /api/admin/settings/presets`
 
@@ -1640,4 +1710,4 @@ Special case:
 - admin benchmark and public transcription log into [`logs`](x:/dev/G3_WHISPER/logs)
 - optional history debug audio lives under `logs/debug-audio`, is never written into JSONL, and is purged on start, shutdown, or setting disable; capture time is reported separately and is excluded from pipeline phase timings
 - the optional `GENESIS_GPU_LEASE_PATH` file lock can serialize CUDA phases with a colocated DIA process; without it only each service's in-process locks apply
-- DIA-freie Diarisierung (Bausteine, noch an keinen Endpunkt angeschlossen): `segmentation_model_path` nennt einen pyannote-segmentation-3.0-Checkpoint (`pytorch_model.bin`); leer sucht der Server ihn im HF-Cache von `local_model_cache_path` (`models--pyannote--speaker-diarization-community-1/snapshots/*/segmentation/pytorch_model.bin`, dann `models--pyannote--segmentation-3.0`), danach in `HF_HUB_CACHE` bzw. `~/.cache/huggingface/hub`. Es wird nie etwas heruntergeladen. Das Modell (rund 6 MB Gewichte) folgt `local_gpu_device`. Der Checkpoint wird mit einem eingeschraenkten Unpickler gelesen, der ausser Tensoren nichts aus der Datei ausfuehrt. Die Antwortform der lokalen Diarisierung ist die von G3_DIA `/v2/diarize`; `speaker_turns` fuer `mode: "transcript"` (Genesis3 docs/243 §8.8) wird mit Phase 2 beschrieben, sobald `GET /v2/capabilities` es anbietet.
+- DIA-freie Diarisierung und `speaker_turns`: `segmentation_model_path` nennt einen pyannote-segmentation-3.0-Checkpoint (`pytorch_model.bin`); leer sucht der Server ihn im HF-Cache von `local_model_cache_path` (`models--pyannote--speaker-diarization-community-1/snapshots/*/segmentation/pytorch_model.bin`, dann `models--pyannote--segmentation-3.0`), danach in `HF_HUB_CACHE` bzw. `~/.cache/huggingface/hub`. Es wird nie etwas heruntergeladen. Das Modell (rund 6 MB Gewichte) folgt `local_gpu_device`. Der Checkpoint wird mit einem eingeschraenkten Unpickler gelesen, der ausser Tensoren nichts aus der Datei ausfuehrt. Die Antwortform der lokalen Diarisierung ist die von G3_DIA `/v2/diarize`. Beim Start wird seg-3.0 geladen und einmal gerechnet und ReDimNet fuer 1,5-s-Fenster vorgewaermt, nur wenn `diarization_engine` `local` ist oder `speaker_turns_enabled` an. Alle GPU-Phasen laufen in Scheiben unter der GPU-Sperre (seg-3.0: 128 Chunks, ReDimNet: 64 Fenster je Halten), die CPU-Arbeit in Worker-Threads; das Freigeben des CUDA-Pools nach 5 s Ruhe bleibt unveraendert.

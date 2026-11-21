@@ -137,7 +137,9 @@ class LanguageDetectionWarmupTests(unittest.TestCase):
         ):
             asyncio.run(server.startup_server(app))
         # The detector's download runs before its GPU phase, on a worker thread rather than the GPU thread.
-        self.assertEqual(order, ["_warmup_local_asr", "_warmup_redimnet", "_prepare_lid", "_warmup_lid"])
+        self.assertEqual(
+            order, ["_warmup_local_asr", "_warmup_redimnet", "_prepare_lid", "_warmup_lid", "_warmup_segmentation"]
+        )
 
     def test_the_download_step_runs_only_where_the_detector_is_used(self) -> None:
         with mock.patch.object(lid, "prepare_lid_model", return_value=True) as prepare:
@@ -145,6 +147,34 @@ class LanguageDetectionWarmupTests(unittest.TestCase):
             current_settings["cohere_language_detection"] = False
             server._prepare_lid()
         prepare.assert_called_once_with()
+
+
+class SegmentationWarmupTests(unittest.TestCase):
+    def test_runs_only_when_a_feature_uses_the_model_and_never_raises(self) -> None:
+        from backend import genesis_whisper_server_diarization_engine as diarization_engine
+        from backend import genesis_whisper_server_segmentation as seg
+
+        model = mock.Mock()
+        cases = (
+            ({"diarization_engine": "dia", "speaker_turns_enabled": False}, 0),
+            ({"diarization_engine": "dia", "speaker_turns_enabled": True}, 1),
+            ({"diarization_engine": "local", "speaker_turns_enabled": False}, 1),
+        )
+        for values, loads in cases:
+            with self.subTest(values=values):
+                with (
+                    mock.patch.dict(current_settings, values),
+                    mock.patch.object(seg, "load_segmentation_model", return_value=model) as load,
+                    mock.patch.object(diarization_engine, "prepare_window_length") as prepare,
+                ):
+                    server._warmup_segmentation()
+                self.assertEqual(load.call_count, loads)
+                self.assertEqual(prepare.call_count, loads)
+        with (
+            mock.patch.dict(current_settings, {"speaker_turns_enabled": True}),
+            mock.patch.object(seg, "load_segmentation_model", side_effect=RuntimeError("CUDA error")),
+        ):
+            server._warmup_segmentation()
 
 
 if __name__ == "__main__":

@@ -30,6 +30,9 @@ export type AdminSettings = {
   huggingface_token: string;
   dia_server_base_url: string;
   dia_api_key: string;
+  diarization_engine: "dia" | "local";
+  segmentation_model_path: string;
+  speaker_turns_enabled: boolean;
   dia_api_key_configured: boolean;
   dia_api_key_source: "settings" | "environment" | "none";
   dia_server_base_url_effective: string;
@@ -109,6 +112,7 @@ export type SettingsResponse = {
     precisions: AdminOption[];
     languages: AdminOption[];
     language_detection_models: AdminOption[];
+    diarization_engines?: AdminOption[];
   };
   models: ManagedModel[];
   loaded_model_identifier: string[] | null;

@@ -354,22 +354,50 @@ def _batch_bucket(size: int, maximum: int) -> int:
     return min(bucket, maximum)
 
 
-def chunk_audio(audio: np.ndarray, sample_rate: int = SEGMENTATION_SAMPLE_RATE,
-                chunk_seconds: float = SEGMENTATION_CHUNK_SECONDS,
-                step_seconds: float = SEGMENTATION_STEP_SECONDS) -> np.ndarray:
-    """(chunks, samples) exactly as pyannote Inference.slide cuts: full chunks, then the zero-padded remainder."""
+def chunk_layout(num_samples: int, sample_rate: int = SEGMENTATION_SAMPLE_RATE,
+                 chunk_seconds: float = SEGMENTATION_CHUNK_SECONDS,
+                 step_seconds: float = SEGMENTATION_STEP_SECONDS) -> tuple[int, int, int, bool]:
+    """(full chunks, chunk samples, step samples, padded last chunk) of pyannote Inference.slide."""
 
-    samples = np.asarray(audio, dtype=np.float32).reshape(-1)
     window = int(round(chunk_seconds * sample_rate))
     step = int(round(step_seconds * sample_rate))
-    total = len(samples)
+    total = int(num_samples)
     full = (total - window) // step + 1 if total >= window else 0
-    chunks = [samples[i * step: i * step + window] for i in range(full)]
-    if total < window or (total - window) % step > 0:
-        last = samples[full * step:]
-        padded = np.zeros(window, np.float32)
-        padded[: len(last)] = last
-        chunks.append(padded)
+    padded = total < window or (total - window) % step > 0
+    return full, window, step, padded
+
+
+def chunk_count(num_samples: int) -> int:
+    """Number of seg-3.0 chunks of a signal (full ones plus the padded remainder)."""
+
+    full, _, _, padded = chunk_layout(num_samples)
+    return full + (1 if padded else 0)
+
+
+def chunk_audio(audio: np.ndarray, sample_rate: int = SEGMENTATION_SAMPLE_RATE,
+                chunk_seconds: float = SEGMENTATION_CHUNK_SECONDS,
+                step_seconds: float = SEGMENTATION_STEP_SECONDS,
+                first: int = 0, count: Optional[int] = None) -> np.ndarray:
+    """(chunks, samples) exactly as pyannote Inference.slide cuts: full chunks, then the zero-padded remainder.
+
+    ``first``/``count`` cut only that range of chunk indices, so a long recording never holds all chunks
+    (10 s each, 1 s apart: ten copies of the signal) in memory at once.
+    """
+
+    samples = np.asarray(audio, dtype=np.float32).reshape(-1)
+    full, window, step, padded = chunk_layout(len(samples), sample_rate, chunk_seconds, step_seconds)
+    total_chunks = full + (1 if padded else 0)
+    first = max(0, int(first))
+    last = total_chunks if count is None else min(total_chunks, first + max(0, int(count)))
+    chunks = []
+    for index in range(first, last):
+        if index < full:
+            chunks.append(samples[index * step: index * step + window])
+        else:
+            remainder = samples[full * step:]
+            chunk = np.zeros(window, np.float32)
+            chunk[: len(remainder)] = remainder
+            chunks.append(chunk)
     return np.stack(chunks) if chunks else np.zeros((0, window), np.float32)
 
 
@@ -415,6 +443,11 @@ class SegmentationModel:
             return np.zeros((0, frames, width), np.float32)
         return np.concatenate(outputs)
 
+    def segment_range(self, audio: np.ndarray, first: int = 0, count: Optional[int] = None) -> np.ndarray:
+        """Hard multilabel activations (count, 589, 3) of the chunks ``first .. first + count``."""
+
+        return self._run(chunk_audio(audio, first=first, count=count), convert=True)
+
     def segment(self, audio: np.ndarray) -> Dict[str, Any]:
         """seg-3.0 output of a 16 kHz mono signal, the arrays pyannote's segmentation Inference produces.
 
@@ -423,17 +456,22 @@ class SegmentationModel:
         ``frame_start + f * frame_step`` inside it.
         """
 
-        chunks = chunk_audio(audio)
-        data = self._run(chunks, convert=True)
-        return {
-            "data": data,
-            "chunk_start": 0.0,
-            "chunk_step": SEGMENTATION_STEP_SECONDS,
-            "chunk_dur": SEGMENTATION_CHUNK_SECONDS,
-            "frame_start": self.frame_start,
-            "frame_step": self.frame_step,
-            "frame_dur": self.frame_duration,
-        }
+        return segmentation_payload(self.segment_range(audio))
+
+
+def segmentation_payload(data: np.ndarray) -> Dict[str, Any]:
+    """The seg-3.0 arrays dict around (concatenated) ``segment_range`` outputs."""
+
+    start, step, duration = frame_grid()
+    return {
+        "data": data,
+        "chunk_start": 0.0,
+        "chunk_step": SEGMENTATION_STEP_SECONDS,
+        "chunk_dur": SEGMENTATION_CHUNK_SECONDS,
+        "frame_start": start,
+        "frame_step": step,
+        "frame_dur": duration,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -499,7 +537,9 @@ def resolve_segmentation_checkpoint(settings: Optional[Mapping[str, Any]] = None
 
 
 _segmentation_lock = threading.Lock()
-_segmentation_state: Dict[str, Any] = {"model": None, "path": None, "device": None, "error": None}
+# failed_path: the checkpoint whose last load failed. The capabilities report speaker_turns unsupported for it (no
+# GPU load from a GET); requests still retry the load, and a settings save clears it.
+_segmentation_state: Dict[str, Any] = {"model": None, "path": None, "device": None, "error": None, "failed_path": None}
 
 
 def _target_device() -> torch.device:
@@ -518,26 +558,63 @@ def load_segmentation_model() -> Optional[SegmentationModel]:
         if current is not None and _segmentation_state.get("path") == str(path) and str(current.device) == str(device):
             return current
         if path is None:
-            _segmentation_state.update({"model": None, "path": None, "device": None,
+            _segmentation_state.update({"model": None, "path": None, "device": None, "failed_path": None,
                                         "error": "Kein Segmentierungsmodell (segmentation-3.0) gefunden."})
             return None
         try:
             with shared_gpu_lease():
                 model = SegmentationModel.from_checkpoint(path, device)
         except Exception as exc:
-            _segmentation_state.update({"model": None, "path": None, "device": None,
+            _segmentation_state.update({"model": None, "path": None, "device": None, "failed_path": str(path),
                                         "error": f"{type(exc).__name__}: {exc}"})
             print(f"[FEHLER-SEG] Segmentierungsmodell konnte nicht geladen werden: {exc}", file=sys.stderr)
             return None
-        _segmentation_state.update({"model": model, "path": str(path), "device": str(device), "error": None})
+        _segmentation_state.update({"model": model, "path": str(path), "device": str(device), "error": None,
+                                    "failed_path": None})
         print(f"[INFO-SEG] {SEGMENTATION_MODEL_NAME} geladen aus {path} auf {device}.", file=sys.stderr)
         return model
 
 
 def segmentation_available() -> bool:
-    """A checkpoint exists locally (cheap; does not load the model)."""
+    """A checkpoint exists locally and its last load did not fail (cheap; does not load the model)."""
 
-    return resolve_segmentation_checkpoint() is not None
+    path = resolve_segmentation_checkpoint()
+    if path is None:
+        return False
+    with _segmentation_lock:
+        return _segmentation_state.get("failed_path") != str(path)
+
+
+def release_segmentation_model() -> bool:
+    """Drop the loaded model (the next use loads it again); True when one was loaded."""
+
+    with _segmentation_lock:
+        model = _segmentation_state.get("model")
+        _segmentation_state.update({"model": None, "path": None, "device": None})
+    if model is None:
+        return False
+    del model
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return True
+
+
+def apply_segmentation_settings(needed: bool = True) -> bool:
+    """Admin hook (GPU thread). A loaded model whose checkpoint or device no longer matches the settings, or that
+    no feature needs any more (``needed`` False), is released; the next use loads the right one. A remembered
+    failed load is forgotten, so a fixed file is offered again. True when a model was released."""
+
+    with _segmentation_lock:
+        model = _segmentation_state.get("model")
+        loaded_path = _segmentation_state.get("path")
+        loaded_device = _segmentation_state.get("device")
+        _segmentation_state["failed_path"] = None
+    if model is None:
+        return False
+    stale = str(resolve_segmentation_checkpoint()) != loaded_path or str(_target_device()) != loaded_device
+    if needed and not stale:
+        return False
+    return release_segmentation_model()
 
 
 def segmentation_status() -> Dict[str, Any]:
@@ -547,22 +624,43 @@ def segmentation_status() -> Dict[str, Any]:
         }
 
 
-def segment_audio(audio: np.ndarray) -> Dict[str, Any]:
-    """seg-3.0 arrays of ``audio`` with the process-wide model; RuntimeError when no model is available."""
-
+def _loaded_model() -> SegmentationModel:
     model = load_segmentation_model()
     if model is None:
         raise RuntimeError(_segmentation_state.get("error") or "Segmentierungsmodell nicht verfuegbar.")
+    return model
+
+
+def segment_audio(audio: np.ndarray) -> Dict[str, Any]:
+    """seg-3.0 arrays of ``audio`` with the process-wide model; RuntimeError when no model is available."""
+
+    model = _loaded_model()
     with shared_gpu_lease():
         return model.segment(audio)
+
+
+def segment_audio_range(indices: Any, audio: np.ndarray) -> np.ndarray:
+    """Activations of the consecutive chunk ``indices`` (a slice of ``range(chunk_count)``): the GPU unit of the
+    sliced driver, so a long recording releases the GPU lock between slices. RuntimeError without a model."""
+
+    indices = list(indices)
+    model = _loaded_model()
+    if not indices:
+        return np.zeros((0, num_output_frames(int(SEGMENTATION_CHUNK_SECONDS * SEGMENTATION_SAMPLE_RATE)),
+                         SEGMENTATION_NUM_SPEAKERS), np.float32)
+    with shared_gpu_lease():
+        return model.segment_range(audio, first=int(indices[0]), count=len(indices))
 
 
 __all__ = [
     "PyanNet",
     "SEGMENTATION_MODEL_NAME",
     "SegmentationModel",
+    "apply_segmentation_settings",
     "build_model",
     "chunk_audio",
+    "chunk_count",
+    "chunk_layout",
     "frame_grid",
     "load_checkpoint_state",
     "load_segmentation_model",
@@ -570,7 +668,10 @@ __all__ = [
     "powerset_mapping",
     "powerset_to_multilabel",
     "resolve_segmentation_checkpoint",
+    "release_segmentation_model",
     "segment_audio",
+    "segment_audio_range",
     "segmentation_available",
+    "segmentation_payload",
     "segmentation_status",
 ]

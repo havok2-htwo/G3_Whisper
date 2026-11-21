@@ -26,6 +26,10 @@ load_dotenv(os.path.join(PROJECT_ROOT, ".env"), override=False)
 # install reaches the local G3_DIA. Compose sets DIA_SERVER_BASE_URL=http://dia:7864, which wins over this.
 DEFAULT_DIA_SERVER_BASE_URL = "http://127.0.0.1:7864"
 
+# Allowed values of diarization_engine: "dia" asks the G3_DIA server (the default, existing installs keep it), "local"
+# runs the seg-3.0 + ReDimNet2 pipeline in this process (genesis_whisper_server_diarization_engine).
+DIARIZATION_ENGINE_VALUES = ("dia", "local")
+
 # Allowed values of redimnet_max_batch_size: the power-of-two CUDA batch buckets ReDimNet is warmed for.
 REDIMNET_MAX_BATCH_SIZE_VALUES = (1, 2, 4, 8)
 
@@ -51,8 +55,11 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "huggingface_token": "",
     "dia_server_base_url": "",
     "dia_api_key": "",
+    "diarization_engine": "dia",
     # Explicit seg-3.0 checkpoint for the DIA-free diarization; empty = find it in the local HF cache.
     "segmentation_model_path": "",
+    # Live speaker turns in transcript mode; offered only while the seg-3.0 checkpoint is usable.
+    "speaker_turns_enabled": True,
     "model_profiles": {},
 }
 
@@ -111,7 +118,9 @@ SERVICE_SETTINGS_FIELDS: Tuple[str, ...] = (
     "huggingface_token",
     "dia_server_base_url",
     "dia_api_key",
+    "diarization_engine",
     "segmentation_model_path",
+    "speaker_turns_enabled",
     "debug_retain_history_audio",
 )
 
@@ -208,6 +217,14 @@ def normalize_settings(settings: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     normalized["dia_server_base_url"] = str(source.get("dia_server_base_url", "") or "").strip().rstrip("/")
     normalized["dia_api_key"] = str(source.get("dia_api_key", "") or "").strip()
     normalized["segmentation_model_path"] = str(source.get("segmentation_model_path", "") or "").strip()
+    configured_engine = str(source.get("diarization_engine", DEFAULT_SETTINGS["diarization_engine"]) or "").strip().lower()
+    normalized["diarization_engine"] = (
+        configured_engine if configured_engine in DIARIZATION_ENGINE_VALUES else DEFAULT_SETTINGS["diarization_engine"]
+    )
+    configured_turns = source.get("speaker_turns_enabled", DEFAULT_SETTINGS["speaker_turns_enabled"])
+    normalized["speaker_turns_enabled"] = (
+        configured_turns if isinstance(configured_turns, bool) else DEFAULT_SETTINGS["speaker_turns_enabled"]
+    )
 
     try:
         normalized["batch_wait_time_ms"] = max(0, int(source.get("batch_wait_time_ms", DEFAULT_SETTINGS["batch_wait_time_ms"])))

@@ -245,6 +245,30 @@ def embed_window_starts(audio: np.ndarray, starts: np.ndarray, length_s: float) 
 EmbedFn = Callable[[np.ndarray, np.ndarray, float], np.ndarray]
 
 
+def plan_scale_starts(num_samples: int, speech: np.ndarray, frame_samples: int,
+                      scales: Mapping[str, tuple[float, float]] = BATCH_WINDOW_SCALES) -> Dict[str, np.ndarray]:
+    """Start samples of the windows worth embedding, per scale (CPU part of ``compute_window_features``)."""
+
+    return {name: plan_window_starts(num_samples, length_s, hop_s, speech, frame_samples)
+            for name, (length_s, hop_s) in scales.items()}
+
+
+def assemble_windows(starts: Mapping[str, np.ndarray], vectors: Mapping[str, np.ndarray],
+                     scales: Mapping[str, tuple[float, float]] = BATCH_WINDOW_SCALES) -> Dict[str, Windows]:
+    """(start s, end s, vectors) per scale from the planned starts and their embeddings (same order)."""
+
+    out: Dict[str, Windows] = {}
+    for name, (length_s, _) in scales.items():
+        st = np.asarray(starts[name]) / SAMPLE_RATE
+        X = np.asarray(vectors.get(name, np.zeros((0, 192), np.float32)), np.float32)
+        if len(X) == 0:
+            X = np.zeros((0, 192), np.float32)
+        if len(X) != len(st):
+            raise ValueError(f"{name}: {len(X)} Vektoren fuer {len(st)} Fenster.")
+        out[name] = (st, st + length_s, X)
+    return out
+
+
 def compute_window_features(audio: np.ndarray, speech: np.ndarray, frame_samples: int,
                             scales: Mapping[str, tuple[float, float]] = BATCH_WINDOW_SCALES,
                             embed: Optional[EmbedFn] = None) -> Dict[str, Windows]:
@@ -252,13 +276,10 @@ def compute_window_features(audio: np.ndarray, speech: np.ndarray, frame_samples
 
     embed = embed or embed_window_starts
     audio = np.asarray(audio, np.float32).reshape(-1)
-    out: Dict[str, Windows] = {}
-    for name, (length_s, hop_s) in scales.items():
-        starts = plan_window_starts(len(audio), length_s, hop_s, speech, frame_samples)
-        vectors = embed(audio, starts, length_s) if len(starts) else np.zeros((0, 192), np.float32)
-        st = starts / SAMPLE_RATE
-        out[name] = (st, st + length_s, np.asarray(vectors, np.float32))
-    return out
+    starts = plan_scale_starts(len(audio), speech, frame_samples, scales)
+    vectors = {name: (embed(audio, starts[name], scales[name][0]) if len(starts[name])
+                      else np.zeros((0, 192), np.float32)) for name in scales}
+    return assemble_windows(starts, vectors, scales)
 
 
 # ---------------------------------------------------------------------------
@@ -612,6 +633,8 @@ def diarize_audio(audio: np.ndarray, *, num_speakers: Optional[int] = None, min_
 __all__ = [
     "BATCH_WINDOW_SCALES",
     "DEFAULT_PARAMS",
+    "WINDOW_MIN_SPEECH",
+    "assemble_windows",
     "DiarizationResult",
     "Features",
     "LOCAL_DIARIZATION_MODEL_ID",
@@ -619,6 +642,7 @@ __all__ = [
     "diarize_audio",
     "diarize_features",
     "embed_window_starts",
+    "plan_scale_starts",
     "plan_window_starts",
     "result_to_dia_payload",
     "seg_count",

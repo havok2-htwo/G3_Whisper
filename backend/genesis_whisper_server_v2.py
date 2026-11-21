@@ -25,6 +25,17 @@ from .genesis_whisper_server_auth import authorize_api_key, get_auth_store, requ
 from .genesis_whisper_server_batching import served_model_id
 from .genesis_whisper_server_chunking import combine_transcription_chunks, split_audio_for_whisper
 from .genesis_whisper_server_dia_client import DiaClientError, dia_is_configured, diarize_v2
+from .genesis_whisper_server_diarization_engine import (
+    DIARIZATION_ENGINE_LOCAL,
+    LOCAL_WINDOW_FILTER,
+    SPEAKER_TURNS_MAX_AUDIO_S,
+    compute_section_turns,
+    configured_diarization_engine,
+    diarization_capability,
+    run_local_diarization,
+    section_words,
+    speaker_turns_available,
+)
 from .genesis_whisper_server_globals import (
     COHERE_FALLBACK_LANGUAGE,
     SUPPORTED_LANGUAGE_OPTIONS,
@@ -77,6 +88,13 @@ from .genesis_whisper_server_speaker_matching import (
 )
 from .genesis_whisper_server_speaker_audio import build_unknown_speaker_audio_assets
 from .genesis_whisper_server_speaker_refinement import refine_speaker_turns
+from .genesis_whisper_server_segmentation import SEGMENTATION_MODEL_NAME
+from .genesis_whisper_server_speaker_turns import (
+    assign_words_to_turns as assign_section_words,
+    parse_speaker_turns_request,
+    speaker_turns_capability,
+    turns_to_wire,
+)
 from .genesis_whisper_server_storage import log_transcription, normalize_settings
 from .genesis_whisper_server_turn_gate import finalize_segment_text, prefilter_turns
 from .genesis_whisper_server_wxc import (
@@ -176,7 +194,7 @@ def _parse_request_json(raw_value: str | None) -> dict[str, Any]:
         raise V2ApiError(400, "INVALID_JSON", "Multipart-Feld 'request' enthaelt kein gueltiges JSON.") from exc
     if not isinstance(payload, dict):
         raise V2ApiError(422, "INVALID_REQUEST", "Request-JSON muss ein Objekt sein.")
-    _validate_object_keys(payload, {"schema_version", "mode", "diarization", "language"}, "request")
+    _validate_object_keys(payload, {"schema_version", "mode", "diarization", "language", "speaker_turns"}, "request")
     if payload.get("schema_version") != V2_SCHEMA_VERSION:
         raise V2ApiError(422, "INVALID_REQUEST", "schema_version muss '2.0' sein.")
     mode = str(payload.get("mode") or "").strip()
@@ -198,11 +216,32 @@ def _parse_request_json(raw_value: str | None) -> dict[str, Any]:
                 f"language '{normalized_language}' wird nicht unterstuetzt.",
             )
 
+    # speaker_turns (Genesis3 docs/243 8.8): live speaker turns of one section, transcript mode only. Whether the
+    # server offers it at all is checked by the endpoint (capabilities), the shape here. Always INVALID_REQUEST:
+    # the Genesis3 client retries exactly that code once without the field.
+    speaker_turns_value = payload.get("speaker_turns")
+    known_section_speakers: list[dict[str, Any]] | None = None
+    if speaker_turns_value is not None:
+        if mode != "transcript":
+            raise V2ApiError(
+                422,
+                "INVALID_REQUEST",
+                "speaker_turns ist nur im Modus 'transcript' erlaubt.",
+                details={"field": "request.speaker_turns"},
+            )
+        try:
+            known_section_speakers = parse_speaker_turns_request(speaker_turns_value)
+        except ValueError as exc:
+            raise V2ApiError(422, "INVALID_REQUEST", str(exc), details={"field": "request.speaker_turns"}) from exc
+
     diarization = payload.get("diarization")
     if mode != "diarization":
         if diarization is not None:
             raise V2ApiError(422, "INVALID_REQUEST", "diarization ist nur im Modus 'diarization' erlaubt.")
-        return {"schema_version": V2_SCHEMA_VERSION, "mode": mode, "language": normalized_language}
+        parsed_request: dict[str, Any] = {"schema_version": V2_SCHEMA_VERSION, "mode": mode, "language": normalized_language}
+        if known_section_speakers is not None:
+            parsed_request["speaker_turns"] = {"known_speakers": known_section_speakers}
+        return parsed_request
     if diarization is None:
         diarization = {}
     if not isinstance(diarization, dict):
@@ -902,6 +941,7 @@ async def _wxc_transcribe_segments(
     apply_repetition_filter: bool,
     language_override: str | None = None,
     speaker_languages: SpeakerLanguages | None = None,
+    speech_probs: np.ndarray | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, int], dict[str, Any], str]:
     """Transcribe-first WXC path: large Silero chunks -> ASR -> word alignment ->
     gated speaker skeleton -> sentence-level 192D verification.
@@ -922,7 +962,8 @@ async def _wxc_transcribe_segments(
     timings: dict[str, int] = {}
 
     vad_started = time.monotonic()
-    probs = await asyncio.to_thread(silero_frame_probs, audio)
+    # The local diarization engine already ran Silero on the same audio for its window filter.
+    probs = speech_probs if speech_probs is not None else await asyncio.to_thread(silero_frame_probs, audio)
     regions = speech_regions_from_probs(probs)
     timings["vad"] = round((time.monotonic() - vad_started) * 1000)
     if not regions:
@@ -1035,6 +1076,70 @@ async def _generate_embedding(request: Request, audio: np.ndarray) -> tuple[list
     return vector.astype(float).tolist(), round((time.monotonic() - started) * 1000)
 
 
+async def _transcribe_with_speaker_turns(
+    request: Request,
+    audio: np.ndarray,
+    language_override: str | None,
+    known_speakers: Sequence[Mapping[str, Any]],
+    apply_repetition_filter: bool,
+) -> tuple[str, int, str, LanguageDecision, list[dict[str, Any]] | None, dict[str, int], list[dict[str, Any]]]:
+    """Transcript mode with ``speaker_turns``: (text, transcription ms, served model, language decision,
+    wire turns or None, extra timings, warnings).
+
+    The ASR job and the speaker part (seg-3.0 on the section, 1.5 s / 3 s ReDimNet windows, the turn logic) run
+    concurrently; both queue on the same GPU lock, so neither holds the GPU for the other. The words get their
+    times from one MMS_FA forced alignment of the transcript over the whole section (the WXC aligner), then go to
+    the turn that holds their midpoint. Any failure of the speaker part keeps the transcript: turns None plus a
+    warning, never an error status (the Genesis3 client then keeps the section text as one line).
+    """
+
+    timings: dict[str, int] = {}
+    warnings: list[dict[str, Any]] = []
+    duration_s = get_audio_duration_seconds(audio)
+    if duration_s > SPEAKER_TURNS_MAX_AUDIO_S:
+        text, transcription_ms, _, model_id, decision = await _transcribe_audio(request, audio, language_override)
+        if apply_repetition_filter:
+            text = filter_repeated_patterns(text)
+        warnings.append({"code": "SPEAKER_TURNS_AUDIO_TOO_LONG", "max_seconds": SPEAKER_TURNS_MAX_AUDIO_S})
+        return text, transcription_ms, model_id, decision, None, timings, warnings
+
+    lock = request.app.state.local_gpu_lock
+
+    async def _turns() -> tuple[list[dict[str, Any]] | None, Exception | None, int]:
+        started = time.monotonic()
+        try:
+            found = await compute_section_turns(lock, audio, known_speakers)
+            return found, None, round((time.monotonic() - started) * 1000)
+        except Exception as exc:
+            print(f"[WARNUNG-TURNS] speaker_turns fehlgeschlagen, Transkript bleibt: {exc}", file=sys.stderr)
+            return None, exc, round((time.monotonic() - started) * 1000)
+
+    (text, transcription_ms, _, model_id, decision), (turns, turns_error, turns_ms) = await asyncio.gather(
+        _transcribe_audio(request, audio, language_override), _turns()
+    )
+    if apply_repetition_filter:
+        text = filter_repeated_patterns(text)
+    timings["speaker_turns"] = turns_ms
+    if turns is None:
+        warnings.append({"code": "SPEAKER_TURNS_UNAVAILABLE", "message": str(turns_error)[:300]})
+        return text, transcription_ms, model_id, decision, None, timings, warnings
+
+    words: list[dict[str, Any]] = []
+    if text.strip():
+        align_started = time.monotonic()
+        try:
+            aligned = await _align_words_sliced(request, audio, [(0.0, duration_s)], [text])
+            words = section_words(text, aligned)
+            if not words:
+                warnings.append({"code": "SPEAKER_TURNS_WORDS_UNALIGNED"})
+        except Exception as exc:
+            print(f"[WARNUNG-TURNS] Wortzeiten fehlgeschlagen: {exc}", file=sys.stderr)
+            warnings.append({"code": "SPEAKER_TURNS_WORDS_UNALIGNED", "message": str(exc)[:300]})
+        timings["alignment"] = round((time.monotonic() - align_started) * 1000)
+    wire = turns_to_wire(assign_section_words(turns, words))
+    return text, transcription_ms, model_id, decision, wire, timings, warnings
+
+
 def _record_log(
     request: Request,
     history_id: str,
@@ -1081,13 +1186,36 @@ async def _process_diarization(
     speaker_refinement_mode = str(configuration.get("speaker_refinement") or "off")
     include_unknown_speaker_audio = bool(configuration.get("unknown_speaker_audio", False))
     dia_started = time.monotonic()
-    dia_response = await diarize_v2(
-        file.file,
-        file.filename or "upload",
-        file.content_type,
-        num_speakers=expected_speakers,
-        min_speakers=len(known_speakers) if expected_speakers is None and known_speakers else None,
-    )
+    min_speakers = len(known_speakers) if expected_speakers is None and known_speakers else None
+    speech_probs: np.ndarray | None = None
+    if configured_diarization_engine() == DIARIZATION_ENGINE_LOCAL:
+        # No DIA server call and no silent fallback to it: the operator chose the engine, a missing seg-3.0
+        # checkpoint is reported like an unreachable model (503 MODEL_UNAVAILABLE, not retryable).
+        try:
+            if LOCAL_WINDOW_FILTER == "silero":
+                speech_probs = await asyncio.to_thread(silero_frame_probs, audio)
+            dia_response = await run_local_diarization(
+                http_request.app.state.local_gpu_lock,
+                audio,
+                num_speakers=expected_speakers,
+                min_speakers=min_speakers,
+                speech_probs=speech_probs,
+            )
+        except RuntimeError as exc:
+            raise V2ApiError(
+                503,
+                "MODEL_UNAVAILABLE",
+                f"Lokale Diarisierung nicht verfuegbar: {exc}",
+                False,
+            ) from exc
+    else:
+        dia_response = await diarize_v2(
+            file.file,
+            file.filename or "upload",
+            file.content_type,
+            num_speakers=expected_speakers,
+            min_speakers=min_speakers,
+        )
     dia_duration_ms = round((time.monotonic() - dia_started) * 1000)
     duration_ms = round(get_audio_duration_seconds(audio) * 1000)
     standard = _normalize_dia_segments(dia_response.get("diarization", []), duration_ms)
@@ -1159,6 +1287,7 @@ async def _process_diarization(
                     apply_repetition_filter,
                     language_override,
                     speaker_languages,
+                    speech_probs,
                 )
             )
             transcription_ms = extra_timings.get("transcription", 0)
@@ -1461,7 +1590,9 @@ def create_v2_capabilities_api(app: FastAPI) -> FastAPI:
             },
             "modes": list(V2_MODES),
             "embedding": {"id": embedding_model_metadata()["id"]},
-            "diarization": {"configured": dia_is_configured()},
+            "diarization": diarization_capability(dia_is_configured()),
+            # Genesis3 docs/243 8.8: offered only while the switch is on and the seg-3.0 checkpoint is usable.
+            "speaker_turns": speaker_turns_capability(speaker_turns_available()),
         }
 
     return app
@@ -1505,6 +1636,13 @@ def create_v2_api(app: FastAPI) -> FastAPI:
             form_data, file, request_json = await _parse_multipart_parts(http_request)
             parsed = _parse_request_json(request_json)
             mode = parsed["mode"]
+            if parsed.get("speaker_turns") is not None and not speaker_turns_available():
+                raise V2ApiError(
+                    422,
+                    "INVALID_REQUEST",
+                    "speaker_turns wird von diesem Server nicht angeboten (siehe GET /v2/capabilities).",
+                    details={"field": "request.speaker_turns", "reason": "not_supported"},
+                )
             filename = file.filename or "upload"
             decode_started = time.monotonic()
             try:
@@ -1537,6 +1675,32 @@ def create_v2_api(app: FastAPI) -> FastAPI:
                 timings["embedding"] = embedding_ms
                 models["embedding"] = embedding_model_metadata()
                 result = {"embedding": {"vector": vector}}
+            elif mode == "transcript" and parsed.get("speaker_turns") is not None:
+                (
+                    transcript_text,
+                    transcription_ms,
+                    asr_model_id,
+                    language_decision,
+                    wire_turns,
+                    turn_timings,
+                    turn_warnings,
+                ) = await _transcribe_with_speaker_turns(
+                    http_request,
+                    audio,
+                    parsed.get("language"),
+                    parsed["speaker_turns"]["known_speakers"],
+                    filter_enabled,
+                )
+                timings["transcription"] = transcription_ms
+                timings.update(turn_timings)
+                warnings.extend(turn_warnings)
+                models["asr"] = {"id": asr_model_id}
+                models["embedding"] = embedding_model_metadata()
+                models["segmentation"] = {"id": SEGMENTATION_MODEL_NAME}
+                result = {
+                    "transcript": {"text": transcript_text, "language": language_decision.language},
+                    "speaker_turns": wire_turns,
+                }
             elif mode == "transcript":
                 transcript_text, transcription_ms, _, asr_model_id, language_decision = await _transcribe_audio(
                     http_request, audio, parsed.get("language")
