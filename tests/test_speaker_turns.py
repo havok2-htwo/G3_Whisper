@@ -113,6 +113,35 @@ class TurnTests(unittest.TestCase):
         self.assertIsNone(turns[0]["vector"])
         self.assertEqual(st.speaker_turns({"sm": np.zeros(50, bool), "w15": section["w15"], "w30": section["w30"]}, []), [])
 
+    def test_short_known_turn_without_a_window_sends_no_vector(self) -> None:
+        # B talks 1.3 s: no whole 1.5 s window fits into the turn. Its state is the client's own centroid, so the
+        # turn keeps the ref but must not echo that centroid back as a measured vector with cos 1.0.
+        section = _section([(0.0, 3.0, 1), (3.0, 4.3, 2), (4.3, 8.0, 1)], 8.0)
+        known = [{"id": "s1", "vector": _voice(1), "weight": 20.0}, {"id": "s2", "vector": _voice(2), "weight": 10.0}]
+        turns = st.speaker_turns(section, known)
+        short = [t for t in turns if t["speaker_ref"] == "s2"]
+        self.assertEqual(len(short), 1, turns)
+        self.assertIsNone(short[0]["vector"])
+        self.assertIsNone(short[0]["cos"])
+        self.assertGreater(short[0]["support_s"], 1.0)
+        for turn in turns:
+            if turn["speaker_ref"] == "s1":
+                self.assertEqual(turn["vector"].shape, (192,))
+                self.assertLess(turn["cos"], 0.9999)  # measured, not the sent centroid
+        wire = st.turns_to_wire(turns)
+        self.assertIsNone([t for t in wire if t["speaker_ref"] == "s2"][0]["vector"])
+        json.dumps(wire)
+
+    def test_short_new_voice_turn_keeps_its_section_centroid(self) -> None:
+        section = _section([(0.0, 3.0, 1), (3.0, 4.3, 2), (4.3, 8.0, 1)], 8.0)
+        new_vec = st.speaker_turns(section, [{"id": "s1", "vector": _voice(1), "weight": 20.0}])
+        refs = {t["speaker_ref"] for t in new_vec}
+        for turn in new_vec:
+            if str(turn["speaker_ref"]).startswith("new:"):
+                self.assertIsNotNone(turn["vector"])  # measured in this section
+                self.assertIsNotNone(turn["cos"])
+        self.assertIn("s1", refs)
+
     def test_speech_mask_from_segmentation(self) -> None:
         n = st.section_frames(16000 * 4)
         self.assertEqual(n, 200)

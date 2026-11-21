@@ -81,16 +81,26 @@ def _default_user_hub() -> Path:
     return Path.home() / ".cache" / "torch" / "hub"
 
 
+def _silero_local_dir() -> Path | None:
+    candidates = [
+        _default_user_hub() / "snakers4_silero-vad_master",
+        Path(torch.hub.get_dir()) / "snakers4_silero-vad_master",
+    ]
+    return next((c for c in candidates if c.is_dir()), None)
+
+
+def silero_available_locally() -> bool:
+    """Silero is loaded or its hub copy is on disk (no download needed to use it)."""
+
+    return _silero_model is not None or _silero_local_dir() is not None
+
+
 def _load_silero_model():
     global _silero_model
     with _silero_lock:
         if _silero_model is not None:
             return _silero_model
-        candidates = [
-            _default_user_hub() / "snakers4_silero-vad_master",
-            Path(torch.hub.get_dir()) / "snakers4_silero-vad_master",
-        ]
-        local = next((c for c in candidates if c.is_dir()), None)
+        local = _silero_local_dir()
         if local is not None:
             model, _ = torch.hub.load(str(local), "silero_vad", source="local", trust_repo=True)
         else:
@@ -123,6 +133,10 @@ def silero_frame_probs(audio: np.ndarray) -> np.ndarray:
     streams = torch.from_numpy(padded).reshape(n_streams, SILERO_STREAM_FRAMES * SILERO_WINDOW)
 
     probs = np.empty((n_streams, SILERO_STREAM_FRAMES), dtype=np.float32)
+    # Silero is causal, so one stream (a live section, any clip up to ~33 s)
+    # stops at its last real frame instead of stepping through the zero padding;
+    # the returned values are the same.
+    steps = n_frames if n_streams == 1 else SILERO_STREAM_FRAMES
     # The one Silero model carries recurrent state per stream row between calls.
     # Two long requests run this on different asyncio.to_thread workers, so one
     # pass at a time: interleaved steps would corrupt each other's state (or
@@ -131,7 +145,7 @@ def silero_frame_probs(audio: np.ndarray) -> np.ndarray:
         model.reset_states()
         try:
             with torch.no_grad():
-                for frame_index in range(SILERO_STREAM_FRAMES):
+                for frame_index in range(steps):
                     chunk = streams[:, frame_index * SILERO_WINDOW : (frame_index + 1) * SILERO_WINDOW]
                     out = model(chunk, SAMPLE_RATE)
                     probs[:, frame_index] = out.reshape(-1).cpu().numpy()
@@ -457,7 +471,36 @@ def apply_mms_device_setting() -> bool:
         return True
 
 
-def _load_mms():
+# torch.hub caches the MMS_FA weights as <hub>/checkpoints/<url basename>; torchaudio's MMS_FA URL is
+# .../mms/torchaudio/ctc_alignment_mling_uroman/model.pt. A constant, so the capability check imports nothing.
+MMS_CHECKPOINT_FILE = "model.pt"
+
+
+def _mms_hub_choice() -> tuple[Path, bool]:
+    """(hub dir to load MMS_FA from, whether its checkpoint is already there).
+
+    ReDimNet's loader redirects the global torch.hub dir into the model cache;
+    the MMS checkpoint usually lives in the user hub. Whichever hub has the file
+    wins; without one the user hub is used when it has a checkpoints folder
+    (as before), else the current hub dir.
+    """
+
+    name = MMS_CHECKPOINT_FILE
+    user_hub = _default_user_hub()
+    current_hub = Path(torch.hub.get_dir())
+    for hub in (user_hub, current_hub):
+        if (hub / "checkpoints" / name).is_file():
+            return hub, True
+    return (user_hub if (user_hub / "checkpoints").is_dir() else current_hub), False
+
+
+def mms_available_locally() -> bool:
+    """MMS_FA is loaded or its checkpoint is on disk: using it downloads nothing (cheap, no model load)."""
+
+    return _mms_components["model"] is not None or _mms_hub_choice()[1]
+
+
+def _load_mms(*, allow_download: bool = True):
     with _mms_lock:
         if _mms_components["model"] is not None:
             # Follow a changed local_gpu_device instead of staying on the old card.
@@ -465,14 +508,14 @@ def _load_mms():
             if str(_mms_components["device"]) != str(target_device):
                 _move_mms(target_device)
             return _mms_components
-        # ReDimNet's loader redirects the global torch.hub dir into the model
-        # cache; the MMS checkpoint usually already lives in the user hub, so
-        # prefer whichever hub dir has it instead of downloading 1.2GB twice.
+        # Prefer whichever hub dir has the checkpoint instead of downloading
+        # 1.2GB twice (see _mms_hub_choice).
         previous_hub = torch.hub.get_dir()
-        user_hub = _default_user_hub()
+        hub, present = _mms_hub_choice()
+        if not present and not allow_download:
+            raise RuntimeError("MMS_FA-Checkpoint fehlt lokal; ohne Download keine Wortzeiten.")
         try:
-            if (user_hub / "checkpoints").is_dir():
-                torch.hub.set_dir(str(user_hub))
+            torch.hub.set_dir(str(hub))
             from torchaudio.pipelines import MMS_FA as bundle
 
             # Same card as the ASR engine (local_gpu_device). torch.device("cuda")
@@ -541,8 +584,12 @@ def align_chunk_slice(
     chunks: Sequence[tuple[float, float]],
     texts: Sequence[str],
     bounds: Sequence[float],
+    allow_download: bool = True,
 ) -> list[dict[str, Any]]:
     """Align only the chunks in ``indices``; the GPU unit of the sliced driver.
+
+    ``allow_download`` False (the live speaker_turns path) raises instead of
+    fetching a missing MMS_FA checkpoint under the GPU lock.
 
     Seam ownership only needs the neighbouring chunk boundaries, so any subset
     of chunks can be aligned independently and the per-slice word lists simply
@@ -553,7 +600,7 @@ def align_chunk_slice(
     total_s = len(audio) / SAMPLE_RATE
     words: list[dict[str, Any]] = []
     with shared_gpu_lease():
-        components = _load_mms()
+        components = _load_mms() if allow_download else _load_mms(allow_download=False)
         model, tokenizer, aligner = components["model"], components["tokenizer"], components["aligner"]
         device = components["device"]
         dtype = components.get("dtype") or torch.float32

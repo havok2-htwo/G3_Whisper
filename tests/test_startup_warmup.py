@@ -156,25 +156,54 @@ class SegmentationWarmupTests(unittest.TestCase):
 
         model = mock.Mock()
         cases = (
-            ({"diarization_engine": "dia", "speaker_turns_enabled": False}, 0),
-            ({"diarization_engine": "dia", "speaker_turns_enabled": True}, 1),
-            ({"diarization_engine": "local", "speaker_turns_enabled": False}, 1),
+            ({"diarization_engine": "dia", "speaker_turns_enabled": False}, 0, 0),
+            ({"diarization_engine": "dia", "speaker_turns_enabled": True}, 1, 1),
+            ({"diarization_engine": "local", "speaker_turns_enabled": False}, 1, 0),
         )
-        for values, loads in cases:
+        for values, loads, helpers in cases:
             with self.subTest(values=values):
                 with (
                     mock.patch.dict(current_settings, values),
                     mock.patch.object(seg, "load_segmentation_model", return_value=model) as load,
                     mock.patch.object(diarization_engine, "prepare_window_length") as prepare,
+                    mock.patch.object(diarization_engine, "_warmup_speaker_turns_helpers") as warm_helpers,
                 ):
                     server._warmup_segmentation()
                 self.assertEqual(load.call_count, loads)
                 self.assertEqual(prepare.call_count, loads)
+                self.assertEqual(warm_helpers.call_count, helpers)
         with (
             mock.patch.dict(current_settings, {"speaker_turns_enabled": True}),
             mock.patch.object(seg, "load_segmentation_model", side_effect=RuntimeError("CUDA error")),
         ):
             server._warmup_segmentation()
+
+    def test_speaker_turns_warms_mms_and_silero_only_from_local_files(self) -> None:
+        from backend import genesis_whisper_server_diarization_engine as diarization_engine
+
+        wxc = diarization_engine._wxc
+        for local in (True, False):
+            with self.subTest(local=local):
+                with (
+                    mock.patch.object(wxc, "mms_available_locally", return_value=local),
+                    mock.patch.object(wxc, "silero_available_locally", return_value=local),
+                    mock.patch.object(wxc, "_load_mms") as load_mms,
+                    mock.patch.object(wxc, "silero_frame_probs") as silero,
+                ):
+                    diarization_engine._warmup_speaker_turns_helpers()
+                if local:
+                    load_mms.assert_called_once_with(allow_download=False)
+                    silero.assert_called_once()
+                else:
+                    load_mms.assert_not_called()
+                    silero.assert_not_called()
+        with (
+            mock.patch.object(wxc, "mms_available_locally", return_value=True),
+            mock.patch.object(wxc, "silero_available_locally", return_value=True),
+            mock.patch.object(wxc, "_load_mms", side_effect=RuntimeError("CUDA error")),
+            mock.patch.object(wxc, "silero_frame_probs", side_effect=RuntimeError("kaputt")),
+        ):
+            diarization_engine._warmup_speaker_turns_helpers()  # logs only
 
 
 if __name__ == "__main__":

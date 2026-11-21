@@ -207,7 +207,7 @@ class SpeakerTurnsEndpointTests(unittest.TestCase):
         self.audio = np.full(16000 * 10, 0.1, dtype=np.float32)
 
     def _call(self, body: dict, *, available: bool = True, audio: np.ndarray | None = None,
-              turns=None, aligned=None, transcribe=None):
+              turns=None, aligned=None, transcribe=None, mms_local: bool = True):
         upload = _upload()
         raw_request = json.dumps({"schema_version": "2.0", "mode": "transcript", **body})
         form = FormData([("file", upload), ("request", raw_request)])
@@ -226,6 +226,7 @@ class SpeakerTurnsEndpointTests(unittest.TestCase):
             mock.patch.object(v2, "_transcribe_audio", new=self.transcribe),
             mock.patch.object(v2, "compute_section_turns", new=self.compute),
             mock.patch.object(v2, "_align_words_sliced", new=self.align),
+            mock.patch.object(v2, "mms_available_locally", return_value=mms_local),
         ):
             return asyncio.run(self.endpoint(_request(self.app)))
 
@@ -251,6 +252,17 @@ class SpeakerTurnsEndpointTests(unittest.TestCase):
         self.assertEqual(known[0]["id"], "s1")
         self.assertEqual(self.align.await_args.args[2], [(0.0, 10.0)])
         self.assertEqual(self.align.await_args.args[3], ["Guten Morgen. Hallo zusammen."])
+        # never a download of MMS_FA under the GPU lock on this path
+        self.assertIs(self.align.await_args.kwargs.get("allow_download"), False)
+
+    def test_missing_mms_checkpoint_skips_the_alignment_and_warns(self) -> None:
+        response = self._call({"speaker_turns": {"known_speakers": []}}, mms_local=False)
+        payload = _payload(response)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(payload["result"]["transcript"]["text"], "Guten Morgen. Hallo zusammen.")
+        self.assertEqual([t["text"] for t in payload["result"]["speaker_turns"]], ["", ""])
+        self.assertEqual([w["code"] for w in payload["warnings"]], ["SPEAKER_TURNS_WORDS_UNALIGNED"])
+        self.align.assert_not_awaited()
 
     def test_not_offered_is_422_before_decode_and_asr(self) -> None:
         response = self._call({"speaker_turns": {"known_speakers": []}}, available=False)
@@ -324,6 +336,7 @@ class SectionTurnsDriverTests(unittest.TestCase):
         with (
             mock.patch.object(engine, "segment_audio_range", side_effect=meeting.segment_range),
             mock.patch.object(engine, "_embed_native", side_effect=meeting.embed_native),
+            mock.patch.object(engine._wxc, "silero_available_locally", return_value=False),
         ):
             turns = asyncio.run(engine.compute_section_turns(lock, meeting.audio, known))
         reference = speaker_turns(section_features(meeting.audio, meeting.segmentation(), meeting.embed_reference), known)
@@ -332,6 +345,47 @@ class SectionTurnsDriverTests(unittest.TestCase):
         self.assertEqual([t["speaker_ref"] for t in turns], ["s1", "new:1"])
         # one seg-3.0 slice and one ReDimNet slice per window scale, each under the lock
         self.assertEqual(lock.acquired, 3)
+
+    def _planned_starts(self, meeting, probs=None, silero_error=None):
+        planned: dict = {}
+        original = engine.plan_scale_starts
+
+        def spy(num_samples, speech, frame_samples, scales):
+            planned["frame_samples"] = frame_samples
+            planned["starts"] = original(num_samples, speech, frame_samples, scales)
+            return planned["starts"]
+
+        silero = mock.Mock(return_value=probs, side_effect=silero_error)
+        with (
+            mock.patch.object(engine, "segment_audio_range", side_effect=meeting.segment_range),
+            mock.patch.object(engine, "_embed_native", side_effect=meeting.embed_native),
+            mock.patch.object(engine._wxc, "silero_available_locally", return_value=True),
+            mock.patch.object(engine._wxc, "silero_frame_probs", new=silero),
+            mock.patch.object(engine, "plan_scale_starts", side_effect=spy),
+        ):
+            turns = asyncio.run(engine.compute_section_turns(_CountingLock(), meeting.audio, []))
+        return planned, turns, silero
+
+    def test_windows_are_chosen_by_silero_like_the_live_bench(self) -> None:
+        meeting = _Meeting([(0.3, 4.2, 11), (5.0, 9.6, 12)], 10.0)
+        frames = len(meeting.audio) // 512
+        t = (np.arange(frames) * 512 + 256) / 16000.0
+        # Silero hears only the first voice: no window over the second may be planned, although seg-3.0 marks it.
+        probs = np.where((t >= 0.3) & (t < 4.2), 0.9, 0.1).astype(np.float32)
+        planned, turns, silero = self._planned_starts(meeting, probs)
+        silero.assert_called_once()
+        self.assertEqual(planned["frame_samples"], 512)
+        for name, (length_s, hop_s) in engine.SECTION_WINDOW_SCALES.items():
+            expected = ld.plan_window_starts(len(meeting.audio), length_s, hop_s, probs > 0.5, 512)
+            np.testing.assert_array_equal(planned["starts"][name], expected)
+        self.assertTrue(all(int(s) / 16000.0 < 4.2 for s in planned["starts"]["w15"]))
+        self.assertTrue(turns)
+
+    def test_failing_silero_falls_back_to_the_seg_mask(self) -> None:
+        meeting = _Meeting([(0.3, 4.2, 11), (5.0, 9.6, 12)], 10.0)
+        planned, turns, _ = self._planned_starts(meeting, silero_error=RuntimeError("kaputt"))
+        self.assertEqual(planned["frame_samples"], 320)
+        self.assertEqual([t["speaker_ref"] for t in turns], ["new:1", "new:2"])
 
 
 class LocalDiarizationDriverTests(unittest.TestCase):
@@ -474,10 +528,13 @@ class CapabilitiesTests(unittest.TestCase):
         admin.current_settings.clear()
         admin.current_settings.update(self.original)
 
-    def _caps(self, checkpoint: bool, **values) -> dict:
+    def _caps(self, checkpoint: bool, mms_local: bool = True, **values) -> dict:
         admin.current_settings.clear()
         admin.current_settings.update(storage.normalize_settings({**storage.DEFAULT_SETTINGS, **values}))
-        with mock.patch.object(engine, "segmentation_available", return_value=checkpoint):
+        with (
+            mock.patch.object(engine, "segmentation_available", return_value=checkpoint),
+            mock.patch.object(engine._wxc, "mms_available_locally", return_value=mms_local),
+        ):
             response = self.client.get("/v2/capabilities")
         self.assertEqual(response.status_code, 200, response.text)
         return response.json()
@@ -491,6 +548,10 @@ class CapabilitiesTests(unittest.TestCase):
     def test_speaker_turns_not_offered_without_checkpoint_or_switch(self) -> None:
         self.assertEqual(self._caps(False)["speaker_turns"], {"supported": False})
         self.assertEqual(self._caps(True, speaker_turns_enabled=False)["speaker_turns"], {"supported": False})
+
+    def test_speaker_turns_not_offered_without_a_local_mms_checkpoint(self) -> None:
+        # The turn texts need MMS_FA word times; offering the field would mean a download under the GPU lock.
+        self.assertEqual(self._caps(True, mms_local=False)["speaker_turns"], {"supported": False})
 
     def test_diarization_reports_the_engine(self) -> None:
         self.assertEqual(self._caps(True)["diarization"]["engine"], "dia")

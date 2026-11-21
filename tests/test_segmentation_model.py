@@ -185,6 +185,145 @@ class CheckpointLoadingTests(unittest.TestCase):
             seg.build_model(state)
 
 
+class _ScriptedSideEffect(torch.nn.Module):
+    """A scripted module whose __setstate__ writes a marker file: runs inside torch.jit.load."""
+
+    def __init__(self, marker: str) -> None:
+        super().__init__()
+        self.marker = marker
+        self.weight = torch.nn.Parameter(torch.zeros(2))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.weight
+
+    @torch.jit.export
+    def __getstate__(self):
+        return (self.marker, self.weight, self.training)
+
+    @torch.jit.export
+    def __setstate__(self, state: tuple[str, torch.Tensor, bool]) -> None:
+        self.marker = state[0]
+        self.weight = state[1]
+        self.training = state[2]
+        torch.save(torch.zeros(1), self.marker)
+
+
+class TorchScriptRefusalTests(unittest.TestCase):
+    def _scripted(self, tmp: Path) -> tuple[Path, Path]:
+        marker = tmp / "pwned.pt"
+        path = tmp / "pytorch_model.bin"
+        torch.jit.save(torch.jit.script(_ScriptedSideEffect(str(marker))), str(path))
+        if marker.exists():
+            marker.unlink()  # scripting itself does not run __setstate__; make sure the check starts clean
+        return path, marker
+
+    def test_counter_check_torch_load_runs_the_scripted_setstate(self) -> None:
+        # Proves the attack is real: torch.load ignores pickle_module for a TorchScript zip.
+        with tempfile.TemporaryDirectory() as tmp:
+            path, marker = self._scripted(Path(tmp))
+            torch.load(str(path), map_location="cpu", pickle_module=seg._restricted_pickle, weights_only=False)
+            self.assertTrue(marker.exists())
+
+    def test_torchscript_archive_is_refused_before_any_code_runs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path, marker = self._scripted(Path(tmp))
+            with self.assertRaises(ValueError):
+                seg.load_checkpoint_state(path)
+            with self.assertRaises(ValueError):
+                seg.SegmentationModel.from_checkpoint(path)
+            self.assertFalse(marker.exists())
+
+    def test_marker_records_are_refused_in_a_plain_zip_too(self) -> None:
+        import io
+        import zipfile
+
+        for name in ("archive/constants.pkl", "constants.pkl", "archive/code/__torch__.py", "code/x.py"):
+            buffer = io.BytesIO()
+            with zipfile.ZipFile(buffer, "w") as archive:
+                archive.writestr("archive/data.pkl", b"x")
+                archive.writestr(name, b"x")
+            with self.assertRaises(ValueError, msg=name):
+                seg._refuse_torchscript(buffer.getvalue())
+        with self.assertRaises(ValueError):
+            seg._refuse_torchscript(b"PK\x03\x04 not really a zip")
+
+    def test_a_plain_torch_save_checkpoint_passes_the_check(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "pytorch_model.bin"
+            torch.save({"state_dict": _random_model(2).state_dict()}, path)
+            seg._refuse_torchscript(path.read_bytes())
+            state, _ = seg.load_checkpoint_state(path)
+        self.assertIn("classifier.weight", state)
+
+
+class LoadLockTests(unittest.TestCase):
+    def setUp(self) -> None:
+        state = dict(seg._segmentation_state)
+        self.addCleanup(lambda: (seg._segmentation_state.clear(), seg._segmentation_state.update(state)))
+        seg._segmentation_state.update({"model": None, "path": None, "device": None, "failed_path": None,
+                                        "error": None})
+
+    def test_a_running_load_does_not_block_the_availability_check(self) -> None:
+        import threading
+        from unittest import mock
+
+        started, release = threading.Event(), threading.Event()
+        checkpoint = Path("/m/pytorch_model.bin")
+
+        def slow_load(_path, _device):
+            started.set()
+            release.wait(10)  # stands for the GPU lease wait / checkpoint read
+            return mock.Mock(device=torch.device("cpu"))
+
+        results: dict = {}
+        with (
+            mock.patch.object(seg, "resolve_segmentation_checkpoint", return_value=checkpoint),
+            mock.patch.object(seg, "_target_device", return_value=torch.device("cpu")),
+            mock.patch.object(seg.SegmentationModel, "from_checkpoint", side_effect=slow_load),
+        ):
+            loader = threading.Thread(target=lambda: results.setdefault("model", seg.load_segmentation_model()))
+            loader.start()
+            self.assertTrue(started.wait(5))
+            probe = threading.Thread(target=lambda: results.setdefault("available", seg.segmentation_available()))
+            probe.start()
+            probe.join(2)
+            status_alive = probe.is_alive()
+            status = seg.segmentation_status()
+            release.set()
+            loader.join(5)
+        self.assertFalse(status_alive, "segmentation_available waited for the running load")
+        self.assertTrue(results["available"])
+        self.assertFalse(status["loaded"])
+        self.assertIsNotNone(results["model"])
+
+    def test_concurrent_loads_load_once(self) -> None:
+        import threading
+        from unittest import mock
+
+        calls: list = []
+        gate = threading.Event()
+
+        def load(_path, _device):
+            calls.append(1)
+            gate.wait(5)
+            return mock.Mock(device=torch.device("cpu"))
+
+        with (
+            mock.patch.object(seg, "resolve_segmentation_checkpoint", return_value=Path("/m/pytorch_model.bin")),
+            mock.patch.object(seg, "_target_device", return_value=torch.device("cpu")),
+            mock.patch.object(seg.SegmentationModel, "from_checkpoint", side_effect=load),
+        ):
+            out: list = []
+            threads = [threading.Thread(target=lambda: out.append(seg.load_segmentation_model())) for _ in range(3)]
+            for thread in threads:
+                thread.start()
+            gate.set()
+            for thread in threads:
+                thread.join(5)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(len({id(m) for m in out}), 1)
+
+
 class DiscoveryTests(unittest.TestCase):
     def test_explicit_path_then_hf_cache(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

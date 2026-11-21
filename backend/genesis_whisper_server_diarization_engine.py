@@ -24,6 +24,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 import numpy as np
 
+from . import genesis_whisper_server_wxc as _wxc
 from .genesis_whisper_server_globals import current_settings, settings_lock
 from .genesis_whisper_server_gpu import run_sliced_gpu_phase
 from .genesis_whisper_server_local_diarization import (
@@ -73,6 +74,12 @@ SPEAKER_TURNS_MAX_AUDIO_S = 60.0
 # Window speech filter of the batch pipeline: "silero" as in the benchmark (window kept with >= 30 % Silero speech
 # frames), or "seg" (the seg-3.0 speech mask, no Silero pass).
 LOCAL_WINDOW_FILTER = "silero"
+# Live sections pick their windows the same way the live bench did (Silero p > 0.5 per 512 samples, >= 30 % of the
+# window): about 70 ms CPU per 15 s section, run next to seg-3.0. Without a local Silero copy (it is never fetched
+# here) the seg-3.0 mask stands in; on the bench sections that kept ~2 % different windows.
+SECTION_WINDOW_FILTER = "silero"
+SILERO_FRAME_SAMPLES = 512
+SILERO_SPEECH_PROB = 0.5
 
 
 # ---------------------------------------------------------------------------
@@ -98,9 +105,10 @@ def speaker_turns_switch(settings: Optional[Mapping[str, Any]] = None) -> bool:
 
 
 def speaker_turns_available() -> bool:
-    """speaker_turns is offered: the switch is on and a seg-3.0 checkpoint is usable (no model load here)."""
+    """speaker_turns is offered: the switch is on, a seg-3.0 checkpoint is usable and the MMS_FA checkpoint for the
+    word times is on disk (file checks only: no model load, no download)."""
 
-    return speaker_turns_switch() and segmentation_available()
+    return speaker_turns_switch() and segmentation_available() and _wxc.mms_available_locally()
 
 
 def segmentation_needed(settings: Optional[Mapping[str, Any]] = None) -> bool:
@@ -223,15 +231,22 @@ async def compute_section_turns(
     audio: np.ndarray,
     known_speakers: Sequence[Mapping[str, Any]],
 ) -> List[Dict[str, Any]]:
-    """Turns (without text) of one section: seg-3.0 mask, 1.5 s / 3 s windows, the frozen speaker_turns logic."""
+    """Turns (without text) of one section: seg-3.0 mask, 1.5 s / 3 s windows chosen by Silero (as benchmarked;
+    the seg-3.0 mask without a local Silero), the frozen speaker_turns logic."""
 
     samples = np.ascontiguousarray(np.asarray(audio, np.float32).reshape(-1))
-    segmentation = await segment_sliced(lock, samples)
+    if SECTION_WINDOW_FILTER == "silero" and _wxc.silero_available_locally():
+        segmentation, probs = await asyncio.gather(segment_sliced(lock, samples),
+                                                   asyncio.to_thread(_section_silero, samples))
+    else:
+        segmentation, probs = await segment_sliced(lock, samples), None
     n = section_frames(len(samples))
     mask = await asyncio.to_thread(section_speech_mask, segmentation, n)
-    starts = await asyncio.to_thread(
-        plan_scale_starts, len(samples), mask, int(GRID_S * SAMPLE_RATE), SECTION_WINDOW_SCALES
-    )
+    if probs is not None:
+        speech, frame_samples = np.asarray(probs) > SILERO_SPEECH_PROB, SILERO_FRAME_SAMPLES
+    else:
+        speech, frame_samples = mask, int(GRID_S * SAMPLE_RATE)
+    starts = await asyncio.to_thread(plan_scale_starts, len(samples), speech, frame_samples, SECTION_WINDOW_SCALES)
     vectors = await embed_scales(lock, samples, starts, SECTION_WINDOW_SCALES)
 
     def _cpu() -> List[Dict[str, Any]]:
@@ -240,6 +255,17 @@ async def compute_section_turns(
         return speaker_turns(section, known_speakers)
 
     return await asyncio.to_thread(_cpu)
+
+
+def _section_silero(samples: np.ndarray) -> Optional[np.ndarray]:
+    """Silero probabilities of a section, None when Silero fails (the seg-3.0 mask then picks the windows)."""
+
+    try:
+        return _wxc.silero_frame_probs(samples)
+    except Exception as exc:
+        print(f"[WARNUNG-TURNS] Silero fuer die Fensterauswahl fehlgeschlagen, seg-3.0-Maske stattdessen: {exc}",
+              file=sys.stderr)
+        return None
 
 
 def section_words(text: str, aligned: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
@@ -274,7 +300,9 @@ def section_words(text: str, aligned: Sequence[Mapping[str, Any]]) -> List[Dict[
 
 def warmup_segmentation() -> bool:
     """Startup (GPU thread): load seg-3.0, run it once on 10 s of quiet noise and warm ReDimNet's 1.5 s shapes,
-    only where a feature uses them. False when skipped or unavailable."""
+    only where a feature uses them. With speaker_turns on, also load MMS_FA (word times of the turns, ~0.6 GB fp16
+    resident from then on) and Silero (window choice) when their files are local, so the first live section pays no
+    load under the GPU lock; nothing is downloaded. False when skipped or unavailable."""
 
     from .genesis_whisper_server_segmentation import load_segmentation_model
 
@@ -293,7 +321,30 @@ def warmup_segmentation() -> bool:
         model.segment((rng.standard_normal(10 * SAMPLE_RATE) * 1e-3).astype(np.float32))
     prepare_window_length(int(SECTION_WINDOW_SCALES["w15"][0] * SAMPLE_RATE))
     print("[WARMUP-SEG] Segmentierung (seg-3.0) und ReDimNet 1,5 s sind bereit.", file=sys.stderr)
+    if speaker_turns_switch():
+        _warmup_speaker_turns_helpers()
     return True
+
+
+def _warmup_speaker_turns_helpers() -> None:
+    """MMS_FA and Silero for speaker_turns, each only from local files; a failure only logs."""
+
+    from .genesis_whisper_server_gpu import shared_gpu_lease
+
+    if _wxc.mms_available_locally():
+        try:
+            with shared_gpu_lease():
+                _wxc._load_mms(allow_download=False)
+            print("[WARMUP-SEG] MMS_FA fuer die Wortzeiten von speaker_turns ist geladen.", file=sys.stderr)
+        except Exception as exc:
+            print(f"[WARMUP-SEG] MMS_FA nicht geladen: {exc}", file=sys.stderr)
+    else:
+        print("[WARMUP-SEG] MMS_FA-Checkpoint fehlt lokal; speaker_turns wird nicht angeboten.", file=sys.stderr)
+    if SECTION_WINDOW_FILTER == "silero" and _wxc.silero_available_locally():
+        try:
+            _wxc.silero_frame_probs(np.zeros(SAMPLE_RATE, np.float32))
+        except Exception as exc:
+            print(f"[WARMUP-SEG] Silero nicht geladen: {exc}", file=sys.stderr)
 
 
 __all__ = [

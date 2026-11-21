@@ -11,6 +11,7 @@ import sys
 import time
 import uuid
 from dataclasses import dataclass, field
+from functools import partial
 from typing import Any, Mapping, Sequence
 
 import numpy as np
@@ -104,6 +105,7 @@ from .genesis_whisper_server_wxc import (
     build_language_superchunks,
     build_superchunks,
     finish_verification,
+    mms_available_locally,
     padded_chunk_audio,
     plan_verification_windows,
     silero_frame_probs,
@@ -504,14 +506,18 @@ async def _align_words_sliced(
     audio: np.ndarray,
     chunks: Sequence[tuple[float, float]],
     texts: Sequence[str],
+    *,
+    allow_download: bool = True,
 ) -> list[dict[str, Any]]:
-    """Forced alignment chunk-group by chunk-group, releasing the lock in between."""
+    """Forced alignment chunk-group by chunk-group, releasing the lock in between.
+
+    ``allow_download`` False: a missing MMS_FA checkpoint raises instead of being fetched under the GPU lock."""
 
     bounds = alignment_bounds(chunks)
     parts = await run_sliced_gpu_phase(
         request.app.state.local_gpu_lock,
         list(range(len(chunks))),
-        align_chunk_slice,
+        align_chunk_slice if allow_download else partial(align_chunk_slice, allow_download=False),
         ALIGN_SLICE_CHUNKS,
         audio,
         chunks,
@@ -1125,10 +1131,14 @@ async def _transcribe_with_speaker_turns(
         return text, transcription_ms, model_id, decision, None, timings, warnings
 
     words: list[dict[str, Any]] = []
-    if text.strip():
+    if text.strip() and not mms_available_locally():
+        # The capability is only offered with MMS_FA on disk; a request that still arrives (cached capabilities,
+        # checkpoint removed since) gets turns without text instead of a 1.2 GB download under the GPU lock.
+        warnings.append({"code": "SPEAKER_TURNS_WORDS_UNALIGNED", "message": "MMS_FA-Checkpoint fehlt lokal."})
+    elif text.strip():
         align_started = time.monotonic()
         try:
-            aligned = await _align_words_sliced(request, audio, [(0.0, duration_s)], [text])
+            aligned = await _align_words_sliced(request, audio, [(0.0, duration_s)], [text], allow_download=False)
             words = section_words(text, aligned)
             if not words:
                 warnings.append({"code": "SPEAKER_TURNS_WORDS_UNALIGNED"})

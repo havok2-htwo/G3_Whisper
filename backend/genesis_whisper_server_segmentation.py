@@ -22,6 +22,7 @@ import pickle
 import sys
 import threading
 import types
+import zipfile
 from itertools import combinations
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional
@@ -131,16 +132,49 @@ _restricted_pickle.load = _restricted_load  # type: ignore[attr-defined]
 _restricted_pickle.loads = _restricted_loads  # type: ignore[attr-defined]
 
 
+def _refuse_torchscript(data: bytes) -> None:
+    """ValueError when ``data`` is a TorchScript archive.
+
+    ``torch.load`` hands such a zip to ``torch.jit.load`` without ever asking ``pickle_module``, and the JIT loader
+    runs the archive's scripted ``__setstate__`` methods while it loads. A segmentation checkpoint is a plain
+    ``torch.save`` zip (``<root>/data.pkl`` plus tensor records), so any ``constants.pkl`` or ``code/`` record (the
+    markers torch's own TorchScript detection and ``torch.jit.save`` use) is refused before torch sees the file.
+    """
+
+    buffer = io.BytesIO(data)
+    # torch decides "zip" by the local-header magic, zipfile by the central directory: either one counts, and a
+    # zip that zipfile cannot list is refused rather than handed to torch unchecked.
+    if not (data[:4] == b"PK\x03\x04" or zipfile.is_zipfile(buffer)):
+        return
+    buffer.seek(0)
+    try:
+        with zipfile.ZipFile(buffer) as archive:
+            names = archive.namelist()
+    except zipfile.BadZipFile as exc:
+        raise ValueError("Segmentierungs-Checkpoint ist kein lesbares Archiv.") from exc
+    for name in names:
+        parts = [part for part in name.replace("\\", "/").split("/") if part]
+        # Records sit under one root folder ("archive/data.pkl"); a flat layout counts too.
+        if parts and (parts[-1] == "constants.pkl" or "code" in parts[:2]):
+            raise ValueError("Segmentierungs-Checkpoint ist ein TorchScript-Archiv; das wird nicht geladen.")
+
+
 def load_checkpoint_state(path: str | os.PathLike) -> tuple[Dict[str, torch.Tensor], Dict[str, Any]]:
     """The state_dict and plain hyper-parameters of a pyannote checkpoint, without executing pickled code.
 
     ``weights_only=True`` refuses the file (it pickles pyannote classes); ``weights_only=False`` with the stock
     pickle would import and call whatever the file names. torch's zip loader runs our ``_RestrictedUnpickler``
     instead (it subclasses ``pickle_module.Unpickler`` and keeps storage handling), so only the allow-listed tensor
-    rebuild helpers are real and every other class is an inert stub.
+    rebuild helpers are real and every other class is an inert stub. A TorchScript archive would bypass the
+    unpickler (``torch.load`` routes it to ``torch.jit.load``), so it is refused first; the file is read once into
+    memory (~6 MB) and the same bytes are checked and loaded, nothing can swap it in between.
     """
 
-    checkpoint = torch.load(str(path), map_location="cpu", pickle_module=_restricted_pickle, weights_only=False)
+    with open(path, "rb") as handle:
+        data = handle.read()
+    _refuse_torchscript(data)
+    checkpoint = torch.load(io.BytesIO(data), map_location="cpu", pickle_module=_restricted_pickle,
+                            weights_only=False)
     if not isinstance(checkpoint, Mapping):
         raise ValueError("Segmentierungs-Checkpoint hat kein erwartetes Format.")
     state = checkpoint.get("state_dict", checkpoint)
@@ -536,7 +570,11 @@ def resolve_segmentation_checkpoint(settings: Optional[Mapping[str, Any]] = None
     return None
 
 
+# _segmentation_lock guards only _segmentation_state and is never held across slow work: segmentation_available()
+# and segmentation_status() take it on the event loop (capabilities, the speaker_turns gate). Loads serialize on
+# _segmentation_load_lock instead, which is held for the checkpoint read, the GPU lease wait and the device copy.
 _segmentation_lock = threading.Lock()
+_segmentation_load_lock = threading.Lock()
 # failed_path: the checkpoint whose last load failed. The capabilities report speaker_turns unsupported for it (no
 # GPU load from a GET); requests still retry the load, and a settings save clears it.
 _segmentation_state: Dict[str, Any] = {"model": None, "path": None, "device": None, "error": None, "failed_path": None}
@@ -548,35 +586,53 @@ def _target_device() -> torch.device:
     return resolve_local_device()
 
 
-def load_segmentation_model() -> Optional[SegmentationModel]:
-    """The process-wide model (loaded once, ~6 MB of weights), or None when no checkpoint is usable."""
-
+def _current_model(path: Optional[Path], device: torch.device) -> Optional[SegmentationModel]:
     with _segmentation_lock:
-        path = resolve_segmentation_checkpoint()
-        device = _target_device()
         current = _segmentation_state.get("model")
         if current is not None and _segmentation_state.get("path") == str(path) and str(current.device) == str(device):
             return current
+    return None
+
+
+def load_segmentation_model() -> Optional[SegmentationModel]:
+    """The process-wide model (loaded once, ~6 MB of weights), or None when no checkpoint is usable."""
+
+    path = resolve_segmentation_checkpoint()
+    device = _target_device()
+    current = _current_model(path, device)
+    if current is not None:
+        return current
+    with _segmentation_load_lock:
+        # Another thread may have loaded it while this one waited; the settings may have changed meanwhile too.
+        path = resolve_segmentation_checkpoint()
+        device = _target_device()
+        current = _current_model(path, device)
+        if current is not None:
+            return current
         if path is None:
-            _segmentation_state.update({"model": None, "path": None, "device": None, "failed_path": None,
-                                        "error": "Kein Segmentierungsmodell (segmentation-3.0) gefunden."})
+            with _segmentation_lock:
+                _segmentation_state.update({"model": None, "path": None, "device": None, "failed_path": None,
+                                            "error": "Kein Segmentierungsmodell (segmentation-3.0) gefunden."})
             return None
         try:
             with shared_gpu_lease():
                 model = SegmentationModel.from_checkpoint(path, device)
         except Exception as exc:
-            _segmentation_state.update({"model": None, "path": None, "device": None, "failed_path": str(path),
-                                        "error": f"{type(exc).__name__}: {exc}"})
+            with _segmentation_lock:
+                _segmentation_state.update({"model": None, "path": None, "device": None, "failed_path": str(path),
+                                            "error": f"{type(exc).__name__}: {exc}"})
             print(f"[FEHLER-SEG] Segmentierungsmodell konnte nicht geladen werden: {exc}", file=sys.stderr)
             return None
-        _segmentation_state.update({"model": model, "path": str(path), "device": str(device), "error": None,
-                                    "failed_path": None})
+        with _segmentation_lock:
+            _segmentation_state.update({"model": model, "path": str(path), "device": str(device), "error": None,
+                                        "failed_path": None})
         print(f"[INFO-SEG] {SEGMENTATION_MODEL_NAME} geladen aus {path} auf {device}.", file=sys.stderr)
         return model
 
 
 def segmentation_available() -> bool:
-    """A checkpoint exists locally and its last load did not fail (cheap; does not load the model)."""
+    """A checkpoint exists locally and its last load did not fail (cheap; does not load the model, never waits for a
+    running load)."""
 
     path = resolve_segmentation_checkpoint()
     if path is None:
@@ -627,7 +683,9 @@ def segmentation_status() -> Dict[str, Any]:
 def _loaded_model() -> SegmentationModel:
     model = load_segmentation_model()
     if model is None:
-        raise RuntimeError(_segmentation_state.get("error") or "Segmentierungsmodell nicht verfuegbar.")
+        with _segmentation_lock:
+            error = _segmentation_state.get("error")
+        raise RuntimeError(error or "Segmentierungsmodell nicht verfuegbar.")
     return model
 
 

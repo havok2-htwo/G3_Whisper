@@ -8,7 +8,8 @@ Viterbi pass and returns the label runs as turns::
     {start_ms, end_ms, text, speaker_ref, cos, vector[192], support_s}
 
 ``speaker_ref``/``vector``/``cos`` are None when the section has too little speech for one embedding window; the
-turn still carries its text. ``text`` is filled from the ASR words by ``assign_words_to_turns``.
+turn still carries its text. A turn of a known speaker that holds no whole window keeps its ``speaker_ref`` but
+sends ``vector``/``cos`` None (its state is the client's centroid, nothing was measured). ``text`` is filled from the ASR words by ``assign_words_to_turns``.
 
 Inputs per section: the speech mask (seg-3.0 on the section, ``section_speech_mask``) and ReDimNet2 windows of
 1.5 s (hop 0.5 s) and 3 s (hop 1.0 s) computed on the section audio only. The frozen configuration is the one the
@@ -382,11 +383,18 @@ def speaker_turns(section: Mapping[str, Any], known_speakers: Sequence[Mapping[s
     turns = []
     for l, a, b in runs:
         v, _ = _turn_vec(sec, a, b + 1, path, l)
-        if v is None:
+        cos: Optional[float] = None
+        if v is None and refs[l].startswith("new:"):
+            # A new voice's centroid was measured in this section, so it may stand for a turn too short for a window.
             v = C[l]
+        if v is not None:
+            cos = round(float(v @ C[l]), 3)
+        # A known speaker's state is the client's own centroid: echoing it back as the turn vector would add weight
+        # without evidence and claim cos 1.0. Without a window in the turn it keeps the ref and sends no vector.
         turns.append(dict(start_ms=int(round(a * GRID_S * 1000)), end_ms=int(round((b + 1) * GRID_S * 1000)),
-                          text="", speaker_ref=refs[l], cos=round(float(v @ C[l]), 3),
-                          vector=v.astype(np.float32), support_s=round(float(sm[a:b + 1].sum() * GRID_S), 2)))
+                          text="", speaker_ref=refs[l], cos=cos,
+                          vector=None if v is None else v.astype(np.float32),
+                          support_s=round(float(sm[a:b + 1].sum() * GRID_S), 2)))
     return turns
 
 

@@ -312,7 +312,8 @@ seiner Aufnahme mit.
 - `known_speakers`: hoechstens 16 Eintraege, je `id` (nicht leerer Text, hoechstens 64 Zeichen, eindeutig, nicht mit
   `new:` beginnend), `vector` (genau 192 endliche Zahlen, kein Nullvektor; der Server normiert ihn) und optional
   `weight` (positive Zahl, Stuetzsekunden). Leere Liste erlaubt.
-- Ungueltig, in einem anderen Modus oder nicht angeboten (Schalter aus, kein seg-3.0-Checkpoint) ist
+- Ungueltig, in einem anderen Modus oder nicht angeboten (Schalter aus, kein seg-3.0-Checkpoint, kein lokaler
+  MMS_FA-Checkpoint fuer die Wortzeiten) ist
   `422 INVALID_REQUEST` mit `error.details.field = "request.speaker_turns"` (bei "nicht angeboten" zusaetzlich
   `reason: "not_supported"`), immer vor dem Dekodieren des Audios. Der Genesis3-Client schickt dann genau einmal ohne
   das Feld.
@@ -335,16 +336,23 @@ Ergebnis: `result.transcript` wie ohne das Feld, dazu
   dieses Abschnitts. `vector` ist der L2-normierte Mittelwert der Fenster des Turns, `cos` seine Naehe zum Zustand,
   `support_s` die Sprechsekunden. `speaker_ref`, `vector` und `cos` sind `null`, wenn der Abschnitt fuer kein
   Embedding-Fenster reicht oder Woerter ausserhalb jeder erkannten Sprache liegen (ein Turn ohne Sprecherdaten).
+  Ein Turn eines bekannten Sprechers, in den kein ganzes Fenster passt (kurzer Einwurf unter rund 1,5 s), behaelt
+  seine `speaker_ref`, hat aber `vector` und `cos` `null`: sein Zustand ist der gesendete Zentroid, gemessen wurde
+  nichts. Ein kurzer Turn einer neuen Stimme traegt deren im Abschnitt gemessenen Zentroid.
 - `text`: die ASR-Woerter, deren Mitte im Turn liegt (sonst der naechste Turn). Die Wortzeiten kommen aus einer
   MMS_FA-Zwangsausrichtung (der WXC-Aligner) des ganzen Transkripts ueber den ganzen Abschnitt; Woerter ohne
   lateinische Buchstaben (Zahlen, Zeichen) bekommen die Zeit ihres Nachbarn. Hoechstens 64 Turns.
 - Ablauf: ASR und Sprecherteil laufen parallel und stehen beide an derselben GPU-Sperre an. Sprecherteil = seg-3.0 auf
   dem Abschnitt (Sprachmaske), ReDimNet2-Fenster 1,5 s (Schritt 0,5 s) und 3 s (Schritt 1,0 s) in Server-Batches
-  <= 8, eingefrorene Logik: jeder bekannte Zentroid ist ein Viterbi-Zustand, bekannt ab cos 0,6, AHC 0,4 innerhalb
+  <= 8. Welche Fenster gerechnet werden, entscheidet wie im Bench Silero (p > 0,5 je 512 Samples, mindestens 30 %
+  des Fensters; rund 70 ms CPU je Abschnitt, parallel zu seg-3.0); ohne lokale Silero-Kopie (sie wird nie geladen)
+  oder bei einem Silero-Fehler nimmt die seg-3.0-Maske ihren Platz ein (auf den Bench-Abschnitten rund 2 % andere
+  Fenster, nicht nachgemessen). Eingefrorene Logik: jeder bekannte Zentroid ist ein Viterbi-Zustand, bekannt ab cos 0,6, AHC 0,4 innerhalb
   des Abschnitts, neue Stimme ab 1 s Stuetze, Wechselstrafe 3, Turns unter 0,5 s Sprache werden eingegliedert.
 - Teilerfolg statt Fehler: scheitert der Sprecherteil (`SPEAKER_TURNS_UNAVAILABLE`), ist das Audio laenger als 60 s
   (`SPEAKER_TURNS_AUDIO_TOO_LONG`), ist `result.speaker_turns` `null`; liefert die Ausrichtung keine Wortzeiten
-  (`SPEAKER_TURNS_WORDS_UNALIGNED`, z. B. Text ohne lateinische Buchstaben), haben die Turns leeren `text`. In allen
+  (`SPEAKER_TURNS_WORDS_UNALIGNED`, z. B. Text ohne lateinische Buchstaben, oder der MMS_FA-Checkpoint fehlt
+  inzwischen lokal: dann wird er nicht geladen und schon gar nicht heruntergeladen), haben die Turns leeren `text`. In allen
   Faellen bleibt `result.transcript.text`, `status` ist `partial`; Genesis3 nimmt dann den Abschnitt als eine Zeile.
 - `models` nennt zusaetzlich `embedding` (ReDimNet2-B6) und `segmentation` (`pyannote/segmentation-3.0`),
   `timings_ms` zusaetzlich `speaker_turns` (Segmentierung, Fenster, Logik) und `alignment`.
@@ -353,7 +361,9 @@ Ergebnis: `result.transcript` wie ohne das Feld, dazu
   bisherigen Bruecke ueber `transcript_embedding`; synthetische Meetings Verwechslung 0,8-1,8 % (Bench-Schritt 0,25/0,5 s). Der CPU-Teil ist
   bitgleich zum Prototyp (3520 von 3520 Abschnitten).
 - Kosten je Abschnitt (RTX 2070S, Bench): Fenster-Embeddings Median 197 ms, p99 326 ms; seg-3.0 Median 13 ms; dazu
-  die MMS_FA-Ausrichtung und die CPU-Logik (wenige ms).
+  die MMS_FA-Ausrichtung und die CPU-Logik (wenige ms). Mit eingeschaltetem `speaker_turns` laedt der Server MMS_FA
+  beim Start (aus lokalen Dateien): rund 0,6 GB FP16 bleiben dauerhaft auf `local_gpu_device`, dazu die
+  Aktivierungen der Ausrichtung je Abschnitt. Das ist dasselbe Modell, das WXC-Diarisierung ohnehin nutzt.
 - Grenzen: Overlap gibt jedem Frame nur einen Sprecher, der zweite Sprecher im Overlap fehlt in den Turns (AMI: 13,7 %
   der Referenz-Sprechzeit). Ein Abschnitt mit zu wenig Sprache fuer ein 1,5-s-Fenster bekommt einen Turn ohne Sprecher. Das Feld ist fuer Live-Abschnitte
   (Genesis3 schneidet bei 15 s) gedacht; lange Dateien gehoeren in den Modus `diarization`.
@@ -814,7 +824,7 @@ Notes:
 - `language.options` is the global list `POST /v2/audio/process` validates against, it does not change with the model.
 - `diarization.configured` means a usable DIA URL exists, the built-in default counts. It does not test that the DIA server is up, `POST /api/admin/dia/test` does.
 - `diarization.engine` ist `dia` (G3_DIA-Server) oder `local` (seg-3.0 + ReDimNet2 im Prozess). Bei `local` heisst `configured`: ein seg-3.0-Checkpoint ist vorhanden und sein letzter Ladeversuch ist nicht gescheitert; dazu `model: "g3-whisper/seg3-redimnet2-v4"`.
-- `speaker_turns` (siehe [`transcript` mit `speaker_turns`](#transcript-mit-speaker_turns-live-sprecher)): `supported: true` nur bei `speaker_turns_enabled` und nutzbarem seg-3.0-Checkpoint, sonst `{ "supported": false }`. Die Abfrage laedt kein Modell.
+- `speaker_turns` (siehe [`transcript` mit `speaker_turns`](#transcript-mit-speaker_turns-live-sprecher)): `supported: true` nur bei `speaker_turns_enabled`, nutzbarem seg-3.0-Checkpoint und lokal vorhandenem MMS_FA-Checkpoint (`<torch-hub>/checkpoints/model.pt`, fuer die Wortzeiten), sonst `{ "supported": false }`. Die Abfrage prueft nur Dateien, laedt kein Modell und wartet nie auf ein laufendes Laden.
 - Older servers answer this path with the HTML landing page and status 200, not with 404. A client must treat a non-JSON answer as "not available".
 
 ## Public Transcription API
@@ -1710,4 +1720,4 @@ Special case:
 - admin benchmark and public transcription log into [`logs`](x:/dev/G3_WHISPER/logs)
 - optional history debug audio lives under `logs/debug-audio`, is never written into JSONL, and is purged on start, shutdown, or setting disable; capture time is reported separately and is excluded from pipeline phase timings
 - the optional `GENESIS_GPU_LEASE_PATH` file lock can serialize CUDA phases with a colocated DIA process; without it only each service's in-process locks apply
-- DIA-freie Diarisierung und `speaker_turns`: `segmentation_model_path` nennt einen pyannote-segmentation-3.0-Checkpoint (`pytorch_model.bin`); leer sucht der Server ihn im HF-Cache von `local_model_cache_path` (`models--pyannote--speaker-diarization-community-1/snapshots/*/segmentation/pytorch_model.bin`, dann `models--pyannote--segmentation-3.0`), danach in `HF_HUB_CACHE` bzw. `~/.cache/huggingface/hub`. Es wird nie etwas heruntergeladen. Das Modell (rund 6 MB Gewichte) folgt `local_gpu_device`. Der Checkpoint wird mit einem eingeschraenkten Unpickler gelesen, der ausser Tensoren nichts aus der Datei ausfuehrt. Die Antwortform der lokalen Diarisierung ist die von G3_DIA `/v2/diarize`. Beim Start wird seg-3.0 geladen und einmal gerechnet und ReDimNet fuer 1,5-s-Fenster vorgewaermt, nur wenn `diarization_engine` `local` ist oder `speaker_turns_enabled` an. Alle GPU-Phasen laufen in Scheiben unter der GPU-Sperre (seg-3.0: 128 Chunks, ReDimNet: 64 Fenster je Halten), die CPU-Arbeit in Worker-Threads; das Freigeben des CUDA-Pools nach 5 s Ruhe bleibt unveraendert.
+- DIA-freie Diarisierung und `speaker_turns`: `segmentation_model_path` nennt einen pyannote-segmentation-3.0-Checkpoint (`pytorch_model.bin`); leer sucht der Server ihn im HF-Cache von `local_model_cache_path` (`models--pyannote--speaker-diarization-community-1/snapshots/*/segmentation/pytorch_model.bin`, dann `models--pyannote--segmentation-3.0`), danach in `HF_HUB_CACHE` bzw. `~/.cache/huggingface/hub`. Es wird nie etwas heruntergeladen. Das Modell (rund 6 MB Gewichte) folgt `local_gpu_device`. Der Checkpoint wird mit einem eingeschraenkten Unpickler gelesen, der ausser Tensoren nichts aus der Datei ausfuehrt; ein TorchScript-Archiv (`constants.pkl` oder `code/` im Zip, das `torch.load` sonst an `torch.jit.load` weiterreicht) wird vorher abgelehnt. Die Antwortform der lokalen Diarisierung ist die von G3_DIA `/v2/diarize`. Beim Start wird seg-3.0 geladen und einmal gerechnet und ReDimNet fuer 1,5-s-Fenster vorgewaermt, nur wenn `diarization_engine` `local` ist oder `speaker_turns_enabled` an; mit `speaker_turns_enabled` zusaetzlich MMS_FA (rund 0,6 GB FP16 dauerhaft) und Silero, beide nur aus lokalen Dateien. Alle GPU-Phasen laufen in Scheiben unter der GPU-Sperre (seg-3.0: 128 Chunks, ReDimNet: 64 Fenster je Halten), die CPU-Arbeit in Worker-Threads; das Freigeben des CUDA-Pools nach 5 s Ruhe bleibt unveraendert.

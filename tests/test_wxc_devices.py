@@ -103,6 +103,85 @@ class MmsDeviceTests(unittest.TestCase):
         self.assertFalse(wxc.apply_mms_device_setting())
 
 
+class MmsLocalCheckpointTests(unittest.TestCase):
+    """speaker_turns may only use MMS_FA from disk: the check is a file test, the no-download load refuses."""
+
+    def setUp(self) -> None:
+        import tempfile
+        from pathlib import Path
+
+        empty = {"model": None, "tokenizer": None, "aligner": None, "device": None, "dtype": None}
+        patcher = mock.patch.dict(wxc._mms_components, empty, clear=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.user_hub = Path(tmp.name) / "user"
+        self.model_hub = Path(tmp.name) / "models"
+        self.user_hub.mkdir()
+        self.model_hub.mkdir()
+        previous = torch.hub.get_dir()
+        torch.hub.set_dir(str(self.model_hub))
+        self.addCleanup(torch.hub.set_dir, previous)
+        hub_patch = mock.patch.object(wxc, "_default_user_hub", return_value=self.user_hub)
+        hub_patch.start()
+        self.addCleanup(hub_patch.stop)
+        device_patch = mock.patch.object(wxc, "resolve_local_device", return_value=torch.device("cpu"))
+        device_patch.start()
+        self.addCleanup(device_patch.stop)
+
+    def _put(self, hub) -> None:
+        (hub / "checkpoints").mkdir(parents=True, exist_ok=True)
+        (hub / "checkpoints" / wxc.MMS_CHECKPOINT_FILE).write_bytes(b"x")
+
+    def test_availability_follows_the_checkpoint_file_in_either_hub(self) -> None:
+        self.assertFalse(wxc.mms_available_locally())
+        self._put(self.model_hub)
+        self.assertTrue(wxc.mms_available_locally())
+        self.assertEqual(wxc._mms_hub_choice(), (self.model_hub, True))
+        self._put(self.user_hub)
+        self.assertEqual(wxc._mms_hub_choice(), (self.user_hub, True))
+
+    def test_an_empty_user_checkpoints_folder_does_not_hide_the_model_hub_copy(self) -> None:
+        (self.user_hub / "checkpoints").mkdir()
+        self._put(self.model_hub)
+        self.assertEqual(wxc._mms_hub_choice(), (self.model_hub, True))
+
+    def test_no_download_load_refuses_without_the_file_and_never_builds_the_model(self) -> None:
+        model = _FakeMmsModel()
+        get_model = mock.Mock(return_value=model)
+        modules = _fake_torchaudio(model)
+        modules["torchaudio.pipelines"].MMS_FA.get_model = get_model
+        with mock.patch.dict(sys.modules, modules):
+            with self.assertRaises(RuntimeError):
+                wxc._load_mms(allow_download=False)
+            get_model.assert_not_called()
+            self._put(self.user_hub)
+            components = wxc._load_mms(allow_download=False)
+        self.assertIs(components["model"], model)
+        get_model.assert_called_once()
+        self.assertTrue(wxc.mms_available_locally())
+
+    def test_slice_passes_the_no_download_flag(self) -> None:
+        from contextlib import contextmanager
+
+        @contextmanager
+        def lease():
+            yield
+
+        seen = []
+
+        def fake_load(**kwargs):
+            seen.append(kwargs)
+            return {"model": None, "tokenizer": None, "aligner": None, "device": "cpu"}
+
+        audio = np.zeros(16000, dtype=np.float32)
+        with mock.patch.object(wxc, "shared_gpu_lease", new=lease), mock.patch.object(wxc, "_load_mms", side_effect=fake_load):
+            wxc.align_chunk_slice([0], audio, [(0.0, 1.0)], ["..."], [float("-inf"), float("inf")], allow_download=False)
+            wxc.align_chunk_slice([0], audio, [(0.0, 1.0)], ["..."], [float("-inf"), float("inf")])
+        self.assertEqual(seen, [{"allow_download": False}, {}])
+
+
 class _StatefulSilero:
     """Records overlapping inference: a second pass entering while one runs would corrupt the stream state."""
 
@@ -122,6 +201,51 @@ class _StatefulSilero:
         with self.guard:
             self.active -= 1
         return torch.zeros(chunk.shape[0])
+
+
+class _CausalSilero:
+    """Stateful per stream row like Silero: each output depends on the frames seen so far."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.state = None
+
+    def reset_states(self) -> None:
+        self.state = None
+
+    def __call__(self, chunk, sample_rate):
+        self.calls += 1
+        energy = chunk.abs().mean(dim=1)
+        self.state = energy if self.state is None else 0.5 * self.state + energy
+        return self.state.clone()
+
+
+class SileroSingleStreamTests(unittest.TestCase):
+    def test_one_stream_stops_at_its_last_frame_with_the_same_values(self) -> None:
+        rng = np.random.default_rng(5)
+        audio = rng.standard_normal(wxc.SILERO_WINDOW * 300).astype(np.float32)
+        short = _CausalSilero()
+        with mock.patch.object(wxc, "_load_silero_model", return_value=short):
+            probs = wxc.silero_frame_probs(audio)
+        self.assertEqual(short.calls, 300)
+        # reference: step through the whole zero-padded stream as before
+        full = _CausalSilero()
+        padded = np.zeros(wxc.SILERO_STREAM_FRAMES * wxc.SILERO_WINDOW, np.float32)
+        padded[: len(audio)] = audio
+        stream = torch.from_numpy(padded).reshape(1, -1)
+        expected = []
+        for index in range(wxc.SILERO_STREAM_FRAMES):
+            out = full(stream[:, index * wxc.SILERO_WINDOW:(index + 1) * wxc.SILERO_WINDOW], 16000)
+            expected.append(float(out[0]))
+        np.testing.assert_array_equal(probs, np.array(expected[:300], np.float32))
+
+    def test_several_streams_still_step_the_full_stream_length(self) -> None:
+        audio = np.ones(wxc.SILERO_WINDOW * (wxc.SILERO_STREAM_FRAMES + 10), np.float32)
+        model = _CausalSilero()
+        with mock.patch.object(wxc, "_load_silero_model", return_value=model):
+            probs = wxc.silero_frame_probs(audio)
+        self.assertEqual(model.calls, wxc.SILERO_STREAM_FRAMES)
+        self.assertEqual(len(probs), wxc.SILERO_STREAM_FRAMES + 10)
 
 
 class SileroConcurrencyTests(unittest.TestCase):
