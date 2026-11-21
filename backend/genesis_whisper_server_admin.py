@@ -117,6 +117,7 @@ class AdminSettingsPayload(BaseModel):
     huggingface_token: str | None = None
     dia_server_base_url: str | None = None
     dia_api_key: str | None = None
+    segmentation_model_path: str | None = None
 
 
 class PresetPayload(BaseModel):

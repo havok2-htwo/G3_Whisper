@@ -1028,6 +1028,7 @@ Response shape:
     "dia_api_key": "",
     "dia_api_key_configured": true,
     "dia_api_key_source": "settings",
+    "segmentation_model_path": "",
     "model_profiles": {
       "openai/whisper-large-v3-turbo": { "batch_max_segments": 16, "transcription_language": "de" }
     }
@@ -1639,3 +1640,4 @@ Special case:
 - admin benchmark and public transcription log into [`logs`](x:/dev/G3_WHISPER/logs)
 - optional history debug audio lives under `logs/debug-audio`, is never written into JSONL, and is purged on start, shutdown, or setting disable; capture time is reported separately and is excluded from pipeline phase timings
 - the optional `GENESIS_GPU_LEASE_PATH` file lock can serialize CUDA phases with a colocated DIA process; without it only each service's in-process locks apply
+- DIA-freie Diarisierung (Bausteine, noch an keinen Endpunkt angeschlossen): `segmentation_model_path` nennt einen pyannote-segmentation-3.0-Checkpoint (`pytorch_model.bin`); leer sucht der Server ihn im HF-Cache von `local_model_cache_path` (`models--pyannote--speaker-diarization-community-1/snapshots/*/segmentation/pytorch_model.bin`, dann `models--pyannote--segmentation-3.0`), danach in `HF_HUB_CACHE` bzw. `~/.cache/huggingface/hub`. Es wird nie etwas heruntergeladen. Das Modell (rund 6 MB Gewichte) folgt `local_gpu_device`. Der Checkpoint wird mit einem eingeschraenkten Unpickler gelesen, der ausser Tensoren nichts aus der Datei ausfuehrt. Die Antwortform der lokalen Diarisierung ist die von G3_DIA `/v2/diarize`; `speaker_turns` fuer `mode: "transcript"` (Genesis3 docs/243 §8.8) wird mit Phase 2 beschrieben, sobald `GET /v2/capabilities` es anbietet.

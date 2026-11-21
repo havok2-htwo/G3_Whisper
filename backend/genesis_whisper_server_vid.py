@@ -233,9 +233,10 @@ def _run_model_warmup(
     device: torch.device,
     dtype: torch.dtype,
     batch_size: int,
+    window_samples: int = REDIMNET_WINDOW_SAMPLES,
 ) -> None:
     waveform = torch.zeros(
-        (batch_size, REDIMNET_WINDOW_SAMPLES),
+        (batch_size, window_samples),
         dtype=torch.float32,
         device=device,
     )
@@ -336,15 +337,16 @@ def _inference_batch_size(current_size: int, device_type: str, prepared_cuda_bat
 def _prepare_waveform_batch(
     windows: Sequence[VoiceWindow],
     inference_batch_size: int,
+    window_samples: int = REDIMNET_WINDOW_SAMPLES,
 ) -> np.ndarray:
     if not windows or inference_batch_size < len(windows):
         raise ValueError("Ungueltige ReDimNet2-Inferenz-Batchgroesse.")
     batch = np.zeros(
-        (inference_batch_size, REDIMNET_WINDOW_SAMPLES),
+        (inference_batch_size, window_samples),
         dtype=np.float32,
     )
     for index, window in enumerate(windows):
-        batch[index] = _fit_window(window.audio)
+        batch[index] = _fit_window(window.audio, window_samples)
     return batch
 
 
@@ -409,6 +411,8 @@ def load_vid_model() -> bool:
                     "cache_root": str(cache_root),
                     "cuda_batch_size": cuda_batch_size,
                     "max_batch_size": max_batch_size,
+                    # Extra window lengths warmed by prepare_window_length for this model instance.
+                    "prepared_lengths": {},
                 }
             )
             memory_note = ""
@@ -494,6 +498,36 @@ def apply_vid_settings() -> bool:
         if _redimnet_components.get("model") is None:
             return False
         return _reprepare_for_settings()
+
+
+def prepare_window_length(window_samples: int) -> bool:
+    """Warm the CUDA batch buckets for one extra window length (e.g. 1.5 s windows), once per loaded model.
+
+    Every unseen input shape costs seconds of one-time kernel preparation on CUDA; the 3 s shapes are warmed at
+    load, other lengths only when a caller asks for them here. Returns False when the model cannot be loaded.
+    """
+
+    window_samples = int(window_samples)
+    if window_samples == REDIMNET_WINDOW_SAMPLES:
+        return load_vid_model()
+    if not load_vid_model():
+        return False
+    with _redimnet_lock:
+        model = _redimnet_components["model"]
+        device: torch.device = _redimnet_components["device"]
+        dtype: torch.dtype = _redimnet_components["dtype"]
+        prepared = _redimnet_components.setdefault("prepared_lengths", {})
+        key = (str(device), int(_redimnet_components.get("cuda_batch_size") or 1))
+        if window_samples in prepared.get(key, set()):
+            return True
+        with shared_gpu_lease():
+            if device.type == "cuda":
+                for bucket in reversed(redimnet_batch_buckets(key[1])):
+                    _run_model_warmup(model, device, dtype, bucket, window_samples)
+            else:
+                _run_model_warmup(model, device, dtype, 1, window_samples)
+        prepared.setdefault(key, set()).add(window_samples)
+    return True
 
 
 def _fit_window(audio: np.ndarray, target_samples: int = REDIMNET_WINDOW_SAMPLES) -> np.ndarray:
@@ -694,7 +728,14 @@ def embed_voice_windows(
     windows: Iterable[VoiceWindow],
     *,
     batch_size: int | None = None,
+    window_samples: int = REDIMNET_WINDOW_SAMPLES,
 ) -> list[EmbeddedVoiceWindow]:
+    """Embed ``windows`` in power-of-two CUDA batches, every window fitted to ``window_samples``.
+
+    The public voice vectors always use 3 s windows. The DIA-free diarization also embeds 1.5 s windows at their
+    native length (``window_samples=24000``); call ``prepare_window_length`` once for such a length so its batch
+    shapes are warmed like the 3 s ones.
+    """
     # None = the configured redimnet_max_batch_size; the prepared CUDA maximum caps it below.
     effective_batch_size = max(1, int(batch_size if batch_size is not None else configured_max_batch_size()))
     window_iterator = iter(windows)
@@ -723,7 +764,7 @@ def embed_voice_windows(
                 device.type,
                 prepared_cuda_batch_size,
             )
-            batch_np = _prepare_waveform_batch(current, model_batch_size)
+            batch_np = _prepare_waveform_batch(current, model_batch_size, window_samples)
             waveform = None
             embeddings = None
             retry_after_oom = False
@@ -838,6 +879,7 @@ __all__ = [
     "generate_voice_vector",
     "iter_windows_from_audio",
     "load_vid_model",
+    "prepare_window_length",
     "redimnet_batch_buckets",
     "resolve_local_device",
     "windows_from_audio",

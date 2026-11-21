@@ -51,6 +51,8 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "huggingface_token": "",
     "dia_server_base_url": "",
     "dia_api_key": "",
+    # Explicit seg-3.0 checkpoint for the DIA-free diarization; empty = find it in the local HF cache.
+    "segmentation_model_path": "",
     "model_profiles": {},
 }
 
@@ -109,6 +111,7 @@ SERVICE_SETTINGS_FIELDS: Tuple[str, ...] = (
     "huggingface_token",
     "dia_server_base_url",
     "dia_api_key",
+    "segmentation_model_path",
     "debug_retain_history_audio",
 )
 
@@ -204,6 +207,7 @@ def normalize_settings(settings: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     normalized["huggingface_token"] = str(source.get("huggingface_token", "")).strip()
     normalized["dia_server_base_url"] = str(source.get("dia_server_base_url", "") or "").strip().rstrip("/")
     normalized["dia_api_key"] = str(source.get("dia_api_key", "") or "").strip()
+    normalized["segmentation_model_path"] = str(source.get("segmentation_model_path", "") or "").strip()
 
     try:
         normalized["batch_wait_time_ms"] = max(0, int(source.get("batch_wait_time_ms", DEFAULT_SETTINGS["batch_wait_time_ms"])))
