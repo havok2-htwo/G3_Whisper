@@ -66,7 +66,8 @@ DIARIZATION_ENGINE_LOCAL = "local"
 DIARIZATION_ENGINES = (DIARIZATION_ENGINE_DIA, DIARIZATION_ENGINE_LOCAL)
 
 # One GPU-lock hold: 128 seg-3.0 chunks are four batches of 32 (~0.1 s on an RTX 2070S); 64 ReDimNet windows are
-# eight batches of 8, the same slice the speaker clouds use.
+# eight batches of 8 at 3 s, the same slice the speaker clouds use (1.5 s / 0.75 s windows run 2x / 4x larger
+# batches of the same audio length, so their slice holds the lock for fewer, equally large batches).
 SEGMENTATION_SLICE_CHUNKS = 128
 EMBED_SLICE_WINDOWS = 64
 # speaker_turns is made for live sections (Genesis3 cuts them at 15 s). Longer audio gets no turns (a warning), the

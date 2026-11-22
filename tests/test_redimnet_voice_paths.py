@@ -495,6 +495,109 @@ class RedimNetVoicePathTests(unittest.TestCase):
         self.assertEqual([item.start_ms for item in embedded], list(range(5)))
         self.assertTrue(all(float(item.vector[1]) == 1.0 for item in embedded))
 
+    def test_length_batch_factor_keeps_samples_per_batch_equal(self) -> None:
+        cases = {96000: 1, 48000: 1, 30000: 1, 24000: 2, 16000: 2, 12000: 4, 6000: 4, 1: 4}
+        for samples, expected in cases.items():
+            with self.subTest(samples=samples):
+                self.assertEqual(vid.length_batch_factor(samples), expected)
+
+    def _short_window_run(self, length: int, count: int, *, device: str, batch_size=None, model=None,
+                          cuda_batch_size: int = 4) -> tuple[list[int], list]:
+        calls: list[int] = []
+
+        class RowWiseModel:
+            """Each vector depends only on its own waveform row, like ReDimNet2 in eval mode."""
+
+            def __call__(self, waveform):
+                calls.append(len(waveform))
+                rows = waveform.to(torch.float32)
+                result = torch.zeros((len(waveform), vid.REDIMNET_EMBEDDING_DIMENSION))
+                result[:, 0] = 1.0
+                result[:, 1] = rows.mean(dim=1)
+                result[:, 2] = rows[:, : length // 2].sum(dim=1)
+                return result
+
+        windows = [
+            vid.VoiceWindow(audio=np.full(length, 0.01 * (index + 1), dtype=np.float32), start_ms=index)
+            for index in range(count)
+        ]
+        components = {"model": model or RowWiseModel(), "device": torch.device(device), "dtype": torch.float32,
+                      "cache_root": None, "cuda_batch_size": cuda_batch_size}
+        real_from_numpy = torch.from_numpy
+
+        class _HostTensor:
+            def __init__(self, array):
+                self._tensor = real_from_numpy(array)
+
+            def to(self, device=None, dtype=None):
+                return self._tensor.to(dtype=dtype)
+
+        with (
+            mock.patch.object(vid, "load_vid_model", return_value=True),
+            mock.patch.dict(vid._redimnet_components, components, clear=True),
+            mock.patch.object(vid, "shared_gpu_lease", return_value=nullcontext()),
+            mock.patch.object(vid, "_model_autocast", return_value=nullcontext()),
+            mock.patch.object(vid.torch, "from_numpy", side_effect=_HostTensor),
+            mock.patch.dict(vid.current_settings, {"redimnet_max_batch_size": 4}, clear=True),
+        ):
+            embedded = vid.embed_voice_windows(windows, window_samples=length, batch_size=batch_size)
+            stored = vid._redimnet_components.get("cuda_batch_size")
+        calls.append(stored)
+        return calls, embedded
+
+    def test_short_windows_run_equal_sample_batches(self) -> None:
+        calls, embedded = self._short_window_run(12000, 40, device="cuda")
+        self.assertEqual(calls, [16, 16, 8, 4])  # last entry: the stored 3 s maximum stays 4
+        self.assertEqual([item.start_ms for item in embedded], list(range(40)))
+        calls, _ = self._short_window_run(24000, 19, device="cuda")
+        self.assertEqual(calls, [8, 8, 4, 4])
+        calls, _ = self._short_window_run(vid.REDIMNET_WINDOW_SAMPLES, 9, device="cuda")
+        self.assertEqual(calls, [4, 4, 1, 4])
+
+    def test_equal_sample_batches_give_the_same_vectors_in_the_same_order(self) -> None:
+        for length in (24000, 12000):
+            with self.subTest(length=length):
+                small_calls, small = self._short_window_run(length, 37, device="cuda", batch_size=4)
+                large_calls, large = self._short_window_run(length, 37, device="cuda")
+                self.assertEqual(max(small_calls[:-1]), 4)
+                self.assertGreater(max(large_calls[:-1]), 4)
+                self.assertEqual([item.start_ms for item in large], [item.start_ms for item in small])
+                for a, b in zip(small, large):
+                    np.testing.assert_array_equal(a.vector, b.vector)
+
+    def test_short_window_oom_backoff_stores_the_3s_maximum(self) -> None:
+        calls: list[int] = []
+
+        class OomAboveEightModel:
+            def __call__(self, waveform):
+                calls.append(len(waveform))
+                if len(waveform) > 8:
+                    raise RuntimeError("CUDA out of memory")
+                result = torch.zeros((len(waveform), vid.REDIMNET_EMBEDDING_DIMENSION))
+                result[:, 1] = 1.0
+                return result
+
+        with mock.patch.object(vid.torch.cuda, "is_available", return_value=False):
+            stored_calls, embedded = self._short_window_run(12000, 20, device="cuda", model=OomAboveEightModel())
+        self.assertEqual(calls, [16, 8, 8, 4])
+        self.assertEqual(stored_calls[-1], 2)  # 8 windows of 0.75 s = 2 windows of 3 s
+        self.assertEqual([item.start_ms for item in embedded], list(range(20)))
+
+    def test_prepare_window_length_warms_the_scaled_buckets(self) -> None:
+        warmed: list[tuple[int, int]] = []
+        components = self._loaded_components(mock.Mock(), maximum=4)
+        with (
+            mock.patch.object(vid, "load_vid_model", return_value=True),
+            mock.patch.dict(vid._redimnet_components, components, clear=True),
+            mock.patch.object(vid, "shared_gpu_lease", return_value=nullcontext()),
+            mock.patch.object(vid, "_run_model_warmup", side_effect=lambda m, d, t, b, n: warmed.append((b, n))),
+        ):
+            self.assertTrue(vid.prepare_window_length(12000))
+            self.assertTrue(vid.prepare_window_length(24000))
+            self.assertTrue(vid.prepare_window_length(12000))
+        self.assertEqual(warmed, [(16, 12000), (8, 12000), (4, 12000), (2, 12000), (1, 12000),
+                                  (8, 24000), (4, 24000), (2, 24000), (1, 24000)])
+
     def test_legacy_voice_ident_keeps_shape_but_returns_192_values(self) -> None:
         app = FastAPI()
         app.state.local_gpu_lock = _AsyncLock()
