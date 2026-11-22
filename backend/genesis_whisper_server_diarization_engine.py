@@ -43,6 +43,7 @@ from .genesis_whisper_server_segmentation import (
     SEGMENTATION_MODEL_NAME,
     chunk_count,
     segment_audio_range,
+    segment_audio_range_with_overlap,
     segmentation_available,
     segmentation_payload,
 )
@@ -130,12 +131,21 @@ def diarization_capability(dia_configured: bool) -> Dict[str, Any]:
 # GPU phases (sliced under the request's GPU lock)
 # ---------------------------------------------------------------------------
 
-async def segment_sliced(lock: asyncio.Lock, audio: np.ndarray) -> Dict[str, Any]:
-    """seg-3.0 arrays of ``audio``, ``SEGMENTATION_SLICE_CHUNKS`` chunks per lock hold."""
+async def segment_sliced(lock: asyncio.Lock, audio: np.ndarray, *, overlap: bool = False) -> Dict[str, Any]:
+    """seg-3.0 arrays of ``audio``, ``SEGMENTATION_SLICE_CHUNKS`` chunks per lock hold; ``overlap`` adds the soft
+    overlap probability (``overlap_prob``) from the same forward passes."""
 
     total = chunk_count(len(audio))
-    parts = await run_sliced_gpu_phase(lock, list(range(total)), segment_audio_range, SEGMENTATION_SLICE_CHUNKS, audio)
-    return segmentation_payload(np.concatenate(parts) if parts else segment_audio_range([], audio))
+    if not overlap:
+        parts = await run_sliced_gpu_phase(lock, list(range(total)), segment_audio_range, SEGMENTATION_SLICE_CHUNKS,
+                                           audio)
+        return segmentation_payload(np.concatenate(parts) if parts else segment_audio_range([], audio))
+    parts = await run_sliced_gpu_phase(lock, list(range(total)), segment_audio_range_with_overlap,
+                                       SEGMENTATION_SLICE_CHUNKS, audio)
+    if not parts:
+        parts = [segment_audio_range_with_overlap([], audio)]
+    return segmentation_payload(np.concatenate([data for data, _ in parts]),
+                                np.concatenate([prob for _, prob in parts]))
 
 
 def _embed_native(windows: Sequence[VoiceWindow], window_samples: int) -> List[np.ndarray]:
@@ -192,7 +202,7 @@ async def run_local_diarization(
     started = time.monotonic()
     samples = np.ascontiguousarray(np.asarray(audio, np.float32).reshape(-1))
     duration_s = len(samples) / SAMPLE_RATE
-    segmentation = await segment_sliced(lock, samples)
+    segmentation = await segment_sliced(lock, samples, overlap=True)
     if LOCAL_WINDOW_FILTER == "silero":
         if speech_probs is None:
             from .genesis_whisper_server_wxc import silero_frame_probs

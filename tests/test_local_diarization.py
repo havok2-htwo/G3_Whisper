@@ -15,12 +15,12 @@ def _voice(seed: int) -> np.ndarray:
     return v / np.linalg.norm(v)
 
 
-def _synthetic(schedule, duration_s, *, overlap=(), noise=0.03, seed=0):
+def _synthetic(schedule, duration_s, *, overlap=(), noise=0.03, seed=0, voices=None):
     """Features of a fake meeting: ``schedule`` = [(start, end, speaker)], disjoint; ``overlap`` = extra
-    [(start, end, speaker)] spans where a second speaker talks at the same time."""
+    [(start, end, speaker)] spans where a second speaker talks at the same time; ``voices``: speaker -> vector."""
 
     rng = np.random.default_rng(seed)
-    voices = {k: _voice(100 + k) for k in {s for _, _, s in schedule}}
+    voices = voices or {k: _voice(100 + k) for k in {s for _, _, s in schedule}}
 
     def who(t):
         out = [s for a, b, s in schedule if a <= t < b]
@@ -170,7 +170,7 @@ class WindowPlanTests(unittest.TestCase):
         audio = np.zeros(16000 * 6, np.float32)
         speech = np.ones(300, bool)
         out = ld.compute_window_features(audio, speech, 320, embed=fake_embed)
-        self.assertEqual(seen, [(7, 3.0), (19, 1.5)])
+        self.assertEqual(seen, [(7, 3.0), (19, 1.5), (22, 0.75)])
         self.assertEqual(out["s1.5"][2].shape, (19, 192))
         np.testing.assert_allclose(out["s1.5"][1] - out["s1.5"][0], 1.5)
 
@@ -181,6 +181,175 @@ class WindowPlanTests(unittest.TestCase):
         self.assertEqual(float(batch[1].sum()), 24000.0)  # short window tiled to the length
         self.assertEqual(float(batch[2:].sum()), 0.0)
         self.assertEqual(_prepare_waveform_batch(windows, 2).shape, (2, 48000))
+
+
+def _naive_reseg_score(s, C, scales):
+    """The V4 frame score (one slice add per window), the reference for the vectorized ``_reseg``."""
+
+    score = np.zeros((s.n, len(C)), np.float64)
+    cnt = np.zeros(s.n)
+    for scale, wgt in scales:
+        st, en, X = s.windows[scale]
+        S = X @ C.T
+        fa, fb = ld.window_frames(st, en, s.n)
+        mid = (fa + fb) // 2
+        half = np.maximum(1, ((fb - fa) * s.p["core"]).astype(int) // 2)
+        lo, hi = np.maximum(0, mid - half), np.minimum(s.n, mid + half)
+        for i in range(len(X)):
+            score[lo[i]:hi[i]] += wgt * S[i]
+            cnt[lo[i]:hi[i]] += wgt
+    has = cnt > 0
+    score[has] /= cnt[has, None]
+    return score, has
+
+
+def _state(feats, **params):
+    p = dict(ld.DEFAULT_PARAMS, **params)
+    n = ld.grid_frames(feats.duration_s)
+    info = ld.seg_info(feats.seg, n, p["seg_off"], bool(p["ham"]))
+    count = np.minimum(ld.seg_count(info, n), p["max_overlap"])
+    sm = count >= 1
+    return ld._State(n=n, sm=sm, count=count, info=info, windows=ld._unit_windows(feats.windows),
+                     free=ld.free_switch_frames(sm, int(p["pause_free"] / ld.GRID_S)), p=p)
+
+
+V4_PARAMS = dict(min_spk_s=6.0, w075=0.0, marg_thr=0.0, split_ratio=0.0, seg_off=None, ham=1, map_mode="vote",
+                 beta=0.0, ov_blend=0.0, ov_prune_pov=0.0)
+
+
+class V5BlockTests(unittest.TestCase):
+    SCHEDULE = PipelineTests.SCHEDULE
+
+    def test_seg_info_frame_offset_and_uniform_weights(self) -> None:
+        seg = {"data": np.zeros((2, NF, 3), np.float32), "chunk_step": 1.0, "frame_step": FSTEP}
+        n = ld.grid_frames(11.0)
+        v4 = ld.seg_info(seg, n)
+        v5 = ld.seg_info(seg, n, 0.04, hamming=False)
+        np.testing.assert_allclose(v4.window, np.hamming(NF), rtol=1e-6)
+        self.assertTrue(bool((v5.window == 1.0).all()))
+        # frame 3 of chunk 1: V4 at 1 + 3.5 * FSTEP = 1.059 s (grid 52), V5 at 1 + 3 * FSTEP + 0.04 = 1.091 s (54)
+        self.assertEqual((int(v4.gis[1, 3]), int(v5.gis[1, 3])), (52, 54))
+
+    def test_aggregate_frames_is_the_seg_count_overlap_add(self) -> None:
+        feats = _synthetic(self.SCHEDULE, 52.0, overlap=[(20.0, 22.0, 0)])
+        n = ld.grid_frames(52.0)
+        for hamming in (True, False):
+            info = ld.seg_info(feats.seg, n, 0.04, hamming)
+            mean = ld.aggregate_frames(info, info.data.sum(2), n)
+            np.testing.assert_array_equal(np.rint(mean).astype(np.int32), ld.seg_count(info, n))
+        # two chunks with different values: 1 where only chunk 0 covers, 0 where only chunk 1, a mix in between
+        seg = {"data": np.zeros((2, NF, 3), np.float32), "chunk_step": 1.0, "frame_step": FSTEP}
+        n = ld.grid_frames(11.0)
+        info = ld.seg_info(seg, n, 0.04, hamming=False)
+        mixed = ld.aggregate_frames(info, np.stack([np.ones(NF), np.zeros(NF)]), n)
+        self.assertEqual(float(mixed[int(0.5 / ld.GRID_S)]), 1.0)
+        self.assertEqual(float(mixed[int(10.5 / ld.GRID_S)]), 0.0)
+        self.assertTrue(0.3 < float(mixed[int(5.0 / ld.GRID_S)]) < 0.7)
+        self.assertEqual(len(ld.aggregate_frames(info, np.zeros((0, NF)), n)), n)
+
+    def test_vectorized_reseg_equals_the_slice_loop(self) -> None:
+        feats = _synthetic(self.SCHEDULE, 52.0, overlap=[(20.0, 22.0, 0)], noise=0.2, seed=3)
+        s = _state(feats)
+        C = ld.unit(np.stack([_voice(100), _voice(101), _voice(7)]))
+        for final, scales in ((False, (("s1.5", 1.0), ("s3.0", 0.5))),
+                              (True, (("s1.5", 1.0), ("s3.0", 0.5), ("s0.75", 8.0)))):
+            path, score = ld._reseg(s, C, final=final)
+            ref, has = _naive_reseg_score(s, C, scales)
+            np.testing.assert_allclose(score[has], ref[has], atol=1e-5)
+            self.assertGreater(float(has.mean()), 0.9)
+        # without the final flag the 0.75 s windows never count
+        no_short = dict(s.windows)
+        no_short.pop("s0.75")
+        s2 = _state(feats)
+        s2.windows = no_short
+        np.testing.assert_array_equal(ld._reseg(s2, C)[1], ld._reseg(s, C)[1])
+        # extra is added to the scaled score: a large bonus forces its label
+        bonus = np.zeros((s.n, 3), np.float32)
+        bonus[:, 2] = 100.0
+        path, _ = ld._reseg(s, C, extra=bonus)
+        self.assertTrue(bool((path == 2).all()))
+
+    def test_margins_flag_a_duplicate_centroid(self) -> None:
+        a = _voice(5)
+        b = ld.unit(a + 0.3 * _voice(6))  # cos(a, b) about 0.96
+        feats = _synthetic([(0.0, 10.0, 0), (10.0, 20.0, 1)], 20.0, voices={0: a, 1: b}, noise=0.0)
+        s = _state(feats)
+        path = np.where(np.arange(s.n) < s.n // 2, 0, 1).astype(np.int32)
+        marg, secs = ld._margins(s, np.stack([a, b]), path)
+        self.assertTrue(bool((marg < ld.DEFAULT_PARAMS["marg_thr"]).all()), marg)
+        self.assertAlmostEqual(float(secs.sum()), float(s.sm.sum() * ld.GRID_S), places=6)
+        c = _voice(9)
+        far = _synthetic([(0.0, 10.0, 0), (10.0, 20.0, 1)], 20.0, voices={0: a, 1: c}, noise=0.0)
+        marg, _ = ld._margins(_state(far), np.stack([a, c]), path)
+        self.assertTrue(bool((marg > 0.5).all()), marg)
+
+    def test_split_two_separates_two_groups_and_keeps_one(self) -> None:
+        rng = np.random.default_rng(1)
+        a, b = _voice(11), _voice(12)
+        two = ld.unit(np.concatenate([a + 0.05 * rng.standard_normal((20, 192)),
+                                      b + 0.05 * rng.standard_normal((14, 192))]).astype(np.float32))
+        ratio, minor, lab = ld._split_two(two)
+        self.assertLess(ratio, 0.5)
+        self.assertEqual(minor, 14)
+        self.assertEqual(len(set(lab[:20].tolist())), 1)
+        one = ld.unit((a + 0.05 * rng.standard_normal((30, 192))).astype(np.float32))
+        split = ld._split_two(one)
+        self.assertTrue(split is None or split[0] > ld.DEFAULT_PARAMS["split_ratio"])
+        self.assertIsNone(ld._split_two(two[:5]))
+
+    def test_split_test_finds_two_similar_voices_that_ahc_merges(self) -> None:
+        a = _voice(21)
+        orth = _voice(22) - float(_voice(22) @ a) * a
+        b = ld.unit(0.65 * a + 0.76 * orth / np.linalg.norm(orth))  # cos(a, b) = 0.65
+        feats = _synthetic(self.SCHEDULE, 52.0, voices={0: a, 1: b}, noise=0.02)
+        self.assertEqual(ld.diarize_features(feats, params=V4_PARAMS).active.shape[1], 1)
+        res = ld.diarize_features(feats)
+        self.assertEqual(res.active.shape[1], 2)
+        self.assertEqual(res.debug["nsplit"], 1)
+        lab_a, lab_b = res.primary[int(5 / ld.GRID_S)], res.primary[int(18 / ld.GRID_S)]
+        self.assertNotEqual(lab_a, lab_b)
+        self.assertEqual(res.primary[int(30 / ld.GRID_S)], lab_a)
+        self.assertEqual(res.primary[int(45 / ld.GRID_S)], lab_b)
+        # a speaker hint caps the split
+        self.assertEqual(ld.diarize_features(feats, max_speakers=1).active.shape[1], 1)
+
+    def test_soft_overlap_probability_prunes_the_second_speaker(self) -> None:
+        feats = _synthetic(self.SCHEDULE, 52.0, overlap=[(20.0, 22.0, 0)])
+        t = int(21 / ld.GRID_S)
+        seg = dict(feats.seg)
+        for value, speakers in ((0.9, 2), (0.1, 1)):
+            seg["overlap_prob"] = np.full(seg["data"].shape[:2], value, np.float32)
+            res = ld.diarize_features(ld.Features(seg, feats.windows, feats.duration_s))
+            self.assertTrue(res.debug["ov_prune"])
+            self.assertEqual(int(res.active[t].sum()), speakers, value)
+        # without the probability (precomputed seg arrays of an old caller) nothing is pruned, and the debug says so
+        res = ld.diarize_features(feats)
+        self.assertFalse(res.debug["ov_prune"])
+        self.assertEqual(int(res.active[t].sum()), 2)
+
+    def test_final_pass_runs_only_with_the_short_windows(self) -> None:
+        feats = _synthetic(self.SCHEDULE, 52.0)
+        self.assertTrue(ld.diarize_features(feats).debug["final_pass"])
+        self.assertFalse(ld.diarize_features(feats, params={"w075": 0}).debug["final_pass"])
+        two = {k: v for k, v in feats.windows.items() if k != "s0.75"}
+        res = ld.diarize_features(ld.Features(feats.seg, two, feats.duration_s))
+        self.assertFalse(res.debug["final_pass"])
+        self.assertEqual(res.active.shape[1], 2)
+
+    def test_v4_parameters_still_run(self) -> None:
+        feats = _synthetic(self.SCHEDULE, 52.0, overlap=[(20.0, 22.0, 0)])
+        res = ld.diarize_features(feats, params=V4_PARAMS)
+        self.assertEqual(res.active.shape[1], 2)
+        self.assertFalse(res.debug["final_pass"])
+        self.assertEqual(int(res.active[int(21 / ld.GRID_S)].sum()), 2)
+
+    def test_speech_frames_use_the_pipeline_aggregation(self) -> None:
+        feats = _synthetic(self.SCHEDULE, 52.0)
+        n = ld.grid_frames(52.0)
+        expected = ld.seg_count(ld.seg_info(feats.seg, n, 0.04, hamming=False), n) >= 1
+        np.testing.assert_array_equal(ld.speech_frames_from_seg(feats.seg, 52.0), expected)
+        v4 = ld.speech_frames_from_seg(feats.seg, 52.0, {"seg_off": None, "ham": 1})
+        np.testing.assert_array_equal(v4, ld.seg_count(ld.seg_info(feats.seg, n), n) >= 1)
 
 
 if __name__ == "__main__":

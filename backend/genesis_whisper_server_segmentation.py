@@ -328,6 +328,15 @@ def powerset_to_multilabel(log_probs: torch.Tensor, mapping: torch.Tensor) -> to
     return torch.matmul(hard, mapping)
 
 
+def powerset_overlap_prob(log_probs: torch.Tensor, mapping: torch.Tensor) -> torch.Tensor:
+    """Soft probability that two local speakers talk at once: the summed probability of the two-speaker classes
+    ({0,1}, {0,2}, {1,2}) over the summed probability of all classes, per frame (batch, frames)."""
+
+    probs = torch.exp(log_probs.float())
+    overlap = mapping.sum(1) >= 2
+    return probs[..., overlap].sum(-1) / probs.sum(-1).clamp_min(1e-12)
+
+
 def frame_grid(sample_rate: int = SEGMENTATION_SAMPLE_RATE) -> tuple[float, float, float]:
     """(start, step, duration) in seconds of the output frames (pyannote's ``receptive_field``)."""
 
@@ -455,9 +464,14 @@ class SegmentationModel:
 
         return self._run(chunks, convert=False)
 
-    def _run(self, chunks: np.ndarray, *, convert: bool, batch_size: int = SEGMENTATION_BATCH_SIZE) -> np.ndarray:
+    def _run(self, chunks: np.ndarray, *, convert: bool, batch_size: int = SEGMENTATION_BATCH_SIZE,
+             overlap: bool = False) -> Any:
+        """Log-probabilities, or (``convert``) hard multilabel activations; with ``overlap`` also the soft overlap
+        probability per frame from the same forward pass: ``(activations, overlap_prob)``."""
+
         chunks = np.asarray(chunks, dtype=np.float32)
         outputs = []
+        overlaps = []
         with torch.inference_mode():
             for first in range(0, len(chunks), batch_size):
                 current = chunks[first: first + batch_size]
@@ -468,13 +482,18 @@ class SegmentationModel:
                 batch[: len(current)] = current
                 tensor = torch.from_numpy(batch).to(self.device)[:, None, :]
                 result = self.model(tensor)[: len(current)]
+                if convert and overlap:
+                    overlaps.append(powerset_overlap_prob(result, self.mapping).cpu().numpy())
                 if convert:
                     result = powerset_to_multilabel(result, self.mapping)
                 outputs.append(result.float().cpu().numpy())
         if not outputs:
             frames = num_output_frames(int(SEGMENTATION_CHUNK_SECONDS * SEGMENTATION_SAMPLE_RATE))
             width = self.mapping.shape[1] if convert else self.mapping.shape[0]
-            return np.zeros((0, frames, width), np.float32)
+            empty = np.zeros((0, frames, width), np.float32)
+            return (empty, np.zeros((0, frames), np.float32)) if convert and overlap else empty
+        if convert and overlap:
+            return np.concatenate(outputs), np.concatenate(overlaps).astype(np.float32)
         return np.concatenate(outputs)
 
     def segment_range(self, audio: np.ndarray, first: int = 0, count: Optional[int] = None) -> np.ndarray:
@@ -482,22 +501,30 @@ class SegmentationModel:
 
         return self._run(chunk_audio(audio, first=first, count=count), convert=True)
 
+    def segment_range_with_overlap(self, audio: np.ndarray, first: int = 0,
+                                   count: Optional[int] = None) -> tuple[np.ndarray, np.ndarray]:
+        """``segment_range`` plus the soft overlap probability (count, 589) of the same chunks."""
+
+        return self._run(chunk_audio(audio, first=first, count=count), convert=True, overlap=True)
+
     def segment(self, audio: np.ndarray) -> Dict[str, Any]:
         """seg-3.0 output of a 16 kHz mono signal, the arrays pyannote's segmentation Inference produces.
 
         ``data``: (chunks, 589, 3) hard multilabel activations (0/1) of the three local speakers per chunk;
         chunk ``c`` starts at ``c * chunk_step`` seconds; frame ``f`` of a chunk sits at
-        ``frame_start + f * frame_step`` inside it.
+        ``frame_start + f * frame_step`` inside it. ``overlap_prob``: (chunks, 589) soft probability of two
+        simultaneous local speakers (the batch diarization keeps a second speaker only where it is high).
         """
 
-        return segmentation_payload(self.segment_range(audio))
+        return segmentation_payload(*self.segment_range_with_overlap(audio))
 
 
-def segmentation_payload(data: np.ndarray) -> Dict[str, Any]:
-    """The seg-3.0 arrays dict around (concatenated) ``segment_range`` outputs."""
+def segmentation_payload(data: np.ndarray, overlap_prob: Optional[np.ndarray] = None) -> Dict[str, Any]:
+    """The seg-3.0 arrays dict around (concatenated) ``segment_range`` outputs (``overlap_prob`` when given)."""
 
     start, step, duration = frame_grid()
-    return {
+    extra = {} if overlap_prob is None else {"overlap_prob": overlap_prob}
+    return extra | {
         "data": data,
         "chunk_start": 0.0,
         "chunk_step": SEGMENTATION_STEP_SECONDS,
@@ -710,6 +737,18 @@ def segment_audio_range(indices: Any, audio: np.ndarray) -> np.ndarray:
         return model.segment_range(audio, first=int(indices[0]), count=len(indices))
 
 
+def segment_audio_range_with_overlap(indices: Any, audio: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """``segment_audio_range`` plus the soft overlap probability of the same chunks (one forward pass)."""
+
+    indices = list(indices)
+    model = _loaded_model()
+    if not indices:
+        frames = num_output_frames(int(SEGMENTATION_CHUNK_SECONDS * SEGMENTATION_SAMPLE_RATE))
+        return np.zeros((0, frames, SEGMENTATION_NUM_SPEAKERS), np.float32), np.zeros((0, frames), np.float32)
+    with shared_gpu_lease():
+        return model.segment_range_with_overlap(audio, first=int(indices[0]), count=len(indices))
+
+
 __all__ = [
     "PyanNet",
     "SEGMENTATION_MODEL_NAME",
@@ -724,11 +763,13 @@ __all__ = [
     "load_segmentation_model",
     "num_output_frames",
     "powerset_mapping",
+    "powerset_overlap_prob",
     "powerset_to_multilabel",
     "resolve_segmentation_checkpoint",
     "release_segmentation_model",
     "segment_audio",
     "segment_audio_range",
+    "segment_audio_range_with_overlap",
     "segmentation_available",
     "segmentation_payload",
     "segmentation_status",

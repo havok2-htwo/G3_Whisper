@@ -93,6 +93,22 @@ class PyanNetShapeTests(unittest.TestCase):
         multi = seg.powerset_to_multilabel(logits, torch.from_numpy(mapping))
         self.assertEqual(multi[0].tolist(), [[0, 0, 0], [1, 0, 1], [0, 1, 0]])
 
+    def test_overlap_probability_sums_the_two_speaker_classes(self) -> None:
+        mapping = torch.from_numpy(seg.powerset_mapping())
+        logits = torch.full((1, 3, 7), -10.0)
+        logits[0, 0, 0] = 0.0   # silence
+        logits[0, 1, 5] = 0.0   # {0, 2}
+        logits[0, 2, 2] = 0.0   # {1}
+        pov = seg.powerset_overlap_prob(torch.log_softmax(logits, -1), mapping)
+        self.assertEqual(tuple(pov.shape), (1, 3))
+        self.assertLess(float(pov[0, 0]), 1e-3)
+        self.assertGreater(float(pov[0, 1]), 0.99)
+        self.assertLess(float(pov[0, 2]), 1e-3)
+        lp = torch.log_softmax(torch.randn(2, 5, 7, dtype=torch.float64), -1)
+        p = lp.exp().numpy()
+        np.testing.assert_allclose(seg.powerset_overlap_prob(lp, mapping).numpy(), p[..., 4:7].sum(-1) / p.sum(-1),
+                                   rtol=1e-6)
+
 
 class ChunkingTests(unittest.TestCase):
     def test_chunks_like_pyannote_inference(self) -> None:
@@ -119,6 +135,16 @@ class ChunkingTests(unittest.TestCase):
         self.assertLessEqual(out["data"].sum(-1).max(), 2.0)
         self.assertEqual((out["chunk_step"], out["chunk_dur"]), (1.0, 10.0))
         self.assertAlmostEqual(out["frame_step"], 0.016875)
+        # soft overlap probability from the same forward pass: shape, range, the raw log-probs, the hard path
+        self.assertEqual(out["overlap_prob"].shape, (3, 589))
+        self.assertTrue(0.0 <= float(out["overlap_prob"].min()) and float(out["overlap_prob"].max()) <= 1.0)
+        probs = np.exp(model.log_probs(seg.chunk_audio(audio)).astype(np.float64))
+        np.testing.assert_allclose(out["overlap_prob"], probs[..., 4:7].sum(-1) / probs.sum(-1), atol=1e-5)
+        np.testing.assert_array_equal(out["data"], model.segment_range(audio))
+        data, pov = model.segment_range_with_overlap(audio, first=1, count=2)
+        np.testing.assert_array_equal(data, out["data"][1:3])
+        np.testing.assert_allclose(pov, out["overlap_prob"][1:3], atol=1e-6)
+        self.assertNotIn("overlap_prob", seg.segmentation_payload(out["data"]))
 
 
 class CheckpointLoadingTests(unittest.TestCase):

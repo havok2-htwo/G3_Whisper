@@ -78,6 +78,14 @@ class _Meeting:
         self.seg_calls.append(indices)
         return self.data[indices[0]: indices[0] + len(indices)]
 
+    def overlap_prob(self) -> np.ndarray:
+        # soft P(overlap) as seg-3.0 would give it: high where two local speakers are active
+        return np.where(self.data.sum(-1) >= 2, 0.9, 0.02).astype(np.float32)
+
+    def segment_range_with_overlap(self, indices, audio):
+        indices = list(indices)
+        return self.segment_range(indices, audio), self.overlap_prob()[indices[0]: indices[0] + len(indices)]
+
     def embed_native(self, windows, window_samples):
         return [self.vector_at(w.start_ms / 1000.0, window_samples / 16000.0) for w in windows]
 
@@ -87,7 +95,7 @@ class _Meeting:
     def segmentation(self) -> dict:
         from backend.genesis_whisper_server_segmentation import segmentation_payload
 
-        return segmentation_payload(self.data)
+        return segmentation_payload(self.data, self.overlap_prob())
 
 
 class _CountingLock:
@@ -399,7 +407,9 @@ class LocalDiarizationDriverTests(unittest.TestCase):
         lock = _CountingLock()
         with (
             mock.patch.object(engine, "SEGMENTATION_SLICE_CHUNKS", 16),
-            mock.patch.object(engine, "segment_audio_range", side_effect=meeting.segment_range),
+            mock.patch.object(engine, "segment_audio_range", side_effect=AssertionError("ohne Overlap-Werte")),
+            mock.patch.object(engine, "segment_audio_range_with_overlap",
+                              side_effect=meeting.segment_range_with_overlap),
             mock.patch.object(engine, "_embed_native", side_effect=meeting.embed_native),
         ):
             payload = asyncio.run(engine.run_local_diarization(lock, meeting.audio, speech_probs=probs))
@@ -415,8 +425,22 @@ class LocalDiarizationDriverTests(unittest.TestCase):
         self.assertEqual(sum(len(c) for c in meeting.seg_calls), 51)
         self.assertGreater(lock.acquired, 4)
 
+    def test_sliced_segmentation_carries_the_overlap_probability_in_chunk_order(self) -> None:
+        meeting = _Meeting([(0.0, 20.0, 21), (15.0, 40.0, 22)], 40.0)
+        with (
+            mock.patch.object(engine, "SEGMENTATION_SLICE_CHUNKS", 8),
+            mock.patch.object(engine, "segment_audio_range_with_overlap",
+                              side_effect=meeting.segment_range_with_overlap),
+        ):
+            seg = asyncio.run(engine.segment_sliced(_CountingLock(), meeting.audio, overlap=True))
+        np.testing.assert_array_equal(seg["data"], meeting.data)
+        np.testing.assert_array_equal(seg["overlap_prob"], meeting.overlap_prob())
+        self.assertEqual(seg["overlap_prob"].shape, meeting.data.shape[:2])
+        self.assertGreater(float(seg["overlap_prob"].max()), 0.5)  # the 15-20 s overlap is there
+
     def test_without_a_checkpoint_the_driver_raises_runtime_error(self) -> None:
-        with mock.patch.object(engine, "segment_audio_range", side_effect=RuntimeError("Kein Segmentierungsmodell")):
+        with mock.patch.object(engine, "segment_audio_range_with_overlap",
+                               side_effect=RuntimeError("Kein Segmentierungsmodell")):
             with self.assertRaises(RuntimeError):
                 asyncio.run(engine.run_local_diarization(_CountingLock(), np.zeros(16000 * 5, np.float32),
                                                          speech_probs=np.zeros(156, np.float32)))
