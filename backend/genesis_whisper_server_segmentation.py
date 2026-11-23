@@ -682,10 +682,10 @@ def release_segmentation_model() -> bool:
     return True
 
 
-def apply_segmentation_settings(needed: bool = True) -> bool:
-    """Admin hook (GPU thread). A loaded model whose checkpoint or device no longer matches the settings, or that
-    no feature needs any more (``needed`` False), is released; the next use loads the right one. A remembered
-    failed load is forgotten, so a fixed file is offered again. True when a model was released."""
+def apply_segmentation_settings() -> bool:
+    """Admin hook (GPU thread). A loaded model whose checkpoint or device no longer matches the settings is
+    released; the next use loads the right one. A remembered failed load is forgotten, so a fixed file is offered
+    again. True when a model was released."""
 
     with _segmentation_lock:
         model = _segmentation_state.get("model")
@@ -695,7 +695,7 @@ def apply_segmentation_settings(needed: bool = True) -> bool:
     if model is None:
         return False
     stale = str(resolve_segmentation_checkpoint()) != loaded_path or str(_target_device()) != loaded_device
-    if needed and not stale:
+    if not stale:
         return False
     return release_segmentation_model()
 

@@ -1426,7 +1426,7 @@ class TranscriptLanguageDetectionTests(unittest.TestCase):
 
 
 class DiarizationLanguageDetectionTests(unittest.TestCase):
-    """Per-speaker language: decided once per DIA speaker before ASR, carried on segments and assignments."""
+    """Per-speaker language: decided once per diarization speaker (label) before ASR, carried on segments and assignments."""
 
     TURNS = [
         {"start_ms": 0, "end_ms": 6000, "speaker_id": "SPEAKER_A"},

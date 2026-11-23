@@ -78,12 +78,12 @@ RUN chmod +x /usr/local/bin/entrypoint.sh
 # Run as non-root. Pre-create + own the volume mountpoints so the named volumes
 # inherit `app` ownership on first mount.
 RUN useradd --create-home --uid 1000 app \
-    && mkdir -p /app/models /app/logs /app/frontend /app/gpu-coordination \
+    && mkdir -p /app/models /app/logs /app/frontend \
     && chown -R app:app /app
 USER app
 
 EXPOSE 7861
-VOLUME ["/app/models", "/app/logs", "/app/gpu-coordination"]
+VOLUME ["/app/models", "/app/logs"]
 
 # First boot downloads the warmup model, so give startup a long grace period.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=1200s --retries=5 \

@@ -176,9 +176,9 @@ def _warmup_lid() -> None:
 
 
 def _warmup_segmentation() -> None:
-    """Eager-load seg-3.0 and warm ReDimNet's 1.5 s shapes, only when the local diarization engine or speaker_turns
-    uses them. Best-effort like the other warmups: a failure leaves the lazy load in place (speaker_turns is then
-    not offered while the checkpoint cannot be loaded)."""
+    """Eager-load seg-3.0, warm ReDimNet's 1.5 s shapes and the batch diarization (FP16 windows, Viterbi); MMS_FA
+    and Silero only with speaker_turns on. Best-effort like the other warmups: a failure leaves the lazy load in
+    place (without a seg-3.0 checkpoint diarization answers 503 and speaker_turns is not offered)."""
 
     try:
         from .genesis_whisper_server_diarization_engine import warmup_segmentation

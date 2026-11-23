@@ -168,11 +168,26 @@ class SegmentationWarmupTests(unittest.TestCase):
                     mock.patch.object(seg, "load_segmentation_model", return_value=model) as load,
                     mock.patch.object(diarization_engine, "prepare_window_length") as prepare,
                     mock.patch.object(diarization_engine, "_warmup_speaker_turns_helpers") as warm_helpers,
+                    mock.patch.object(diarization_engine, "_warmup_local_diarization") as warm_diarization,
                 ):
                     server._warmup_segmentation()
                 self.assertEqual(load.call_count, loads)
                 self.assertEqual(prepare.call_count, loads)
+                # the batch diarization (FP16 windows, Viterbi) is warmed whatever the speaker_turns switch says
+                self.assertEqual(warm_diarization.call_count, loads)
                 self.assertEqual(warm_helpers.call_count, helpers)
+        # counter-check: without a seg-3.0 checkpoint nothing further is warmed
+        with (
+            mock.patch.dict(current_settings, {"speaker_turns_enabled": True}),
+            mock.patch.object(seg, "load_segmentation_model", return_value=None),
+            mock.patch.object(diarization_engine, "prepare_window_length") as prepare,
+            mock.patch.object(diarization_engine, "_warmup_speaker_turns_helpers") as warm_helpers,
+            mock.patch.object(diarization_engine, "_warmup_local_diarization") as warm_diarization,
+        ):
+            server._warmup_segmentation()
+        prepare.assert_not_called()
+        warm_diarization.assert_not_called()
+        warm_helpers.assert_not_called()
         with (
             mock.patch.dict(current_settings, {"speaker_turns_enabled": True}),
             mock.patch.object(seg, "load_segmentation_model", side_effect=RuntimeError("CUDA error")),

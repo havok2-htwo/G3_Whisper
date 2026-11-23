@@ -95,13 +95,11 @@ SILERO_SPEECH_PROB = 0.5
 # Settings and capabilities
 # ---------------------------------------------------------------------------
 
-def speaker_turns_switch(settings: Optional[Mapping[str, Any]] = None) -> bool:
-    """The admin switch ``speaker_turns_enabled``; a settings dict without the key counts as on."""
+def speaker_turns_switch() -> bool:
+    """The admin switch ``speaker_turns_enabled``; settings without the key count as on."""
 
-    if settings is None:
-        with settings_lock:
-            return current_settings.get("speaker_turns_enabled", True) is True
-    return settings.get("speaker_turns_enabled", True) is True
+    with settings_lock:
+        return current_settings.get("speaker_turns_enabled", True) is True
 
 
 def speaker_turns_available() -> bool:

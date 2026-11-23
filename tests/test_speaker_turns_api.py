@@ -540,13 +540,13 @@ class DiarizationEngineSwitchTests(unittest.TestCase):
             {"start_ms": 0, "end_ms": 6000, "speaker_id": "SPEAKER_00"},
             {"start_ms": 6000, "end_ms": 12000, "speaker_id": "SPEAKER_01"},
         ]
-        dia_payload = local_result or {
+        diarization_payload = local_result or {
             "model": {"id": ld.LOCAL_DIARIZATION_MODEL_ID, "engine": "local"},
             "diarization": turns,
             "exclusive_diarization": turns,
             "overlaps": [],
         }
-        local = mock.AsyncMock(return_value=dia_payload, side_effect=local_error)
+        local = mock.AsyncMock(return_value=diarization_payload, side_effect=local_error)
 
         async def transcribe(_request, _audio, gated, *_rest):
             return [
@@ -712,7 +712,7 @@ class SegmentationAvailabilityTests(unittest.TestCase):
             self.assertTrue(seg.segmentation_available())
             seg._segmentation_state["failed_path"] = str(seg.Path("/m/pytorch_model.bin"))
             self.assertFalse(seg.segmentation_available())
-            seg.apply_segmentation_settings(True)
+            seg.apply_segmentation_settings()
             self.assertTrue(seg.segmentation_available())
 
     def test_chunk_ranges_cut_like_the_whole_signal(self) -> None:

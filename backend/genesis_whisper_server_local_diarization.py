@@ -32,7 +32,8 @@ The frozen values are ``DEFAULT_PARAMS``; ``V5_PARAMS`` restores V5 (the V4 valu
    best of mapped local activity plus 1.5 x the score difference to the primary, else the score runner-up.
 
 The output is the diarization payload (``diarization``, ``exclusive_diarization``, ``overlaps`` in integer
-milliseconds; formerly the shape of the G3_DIA ``/v2/diarize`` answer, checked by ``validate_diarization_payload``),
+milliseconds; formerly the shape of the G3_DIA ``/v2/diarize`` answer; the tests check it with
+``validate_diarization_payload``),
 which ``_process_diarization`` and the WXC pipeline consume.
 CPU part is numpy/scipy (numba for the Viterbi loop when it is installed, bit-identical numpy fallback); the GPU
 parts (segmentation, embeddings) are passed in or use the shared models.
@@ -1168,7 +1169,8 @@ def _valid_span(item: Any) -> bool:
 
 def validate_diarization_payload(payload: Any) -> Dict[str, Any]:
     """The diarization payload contract (schema 2.0, the former G3_DIA ``/v2/diarize`` answer): returns ``payload``
-    unchanged, raises ``ValueError`` when a field is missing or malformed."""
+    unchanged, raises ``ValueError`` when a field is missing or malformed. A test and contract helper: the server
+    never calls it (``result_to_diarization_payload`` builds the payload itself)."""
 
     if (
         not isinstance(payload, dict)

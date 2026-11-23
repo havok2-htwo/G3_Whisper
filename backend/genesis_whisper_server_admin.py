@@ -300,7 +300,7 @@ def _apply_voice_model_settings() -> Dict[str, bool]:
         "redimnet": apply_vid_settings(),
         "mms_fa": apply_mms_device_setting(),
         "language_detection": apply_lid_device_setting(),
-        "segmentation": apply_segmentation_settings(True),
+        "segmentation": apply_segmentation_settings(),
     }
 
 
