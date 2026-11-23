@@ -249,14 +249,19 @@ class V5BlockTests(unittest.TestCase):
 
     def test_vectorized_reseg_equals_the_slice_loop(self) -> None:
         feats = _synthetic(self.SCHEDULE, 52.0, overlap=[(20.0, 22.0, 0)], noise=0.2, seed=3)
-        s = _state(feats)
         C = ld.unit(np.stack([_voice(100), _voice(101), _voice(7)]))
-        for final, scales in ((False, (("s1.5", 1.0), ("s3.0", 0.5))),
-                              (True, (("s1.5", 1.0), ("s3.0", 0.5), ("s0.75", 8.0)))):
-            path, score = ld._reseg(s, C, final=final)
-            ref, has = _naive_reseg_score(s, C, scales)
-            np.testing.assert_allclose(score[has], ref[has], atol=1e-5)
-            self.assertGreater(float(has.mean()), 0.9)
+        for fast in (False, True):
+            s = _state(feats, loc_w=0.0, fast_sums=fast)
+            for final, scales in ((False, (("s1.5", 1.0), ("s3.0", 0.5))),
+                                  (True, (("s1.5", 1.0), ("s3.0", 0.5), ("s0.75", 8.0)))):
+                path, score = ld._reseg(s, C, final=final)
+                ref, has = _naive_reseg_score(s, C, scales)
+                np.testing.assert_allclose(score[has], ref[has], atol=1e-5)
+                self.assertGreater(float(has.mean()), 0.9)
+                # counter-check: the reference sees a different weighting
+                wrong, _ = _naive_reseg_score(s, C, tuple((k, 1.0) for k, _ in scales))
+                self.assertGreater(float(np.abs(score[has] - wrong[has]).max()), 1e-3)
+        s = _state(feats)
         # without the final flag the 0.75 s windows never count
         no_short = dict(s.windows)
         no_short.pop("s0.75")
@@ -351,6 +356,196 @@ class V5BlockTests(unittest.TestCase):
         v4 = ld.speech_frames_from_seg(feats.seg, 52.0, {"seg_off": None, "ham": 1})
         np.testing.assert_array_equal(v4, ld.seg_count(ld.seg_info(feats.seg, n), n) >= 1)
 
+
+def _viterbi_loop_free_frames(sm, pause_frames):
+    """The V5 loop of ``free_switch_frames`` (reference for the vectorised version)."""
+
+    free = np.zeros(len(sm), bool)
+    run = 0
+    for t in range(len(sm)):
+        if not sm[t]:
+            run += 1
+        else:
+            if run >= pause_frames:
+                free[t] = True
+            run = 0
+    return free
+
+
+class V5FastTests(unittest.TestCase):
+    """V5-fast: the exact speed-ups give the V5 result, the new terms only act where they should."""
+
+    SCHEDULE = PipelineTests.SCHEDULE
+
+    def test_numba_viterbi_is_bit_identical_to_the_numpy_loop(self) -> None:
+        rng = np.random.default_rng(5)
+        for T, K in ((2, 1), (50, 2), (3000, 4), (800, 7)):
+            score = rng.standard_normal((T, K)).astype(np.float32)
+            score[::7] = np.round(score[::7])  # ties
+            free = rng.random(T) < 0.05
+            for pen in (0.0, 1.5, 30.0):
+                np.testing.assert_array_equal(ld.viterbi_nb(score, pen, free), ld.viterbi(score, pen, free))
+                np.testing.assert_array_equal(ld.viterbi_nb(score, pen), ld.viterbi(score, pen))
+        # counter-check: the penalty matters on this input, so equal paths are not trivially equal
+        score = rng.standard_normal((400, 3)).astype(np.float32)
+        self.assertFalse(np.array_equal(ld.viterbi_nb(score, 0.0), ld.viterbi_nb(score, 5.0)))
+        # float64 scores take the numpy loop
+        np.testing.assert_array_equal(ld.viterbi_nb(score.astype(np.float64), 1.0), ld.viterbi(score, 1.0))
+
+    def test_free_switch_frames_equals_the_loop(self) -> None:
+        rng = np.random.default_rng(1)
+        for sm in (rng.random(5000) < 0.7, np.zeros(10, bool), np.ones(10, bool), np.zeros(0, bool)):
+            for pause in (0, 1, 25):
+                np.testing.assert_array_equal(ld.free_switch_frames(sm, pause), _viterbi_loop_free_frames(sm, pause))
+
+    def test_fast_audit_and_activity_equal_the_loops(self) -> None:
+        feats = _synthetic(self.SCHEDULE, 52.0, overlap=[(20.0, 22.0, 0)], noise=0.2, seed=3)
+        s = _state(feats)
+        C = ld.unit(np.stack([_voice(100), _voice(101), _voice(7)]))
+        path, score = ld._reseg(s, C)
+        K = len(C)
+        fast = ld._audit_fast(ld._local_vote_matrix(s, path, K), K, 0.5)
+        loop = ld._audit(ld._local_votes(s, path, K), K, 0.5)
+        for a, b in zip(fast, loop):
+            np.testing.assert_allclose(a, b, atol=1e-12)
+        np.testing.assert_allclose(ld._overlap_activity_hung_fast(s, path, K, score),
+                                   ld._overlap_activity_hung(s, path, K, score), atol=1e-5)
+        # counter-check: another path gives other purities
+        other = ld._audit_fast(ld._local_vote_matrix(s, (path + 1) % K, K), K, 0.5)
+        self.assertFalse(np.allclose(other[0], fast[0]))
+
+    def test_exact_speedups_alone_give_the_v5_result(self) -> None:
+        feats = _synthetic(self.SCHEDULE, 52.0, overlap=[(20.0, 22.0, 0)], noise=0.2, seed=3)
+        v5 = ld.diarize_features(feats, params=ld.V5_PARAMS)
+        fast = ld.diarize_features(feats, params=dict(ld.V5_PARAMS, numba_viterbi=True, fast_sums=True))
+        np.testing.assert_array_equal(fast.active, v5.active)
+        np.testing.assert_array_equal(fast.primary, v5.primary)
+
+    def _counting(self, feats, transform=None):
+        calls = []
+        lookup = {round(float(t), 3): v for t, v in zip(feats.windows["s0.75"][0], feats.windows["s0.75"][2])}
+
+        def embed075(starts_s):
+            calls.append(np.asarray(starts_s).copy())
+            X = np.stack([lookup[round(float(t), 3)] for t in starts_s]) if len(starts_s) else np.zeros((0, 192))
+            return transform(X) if transform else X
+
+        return calls, embed075
+
+    def test_short_windows_are_embedded_only_at_unsure_frames(self) -> None:
+        feats = _synthetic(self.SCHEDULE, 52.0, overlap=[(20.0, 22.0, 0)], noise=0.25, seed=4)
+        st75 = feats.windows["s0.75"][0]
+        placeholders = dict(feats.windows, **{"s0.75": (st75, st75 + 0.75, np.zeros((len(st75), 192), np.float32))})
+        calls, embed075 = self._counting(feats)
+        lazy = ld.diarize_features(ld.Features(feats.seg, placeholders, feats.duration_s, embed075=embed075))
+        self.assertEqual(len(calls), 1)
+        asked = calls[0]
+        self.assertTrue(0 < len(asked) < len(st75), (len(asked), len(st75)))
+        self.assertEqual(lazy.debug["n075"], len(asked))
+        self.assertTrue(set(np.round(asked, 3)) <= set(np.round(st75, 3)))
+        # the overlap (20-22 s) is unsure: every window whose core lies inside it is asked for
+        core_mid = st75 + 0.375
+        inside = st75[(core_mid > 20.3) & (core_mid < 21.7)]
+        self.assertTrue(set(np.round(inside, 3)) <= set(np.round(asked, 3)))
+        # with the vectors already there (no callback) the same windows give the same result
+        eager = ld.diarize_features(feats)
+        np.testing.assert_array_equal(lazy.active, eager.active)
+        self.assertEqual(eager.debug["n075"], len(asked))
+        # counter-check: the asked vectors are really used (flipped vectors change the final pass)
+        _, flipped = self._counting(feats, transform=lambda X: -X)
+        bad = ld.diarize_features(ld.Features(feats.seg, placeholders, feats.duration_s, embed075=flipped))
+        self.assertFalse(np.array_equal(bad.active, eager.active))
+        # V5: every 0.75 s window, asked for once, same result as the stored vectors
+        calls, embed075 = self._counting(feats)
+        v5_lazy = ld.diarize_features(ld.Features(feats.seg, placeholders, feats.duration_s, embed075=embed075),
+                                      params=ld.V5_PARAMS)
+        self.assertEqual([len(c) for c in calls], [len(st75)])
+        np.testing.assert_array_equal(v5_lazy.active, ld.diarize_features(feats, params=ld.V5_PARAMS).active)
+        # no final pass: nothing is asked
+        calls, embed075 = self._counting(feats)
+        ld.diarize_features(ld.Features(feats.seg, placeholders, feats.duration_s, embed075=embed075),
+                            params={"w075": 0})
+        self.assertEqual(calls, [])
+
+    def test_unsure_frames_follow_margin_overlap_and_changes(self) -> None:
+        feats = _synthetic(self.SCHEDULE, 52.0, overlap=[(20.0, 22.0, 0)])
+        st75, en75, _ = feats.windows["s0.75"]
+        C = ld.unit(np.stack([_voice(100), _voice(101)]))
+        s = _state(feats)
+        path, score = ld._reseg(s, C)
+        base = ld._unsure_075(s, path, score, st75, en75)
+        none = ld._unsure_075(_state(feats, sel075_margin=0.0, sel075_overlap=False), path, score, st75, en75)
+        every = ld._unsure_075(_state(feats, sel075_margin=10.0), path, score, st75, en75)
+        wide = ld._unsure_075(_state(feats, sel075_dilate_s=1.0), path, score, st75, en75)
+        self.assertTrue(bool(every.all()))
+        self.assertTrue(bool((none <= base).all()) and bool((base <= wide).all()))
+        self.assertGreater(int(wide.sum()), int(base.sum()))
+        # without margin and overlap only label changes count; here they fall into the pauses, where no window sits,
+        # and widened by 0.5 s they reach exactly the windows next to the changes
+        changes = (np.flatnonzero(path[1:] != path[:-1]) + 1) * ld.GRID_S
+        self.assertEqual(len(changes), 3)
+        self.assertEqual(int(none.sum()), 0)
+        near = ld._unsure_075(_state(feats, sel075_margin=0.0, sel075_overlap=False, sel075_dilate_s=0.5),
+                              path, score, st75, en75)
+        self.assertTrue(0 < int(near.sum()) < len(st75))
+        mids = (st75 + en75) / 2
+        dist = np.abs(mids[:, None] - changes[None, :]).min(1)
+        self.assertTrue(bool((dist[near] <= 0.5 + 0.2 + ld.GRID_S).all()))
+        self.assertTrue(bool((dist[~near] > 0.5).all()))
+
+    def test_local_speaker_vectors_are_means_of_windows_inside_one_local_speaker(self) -> None:
+        feats = _synthetic(self.SCHEDULE, 52.0, noise=0.05, seed=2)
+        s = _state(feats)
+        L = ld._local_speaker_vectors(s)
+        self.assertIsNotNone(L)
+        np.testing.assert_allclose(np.linalg.norm(L["E"], axis=1), 1.0, atol=1e-5)
+        self.assertEqual(len(L["U"]), len(L["G"]))
+        # each unit's vector is close to the voice of the speaker who talks on its frames
+        voices = {k: _voice(100 + k) for k in (0, 1)}
+        t = L["G"] * ld.GRID_S
+        for u in range(len(L["E"])):
+            mid = float(np.median(t[L["U"] == u]))
+            who = [k for a, b, k in self.SCHEDULE if a <= mid < b][0]
+            self.assertGreater(float(L["E"][u] @ voices[who]), float(L["E"][u] @ voices[1 - who]) + 0.5)
+        # the term only enters the final pass, and only with loc_w > 0
+        C = ld.unit(np.stack([_voice(100), _voice(101)]))
+        for final in (False, True):
+            with_loc = ld._reseg(_state(feats), C, final=final)[1]
+            without = ld._reseg(_state(feats, loc_w=0.0), C, final=final)[1]
+            if final:
+                self.assertFalse(np.allclose(with_loc, without))
+            else:
+                np.testing.assert_array_equal(with_loc, without)
+        # counter-check: a speaker below loc_min_f sole frames gets no vector
+        self.assertIsNone(ld._local_speaker_vectors(_state(feats, loc_min_f=10 ** 6)))
+
+    def test_v5_params_turn_every_fast_path_off(self) -> None:
+        p = dict(ld.DEFAULT_PARAMS, **ld.V5_PARAMS)
+        self.assertEqual((p["numba_viterbi"], p["fast_sums"], p["loc_w"], p["sel075"]), (False, False, 0.0, False))
+        d = ld.DEFAULT_PARAMS
+        self.assertEqual((d["numba_viterbi"], d["fast_sums"], d["loc_w"], d["loc_scales"], d["sel075"],
+                          d["sel075_margin"], d["sel075_overlap"], d["sel075_dilate_s"]),
+                         (True, True, 0.2, "s1.5+s0.75", True, 0.3, True, 0.0))
+
+    def test_diarize_audio_embeds_the_short_windows_on_demand(self) -> None:
+        sr = ld.SAMPLE_RATE
+        feats = _synthetic(self.SCHEDULE, 52.0, overlap=[(20.0, 22.0, 0)], noise=0.2, seed=3)
+        audio = np.zeros(52 * sr, np.float32)
+        speech = np.ones(len(audio) // 512, bool)
+        asked = {}
+
+        def embed(_audio, starts, length_s):
+            asked.setdefault(length_s, []).append(len(starts))
+            rng = np.random.default_rng(len(starts))
+            X = rng.standard_normal((len(starts), 192)).astype(np.float32)
+            return X / np.linalg.norm(X, axis=1, keepdims=True)
+
+        ld.diarize_audio(audio, segmentation=feats.seg, speech_probs=speech.astype(np.float32), embed=embed)
+        planned = ld.plan_scale_starts(len(audio), speech, 512)
+        self.assertEqual(asked[3.0], [len(planned["s3.0"])])
+        self.assertEqual(asked[1.5], [len(planned["s1.5"])])
+        self.assertEqual(len(asked[0.75]), 1)
+        self.assertLess(asked[0.75][0], len(planned["s0.75"]))
 
 if __name__ == "__main__":
     unittest.main()

@@ -847,6 +847,127 @@ def embed_voice_windows(
     return output
 
 
+# DIA-free diarization windows only: a pure-FP16 copy of the loaded model (weights, activations and head in FP16, the
+# waveform frontend stays FP32) in fixed batches of twice the prepared 3 s batch times ``length_batch_factor`` (FP16
+# halves the activations, so the reserved pool stays the size the 3 s buckets warmed: measured on an RTX 3090 at
+# maximum 4, 1952 against 1932 MiB). Bench: 3.0 + 1.5 + 0.75 s windows about 25 % faster than the autocast model,
+# vectors cos >= 0.995 to it, same speaker counts on all 210 bench files. The public voice vectors keep the FP32
+# model with autocast (``embed_voice_windows``).
+DIARIZATION_HALF_BATCH_FACTOR = 2
+
+
+def _half_components() -> Dict[str, Any] | None:
+    """The FP16 copy of the loaded model on its device (built once per model instance and device), None off CUDA.
+    Caller holds no lock; the copy is made under ``_redimnet_lock``."""
+
+    import copy
+
+    if not load_vid_model():
+        raise RuntimeError("ReDimNet2-B6 LM konnte nicht geladen werden.")
+    with _redimnet_lock:
+        model = _redimnet_components["model"]
+        device: torch.device = _redimnet_components["device"]
+        if model is None or device is None or device.type != "cuda":
+            return None
+        key = (id(model), str(device))
+        cached = _redimnet_components.get("half")
+        if cached is None or cached["key"] != key:
+            _redimnet_components["half"] = None
+            half = copy.deepcopy(model).eval()
+            for name in ("backbone", "pool", "bn", "linear", "bn2"):
+                module = getattr(half, name, None)
+                if module is not None:
+                    module.half()
+            cached = {"key": key, "model": half, "device": device}
+            _redimnet_components["half"] = cached
+        return {**cached, "batch": max(1, int(_redimnet_components.get("cuda_batch_size") or 1))
+                * DIARIZATION_HALF_BATCH_FACTOR}
+
+
+def _half_forward(model: Any, waveform: torch.Tensor) -> torch.Tensor:
+    """``ReDimNet2Wrap.forward`` with the FP32 frontend output cast to FP16 for the FP16 backbone and head."""
+
+    x = waveform
+    pad = getattr(model, "pad_right_samples", None)
+    if pad is not None:
+        x = torch.nn.functional.pad(x, (0, pad), mode="constant", value=None)
+    x = model.spec(x).half()
+    if x.ndim == 3:
+        x = x.unsqueeze(1)
+    out = model.backbone(x)
+    if isinstance(out, tuple):
+        out = out[0]
+    if out.ndim == 4:
+        bs, channels, freqs, frames = out.size()
+        out = out.reshape(bs, channels * freqs, frames)
+    offset = getattr(model, "before_pool_offset", None)
+    if offset is not None:
+        out = out[:, :, offset:]
+    out = model.linear(model.bn(model.pool(out)))
+    if getattr(model, "bn2", None) is not None:
+        out = model.bn2(out)
+    return out.float()
+
+
+def embed_diarization_windows(windows: Sequence[VoiceWindow], *, window_samples: int) -> list[np.ndarray]:
+    """Unit vectors of the DIA-free diarization windows (fitted to ``window_samples``) with the FP16 copy, every
+    batch padded to the full FP16 batch (one warmed shape per length). Off CUDA: ``embed_voice_windows``."""
+
+    windows = list(windows)
+    if not windows:
+        return []
+    half = _half_components()
+    if half is None:
+        return [item.vector for item in embed_voice_windows(windows, window_samples=window_samples)]
+    model, device = half["model"], half["device"]
+    batch = half["batch"] * length_batch_factor(window_samples)
+    output: list[np.ndarray] = []
+    position = 0
+    with shared_gpu_lease():
+        while position < len(windows):
+            current = windows[position: position + batch]
+            batch_np = _prepare_waveform_batch(current, batch, window_samples)
+            waveform = None
+            try:
+                waveform = torch.from_numpy(batch_np).to(device=device, dtype=torch.float32)
+                with torch.inference_mode():
+                    embeddings_np = _half_forward(model, waveform).cpu().numpy()
+            except RuntimeError as exc:
+                if "out of memory" not in str(exc).lower() or batch == 1:
+                    raise
+                batch = max(1, batch // 2)
+                retry = True
+            else:
+                retry = False
+            finally:
+                del waveform
+            if retry:
+                torch.cuda.empty_cache()
+                continue
+            for vector in embeddings_np[: len(current)]:
+                vector = np.asarray(vector, dtype=np.float32).reshape(-1)
+                norm = float(np.linalg.norm(vector))
+                if len(vector) != REDIMNET_EMBEDDING_DIMENSION or not np.isfinite(norm) or norm <= 1e-12:
+                    raise RuntimeError("ReDimNet2 (FP16) lieferte einen ungueltigen Vektor.")
+                output.append((vector / norm).astype(np.float32, copy=False))
+            position += len(current)
+    return output
+
+
+def prepare_diarization_half(window_lengths: Iterable[int]) -> bool:
+    """Build the FP16 copy and warm its one batch shape per window length (startup, GPU thread). False off CUDA."""
+
+    half = _half_components()
+    if half is None:
+        return False
+    with shared_gpu_lease(), torch.inference_mode():
+        for samples in window_lengths:
+            batch = half["batch"] * length_batch_factor(int(samples))
+            _half_forward(half["model"], torch.zeros((batch, int(samples)), dtype=torch.float32, device=half["device"]))
+        torch.cuda.synchronize(half["device"])
+    return True
+
+
 def _weighted_normalized_mean(vectors: Iterable[np.ndarray], weights: Iterable[float]) -> np.ndarray:
     vector_list = [np.asarray(vector, dtype=np.float32).reshape(-1) for vector in vectors]
     weight_array = np.asarray(list(weights), dtype=np.float32)
@@ -893,12 +1014,14 @@ __all__ = [
     "VoiceWindow",
     "apply_vid_settings",
     "configured_max_batch_size",
+    "embed_diarization_windows",
     "embed_voice_windows",
     "embedding_model_metadata",
     "generate_voice_vector",
     "iter_windows_from_audio",
     "length_batch_factor",
     "load_vid_model",
+    "prepare_diarization_half",
     "prepare_window_length",
     "redimnet_batch_buckets",
     "resolve_local_device",

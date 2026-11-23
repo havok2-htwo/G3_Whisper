@@ -410,7 +410,8 @@ class LocalDiarizationDriverTests(unittest.TestCase):
             mock.patch.object(engine, "segment_audio_range", side_effect=AssertionError("ohne Overlap-Werte")),
             mock.patch.object(engine, "segment_audio_range_with_overlap",
                               side_effect=meeting.segment_range_with_overlap),
-            mock.patch.object(engine, "_embed_native", side_effect=meeting.embed_native),
+            mock.patch.object(engine, "_embed_diarization", side_effect=meeting.embed_native),
+            mock.patch.object(engine, "_embed_native", side_effect=AssertionError("FP16-Kopie erwartet")),
         ):
             payload = asyncio.run(engine.run_local_diarization(lock, meeting.audio, speech_probs=probs))
         reference = ld.diarize_audio(meeting.audio, segmentation=meeting.segmentation(), speech_probs=probs,
@@ -424,6 +425,89 @@ class LocalDiarizationDriverTests(unittest.TestCase):
         self.assertEqual([c[0] for c in meeting.seg_calls], [0, 16, 32, 48])
         self.assertEqual(sum(len(c) for c in meeting.seg_calls), 51)
         self.assertGreater(lock.acquired, 4)
+
+    def _run_driver(self, meeting, probs=None, *, params=None, half_embed=True, silero=None, seg_side=None):
+        calls: list[tuple[int, int]] = []
+
+        def unit(windows, window_samples):
+            calls.append((window_samples, len(windows)))
+            return meeting.embed_native(windows, window_samples)
+
+        patches = [
+            mock.patch.object(engine, "segment_audio_range_with_overlap",
+                              side_effect=seg_side or meeting.segment_range_with_overlap),
+            mock.patch.object(engine, "_embed_diarization" if half_embed else "_embed_native", side_effect=unit),
+            mock.patch.object(engine, "_embed_native" if half_embed else "_embed_diarization",
+                              side_effect=AssertionError("falscher Einbettungsweg")),
+        ]
+        if silero is not None:
+            patches.append(mock.patch.object(engine._wxc, "silero_frame_probs", side_effect=silero))
+        for patch in patches:
+            patch.start()
+        try:
+            payload = asyncio.run(engine.run_local_diarization(_CountingLock(), meeting.audio, speech_probs=probs,
+                                                               params=params, half_embed=half_embed))
+        finally:
+            for patch in reversed(patches):
+                patch.stop()
+        return payload, calls
+
+    @staticmethod
+    def _schedule_probs(meeting, schedule):
+        probs = np.zeros(len(meeting.audio) // 512, np.float32)
+        t = (np.arange(len(probs)) + 0.5) * 512 / 16000
+        for a, b, _ in schedule:
+            probs[(t >= a) & (t < b)] = 0.9
+        return probs
+
+    def test_short_windows_are_embedded_after_clustering_and_only_where_unsure(self) -> None:
+        schedule = [(0.0, 14.0, 21), (14.5, 30.0, 22), (30.5, 44.0, 21), (44.5, 60.0, 22)]
+        meeting = _Meeting(schedule, 60.0)
+        probs = self._schedule_probs(meeting, schedule)
+        planned = ld.plan_scale_starts(len(meeting.audio), probs > 0.5, 512)
+        payload, calls = self._run_driver(meeting, probs)
+        per_length: dict = {}
+        for samples, count in calls:
+            per_length[samples] = per_length.get(samples, 0) + count
+        self.assertEqual(per_length[48000], len(planned["s3.0"]))
+        self.assertEqual(per_length[24000], len(planned["s1.5"]))
+        self.assertTrue(0 < per_length[12000] < len(planned["s0.75"]), per_length)
+        # the 0.75 s windows come last (after the clustering) and in slices of at most 48 s of audio
+        first75 = next(i for i, (samples, _) in enumerate(calls) if samples == 12000)
+        self.assertTrue(all(samples == 12000 for samples, _ in calls[first75:]))
+        self.assertTrue(all(count <= {48000: 16, 24000: 32, 12000: 64}[samples] for samples, count in calls))
+        self.assertEqual(payload["counts"]["speakers"], 2)
+        # V5 (V5_PARAMS + the public model): every 0.75 s window, the same speakers here
+        v5, calls = self._run_driver(meeting, probs, params=ld.V5_PARAMS, half_embed=False)
+        self.assertEqual(sum(c for samples, c in calls if samples == 12000), len(planned["s0.75"]))
+        self.assertEqual(v5["counts"]["speakers"], 2)
+        reference = ld.diarize_audio(meeting.audio, segmentation=meeting.segmentation(), speech_probs=probs,
+                                     embed=meeting.embed_reference, params=ld.V5_PARAMS)
+        for key in ("diarization", "exclusive_diarization", "overlaps"):
+            self.assertEqual(v5[key], reference[key], key)
+
+    def test_silero_runs_next_to_segmentation(self) -> None:
+        import threading
+
+        schedule = [(0.0, 14.0, 21), (14.5, 30.0, 22)]
+        meeting = _Meeting(schedule, 30.0)
+        probs = self._schedule_probs(meeting, schedule)
+        silero_started = threading.Event()
+
+        def silero(_samples):
+            silero_started.set()
+            return probs
+
+        def seg(indices, audio):
+            # seg-3.0 waits for Silero: serial phases (seg first) would time out here
+            if not silero_started.wait(timeout=10):
+                raise AssertionError("Silero laeuft nicht neben seg-3.0")
+            return meeting.segment_range_with_overlap(indices, audio)
+
+        payload, _ = self._run_driver(meeting, None, silero=silero, seg_side=seg)
+        self.assertEqual(payload["counts"]["speakers"], 2)
+        same, _ = self._run_driver(meeting, probs)
+        self.assertEqual(payload["diarization"], same["diarization"])
 
     def test_sliced_segmentation_carries_the_overlap_probability_in_chunk_order(self) -> None:
         meeting = _Meeting([(0.0, 20.0, 21), (15.0, 40.0, 22)], 40.0)

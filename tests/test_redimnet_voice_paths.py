@@ -689,5 +689,174 @@ class RedimNetVoicePathTests(unittest.TestCase):
         self.assertNotIn("pyannote.audio", source)
 
 
+class _TinySpec(torch.nn.Module):
+    """FP32 frontend like ReDimNet's: (B, n) -> (B, 8, n // 8), keeps the input dtype."""
+
+    def forward(self, x):
+        return x.reshape(len(x), 8, -1) * 4.0
+
+
+class _TinyBackbone(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.w = torch.nn.Parameter(torch.linspace(0.5, 1.5, 8).reshape(1, 1, 8, 1))
+
+    def forward(self, x):
+        return torch.tanh(x * self.w)
+
+
+class _TinyPool(torch.nn.Module):
+    def forward(self, x):
+        return x.mean(-1) + x.std(-1)
+
+
+class _TinyReDimNet(torch.nn.Module):
+    """Same attribute layout as ``ReDimNet2Wrap`` (spec, backbone, pool, bn, linear, optional bn2)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        torch.manual_seed(0)
+        self.spec = _TinySpec()
+        self.backbone = _TinyBackbone()
+        self.pool = _TinyPool()
+        self.bn = torch.nn.BatchNorm1d(8)
+        self.linear = torch.nn.Linear(8, vid.REDIMNET_EMBEDDING_DIMENSION)
+        self.bn2 = None
+        self.pad_right_samples = None
+        self.before_pool_offset = None
+        self.eval()
+
+    def forward(self, x):
+        out = self.backbone(self.spec(x).unsqueeze(1))
+        b, c, f, t = out.shape
+        return self.linear(self.bn(self.pool(out.reshape(b, c * f, t))))
+
+
+def _diar_windows(count: int, samples: int) -> list:
+    rng = np.random.default_rng(3)
+    return [vid.VoiceWindow(audio=rng.standard_normal(samples).astype(np.float32) * 0.1, start_ms=i, end_ms=i + 1)
+            for i in range(count)]
+
+
+class DiarizationHalfEmbeddingTests(unittest.TestCase):
+    """V5-fast: an FP16 copy for the diarization windows only; the public model stays FP32."""
+
+    def test_half_copy_is_fp16_cached_per_model_and_device_and_leaves_the_public_model_fp32(self) -> None:
+        model = _TinyReDimNet()
+        components = {"model": model, "device": torch.device("cuda"), "dtype": torch.float16, "cuda_batch_size": 4}
+        with (
+            mock.patch.object(vid, "load_vid_model", return_value=True),
+            mock.patch.dict(vid._redimnet_components, components, clear=True),
+        ):
+            half = vid._half_components()
+            self.assertEqual(half["batch"], 8)  # twice the prepared 3 s batch
+            self.assertIsNot(half["model"], model)
+            for name in ("backbone", "bn", "linear"):
+                self.assertTrue(all(p.dtype == torch.float16 for p in getattr(half["model"], name).parameters()))
+                self.assertTrue(all(p.dtype == torch.float32 for p in getattr(model, name).parameters()))
+            self.assertIs(vid._half_components()["model"], half["model"])
+            # an OOM backoff of the public model halves the FP16 batch too
+            vid._redimnet_components["cuda_batch_size"] = 2
+            self.assertEqual(vid._half_components()["batch"], 4)
+            # another model instance (reload) or device gets a new copy
+            vid._redimnet_components["model"] = _TinyReDimNet()
+            self.assertIsNot(vid._half_components()["model"], half["model"])
+            vid._redimnet_components["device"] = torch.device("cpu")
+            self.assertIsNone(vid._half_components())
+
+    def test_half_forward_matches_the_fp32_model(self) -> None:
+        model = _TinyReDimNet()
+        import copy
+
+        half = copy.deepcopy(model)
+        for name in ("backbone", "pool", "bn", "linear"):
+            getattr(half, name).half()
+        x = torch.from_numpy(np.stack([w.audio for w in _diar_windows(3, 1600)]))
+        with torch.inference_mode():
+            ref = torch.nn.functional.normalize(model(x), dim=1)
+            got = torch.nn.functional.normalize(vid._half_forward(half, x), dim=1)
+        self.assertEqual(got.dtype, torch.float32)
+        cos = (ref * got).sum(1)
+        self.assertGreater(float(cos.min()), 0.999)
+        # counter-check: a slightly different backbone is caught by the same bound
+        with torch.no_grad():
+            half.linear.weight.mul_(torch.linspace(0.5, 1.5, half.linear.weight.shape[1]).half())
+        with torch.inference_mode():
+            off = torch.nn.functional.normalize(vid._half_forward(half, x), dim=1)
+        self.assertLess(float((ref * off).sum(1).min()), 0.999)
+
+    def test_diarization_windows_run_full_fp16_batches_in_order(self) -> None:
+        model = _TinyReDimNet()
+        shapes: list[tuple] = []
+        real_forward = vid._half_forward
+
+        def spy(m, waveform):
+            shapes.append(tuple(waveform.shape))
+            return real_forward(m, waveform)
+
+        windows = _diar_windows(6, 24000)  # 1.5 s: twice the batch of 3 s windows
+        half = {"model": model, "device": torch.device("cpu"), "batch": 2}
+        with (
+            mock.patch.object(vid, "_half_components", return_value=half),
+            mock.patch.object(vid, "_half_forward", side_effect=spy),
+            mock.patch.object(vid, "shared_gpu_lease", return_value=nullcontext()),
+        ):
+            vectors = vid.embed_diarization_windows(windows, window_samples=24000)
+        self.assertEqual(shapes, [(4, 24000), (4, 24000)])  # the tail is zero-padded to the full batch
+        self.assertEqual(len(vectors), 6)
+        with torch.inference_mode():
+            single = [real_forward(model, torch.from_numpy(w.audio[None])).numpy()[0] for w in windows]
+        for got, ref in zip(vectors, single):
+            self.assertAlmostEqual(float(np.linalg.norm(got)), 1.0, places=5)
+            np.testing.assert_allclose(got, ref / np.linalg.norm(ref), atol=1e-5)
+
+    def test_diarization_oom_halves_the_batch_and_keeps_order(self) -> None:
+        model = _TinyReDimNet()
+        shapes: list[int] = []
+        real_forward = vid._half_forward
+
+        def flaky(m, waveform):
+            shapes.append(len(waveform))
+            if len(waveform) == 4:
+                raise RuntimeError("CUDA out of memory. Tried to allocate")
+            return real_forward(m, waveform)
+
+        windows = _diar_windows(5, 24000)
+        half = {"model": model, "device": torch.device("cpu"), "batch": 2}
+        with (
+            mock.patch.object(vid, "_half_components", return_value=half),
+            mock.patch.object(vid, "_half_forward", side_effect=flaky),
+            mock.patch.object(vid, "shared_gpu_lease", return_value=nullcontext()),
+            mock.patch.object(vid.torch.cuda, "empty_cache"),
+        ):
+            vectors = vid.embed_diarization_windows(windows, window_samples=24000)
+        self.assertEqual(shapes, [4, 2, 2, 2])
+        with torch.inference_mode():
+            ref = real_forward(model, torch.from_numpy(np.stack([w.audio for w in windows]))).numpy()
+        ref /= np.linalg.norm(ref, axis=1, keepdims=True)
+        np.testing.assert_allclose(np.stack(vectors), ref, atol=1e-5)
+        # any other error is raised
+        with (
+            mock.patch.object(vid, "_half_components", return_value=half),
+            mock.patch.object(vid, "_half_forward", side_effect=RuntimeError("kaputt")),
+            mock.patch.object(vid, "shared_gpu_lease", return_value=nullcontext()),
+        ):
+            with self.assertRaises(RuntimeError):
+                vid.embed_diarization_windows(windows, window_samples=24000)
+
+    def test_off_cuda_the_diarization_windows_use_the_public_model(self) -> None:
+        windows = _diar_windows(3, 12000)
+        out = [vid.EmbeddedVoiceWindow(vector=_unit_vector(i), start_ms=i, end_ms=i + 1, clean_duration_seconds=0.75,
+                                       quality=1.0, stitched=False) for i in range(3)]
+        with (
+            mock.patch.object(vid, "_half_components", return_value=None),
+            mock.patch.object(vid, "embed_voice_windows", return_value=out) as public,
+        ):
+            vectors = vid.embed_diarization_windows(windows, window_samples=12000)
+        public.assert_called_once()
+        self.assertEqual(public.call_args.kwargs["window_samples"], 12000)
+        np.testing.assert_array_equal(np.stack(vectors), np.stack([o.vector for o in out]))
+        self.assertEqual(vid.embed_diarization_windows([], window_samples=12000), [])
+
 if __name__ == "__main__":
     unittest.main()

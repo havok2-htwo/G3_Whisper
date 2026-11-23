@@ -1,9 +1,11 @@
 """DIA-free batch diarization: seg-3.0 speech/overlap + ReDimNet2 windows + AHC + Viterbi resegmentation.
 
-Production version of the "V5" research pipeline without its per-local-speaker embeddings (those need a separate
-GPU pass that is not built here). Bench (diaopt, against human reference RTTMs, overlap included, tune splits only
-for tuning): research V5 held-out VoxConverse test DER 11.1 % against 12.8 % for pyannote community-1 through G3_DIA.
-The frozen values are ``DEFAULT_PARAMS``; the V4 values are listed there.
+Production version "V5-fast" of the "V5" research pipeline. Its per-local-speaker term costs no GPU pass (the mean
+of windows that are embedded anyway), and the 0.75 s windows are embedded only where the pre-final path is unsure.
+Bench (diaopt / v5fast, against human reference RTTMs, overlap included, tune splits only for tuning, held-out
+scored once): same speaker counts as V5 on all 129 tune and 81 held-out files, tune DER 10.17 % (V5 10.23 %),
+held-out time-weighted DER 0.10 points better than V5; RTX 3090 diarization about 1.16 s per audio minute (V5 1.88).
+The frozen values are ``DEFAULT_PARAMS``; ``V5_PARAMS`` restores V5 (the V4 values are listed at ``DEFAULT_PARAMS``).
 
 1. seg-3.0 (``genesis_whisper_server_segmentation``) gives per 20 ms frame the number of active speakers (0/1/2,
    uniform overlap-add over the 10 s chunks, frame f of a chunk at f * frame_step + 0.04 s). ``count >= 1`` is the
@@ -20,19 +22,24 @@ The frozen values are ``DEFAULT_PARAMS``; the V4 values are listed there.
    (mean margin < 0.175) is a duplicate; the smaller of the two goes. Split test: a cluster whose clean 3 s windows
    fall into two clearly separated groups (centroid cosine / own cosine of the smaller part <= 0.75, >= 10 windows)
    is split in two (max 4 splits, then the margin audit again).
-7. Final pass: resegmentation with the 0.75 s windows added (weight 8), one refinement, resegmentation; then one
-   more pass with the seg-3.0 local-speaker activity (mapped one-to-one per chunk onto the clusters) added to the
-   frame score.
+7. Final pass: only the 0.75 s windows whose scoring core touches an unsure frame of the path so far (top-2 score
+   margin < 0.3, a seg-3.0 overlap frame or a label change) are embedded now (``Features.embed075``) and added to
+   the frame score (weight 8), together with one vector per (chunk, local speaker): the mean of the 1.5 s and the
+   chosen 0.75 s windows inside that local speaker's sole frames (weight 0.2); resegmentation, one refinement,
+   resegmentation; then one more pass with the seg-3.0 local-speaker activity (mapped one-to-one per chunk onto the
+   clusters) added to the frame score.
 8. Overlap: frames with count 2 and an aggregated soft seg-3.0 overlap probability >= 0.5 get a second speaker: the
    best of mapped local activity plus 1.5 x the score difference to the primary, else the score runner-up.
 
 The output has the shape of the G3_DIA ``/v2/diarize`` answer (``diarization``, ``exclusive_diarization``,
 ``overlaps`` in integer milliseconds), so ``_process_diarization`` and the WXC pipeline work unchanged.
-CPU part is numpy/scipy only; the GPU parts (segmentation, embeddings) are passed in or use the shared models.
+CPU part is numpy/scipy (numba for the Viterbi loop when it is installed, bit-identical numpy fallback); the GPU
+parts (segmentation, embeddings) are passed in or use the shared models.
 """
 
 from __future__ import annotations
 
+import sys
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -51,9 +58,10 @@ BATCH_WINDOW_SCALES: Dict[str, tuple[float, float]] = {"s3.0": (3.0, 0.5), "s1.5
                                                        "s0.75": (0.75, 0.25)}
 WINDOW_MIN_SPEECH = 0.3  # a window is embedded only with this share of speech frames
 
-# Frozen V5 configuration without local-speaker embeddings (bench: diaopt/v5/FROZEN.md, tuned on tune splits only,
-# leave-one-out and plateau tested); change only with a new benchmark. The V4 values: min_spk_s 6, w075 0,
-# marg_thr 0, split_ratio 0, seg_off None, ham 1, map_mode "vote", beta 0, ov_blend 0, ov_prune_pov 0.
+# Frozen V5-fast configuration (bench: diaopt/v5/FROZEN.md for V5, v5fast/combined/FROZEN.md for the fast part;
+# tuned on tune splits only, held-out scored once); change only with a new benchmark. ``V5_PARAMS`` gives V5 back.
+# The V4 values: min_spk_s 6, w075 0, marg_thr 0, split_ratio 0, seg_off None, ham 1, map_mode "vote", beta 0,
+# ov_blend 0, ov_prune_pov 0 (with ``V5_PARAMS``).
 DEFAULT_PARAMS: Dict[str, Any] = dict(
     ahc_thr=0.55,        # AHC cosine distance threshold
     min_spk_s=2.0,       # clusters with less clean-window support are dissolved
@@ -79,7 +87,22 @@ DEFAULT_PARAMS: Dict[str, Any] = dict(
     beta=1.0,            # weight of the mapped local-speaker activity in the last resegmentation (0 = off)
     ov_blend=1.5,        # second speaker = argmax(activity + ov_blend * (score - primary score)); 0 = V4 rule
     ov_prune_pov=0.5,    # keep a second speaker only where the aggregated soft P(overlap) reaches this (0 = off)
+    # ---- V5-fast (research names in brackets)
+    numba_viterbi=True,  # numba Viterbi loop, bit-identical to the numpy loop [fastvit 3]
+    fast_sums=True,      # window sums per frame cached once per window set, grouped bincounts [fastres]
+    loc_w=0.2,           # weight of the per-(chunk, local speaker) mean vectors in the final pass (0 = off) [aloc_w]
+    loc_scales="s1.5+s0.75",  # windows averaged into those vectors [aloc_sc]
+    loc_own=0.8,         # a window counts for a local speaker when >= this share of it is that speaker's sole frames
+    loc_min_f=100,       # local speakers with fewer sole frames get no vector
+    sel075=True,         # embed only the 0.75 s windows at unsure frames of the pre-final path [b075]
+    sel075_margin=0.3,   # unsure: top-2 cluster score margin below this [b075_d]
+    sel075_overlap=True,  # unsure: seg-3.0 overlap frames (count >= 2) [b075_ov]
+    sel075_dilate_s=0.0,  # widen the unsure frames by this many seconds on both sides [b075_m]
 )
+
+# V5 (before V5-fast): every 0.75 s window, no local-speaker vectors, the numpy loops. Use with ``half_embed=False``
+# in the request driver for the V5 embeddings too.
+V5_PARAMS: Dict[str, Any] = dict(numba_viterbi=False, fast_sums=False, loc_w=0.0, sel075=False)
 
 
 def unit(x: np.ndarray) -> np.ndarray:
@@ -205,18 +228,76 @@ def viterbi(score: np.ndarray, penalty: float, free: Optional[np.ndarray] = None
     return path
 
 
+try:  # numba ships with librosa (a server dependency); the numpy loop stays the fallback
+    import numba as _nb
+
+    @_nb.njit(cache=True, nogil=True)
+    def _viterbi_nb(score, pen_t):
+        # float32 arithmetic in the same order as the numpy loop (bit-identical path, ties included)
+        T, K = score.shape
+        dp = score[0].copy()
+        bp = np.zeros((T, K), np.int32)
+        for t in range(1, T):
+            best = 0
+            m = dp[0]
+            for k in range(1, K):
+                if dp[k] > m:
+                    m = dp[k]
+                    best = k
+            sw = m - pen_t[t]
+            for k in range(K):
+                if sw > dp[k]:
+                    bp[t, k] = best
+                    dp[k] = sw + score[t, k]
+                else:
+                    bp[t, k] = k
+                    dp[k] = dp[k] + score[t, k]
+        path = np.zeros(T, np.int32)
+        best = 0
+        m = dp[0]
+        for k in range(1, K):
+            if dp[k] > m:
+                m = dp[k]
+                best = k
+        path[T - 1] = best
+        for t in range(T - 1, 0, -1):
+            path[t - 1] = bp[t, path[t]]
+        return path
+except Exception:  # pragma: no cover - numba missing or broken
+    _viterbi_nb = None
+
+
+def viterbi_nb(score: np.ndarray, penalty: float, free: Optional[np.ndarray] = None) -> np.ndarray:
+    """``viterbi`` as a numba loop (same float32 order, bit-identical path); the numpy loop when numba is missing,
+    fails to compile (e.g. no writable cache) or the score is not float32."""
+
+    global _viterbi_nb
+    if _viterbi_nb is None or score.dtype != np.float32 or len(score) < 2:
+        return viterbi(score, penalty, free)
+    pen = np.full(len(score), np.float32(penalty), np.float32)
+    if free is not None:
+        pen[np.asarray(free, bool)] = np.float32(0.0)
+    try:
+        return _viterbi_nb(np.ascontiguousarray(score), pen)
+    except Exception as exc:  # pragma: no cover - environment specific
+        print(f"[WARNUNG-DIAR] numba-Viterbi nicht nutzbar, numpy-Schleife stattdessen: {exc}", file=sys.stderr)
+        _viterbi_nb = None
+        return viterbi(score, penalty, free)
+
+
 def free_switch_frames(sm: np.ndarray, pause_frames: int) -> np.ndarray:
     """True on a speech frame that follows at least ``pause_frames`` non-speech frames."""
 
+    sm = np.asarray(sm, bool)
     free = np.zeros(len(sm), bool)
-    run = 0
-    for t in range(len(sm)):
-        if not sm[t]:
-            run += 1
-        else:
-            if run >= pause_frames:
-                free[t] = True
-            run = 0
+    if not len(sm):
+        return free
+    # length of the non-speech run ending right before every frame (the loop's ``run``)
+    idx = np.arange(len(sm))
+    last_speech = np.maximum.accumulate(np.where(sm, idx, -1))
+    prev_last = np.concatenate([[-1], last_speech[:-1]])
+    run = idx - 1 - prev_last
+    free[sm & (run >= pause_frames)] = True
     return free
 
 
@@ -244,11 +325,16 @@ Windows = tuple  # (start s, end s, vectors N x 192)
 
 @dataclass
 class Features:
-    """Everything the CPU stage needs: seg-3.0 arrays, window embeddings per scale, the signal length."""
+    """Everything the CPU stage needs: seg-3.0 arrays, window embeddings per scale, the signal length.
+
+    ``embed075(starts_s) -> N x 192``: embeds 0.75 s windows on demand (start seconds out of ``windows["s0.75"]``);
+    the final pass then asks only for the windows it uses, and the 0.75 s vectors in ``windows`` may be
+    placeholders. Without it the vectors in ``windows`` are used."""
 
     seg: Mapping[str, Any]
     windows: Dict[str, Windows]
     duration_s: float
+    embed075: Optional[Callable[[np.ndarray], np.ndarray]] = None
 
 
 def plan_window_starts(num_samples: int, length_s: float, hop_s: float, speech: np.ndarray, frame_samples: int,
@@ -329,7 +415,7 @@ def compute_window_features(audio: np.ndarray, speech: np.ndarray, frame_samples
 
 
 # ---------------------------------------------------------------------------
-# The V4 pipeline on features
+# The pipeline on features
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -342,6 +428,8 @@ class _State:
     free: np.ndarray
     p: Dict[str, Any]
     debug: Dict[str, Any] = field(default_factory=dict)
+    # per-request caches of the fast paths (window sums per frame, local-speaker groups, ...)
+    cache: Dict[Any, Any] = field(default_factory=dict)
 
 
 def _unit_windows(windows: Mapping[str, Windows]) -> Dict[str, Windows]:
@@ -352,16 +440,66 @@ def _unit_windows(windows: Mapping[str, Windows]) -> Dict[str, Windows]:
     return out
 
 
+def _frame_sums(s: _State, final: bool):
+    """The weighted window-vector sum per frame is piecewise constant between window core edges and does not depend
+    on the centroids: computed once per window set (``s.cache``, dropped when the windows change), the frame score
+    is then one small matrix product. Returns (sums per piece, weight per piece, piece lengths in frames)."""
+
+    cache = s.cache
+    key = ("F", final)
+    if key in cache:
+        return cache[key]
+    n, p = s.n, s.p
+    los, his, ws, Xs = [], [], [], []
+    for scale, wgt in _scale_weights(p, final):
+        if wgt <= 0 or scale not in s.windows:
+            continue
+        st, en, X = s.windows[scale]
+        if len(X) == 0:
+            continue
+        fa, fb = window_frames(st, en, n)
+        mid = (fa + fb) // 2
+        half = np.maximum(1, ((fb - fa) * p["core"]).astype(int) // 2)
+        los.append(np.maximum(0, mid - half)); his.append(np.minimum(n, mid + half))
+        ws.append(np.full(len(X), wgt, np.float64)); Xs.append(X)
+    if not Xs:
+        out = (np.zeros((1, 192)), np.zeros(1), np.array([n]))
+        cache[key] = out
+        return out
+    lo, hi, w, X = np.concatenate(los), np.concatenate(his), np.concatenate(ws), np.concatenate(Xs).astype(np.float64)
+    edges = np.unique(np.concatenate([[0, n], lo, hi]))
+    nseg = len(edges) - 1
+    a, b = np.searchsorted(edges, lo), np.searchsorted(edges, hi)
+    D = np.zeros((nseg + 1, X.shape[1]))
+    np.add.at(D, a, w[:, None] * X)
+    np.add.at(D, b, -w[:, None] * X)
+    dc = np.bincount(a, w, minlength=nseg + 1) - np.bincount(b, w, minlength=nseg + 1)
+    F = np.cumsum(D, 0)[:nseg]
+    cseg = np.cumsum(dc)[:nseg]
+    out = (F, cseg, np.diff(edges))
+    cache[key] = out
+    return out
+
+
+def _scale_weights(p: Mapping[str, Any], final: bool) -> tuple[tuple[str, float], ...]:
+    return (("s1.5", 1.0), ("s3.0", p["w3"]), ("s0.75", p["w075"] if final else 0.0))
+
+
 def _reseg(s: _State, C: np.ndarray, *, final: bool = False,
            extra: Optional[np.ndarray] = None) -> tuple[np.ndarray, np.ndarray]:
     """Viterbi path and frame score (weighted mean window/centroid cosine). ``final`` adds the 0.75 s windows;
-    ``extra`` (frames x K) is added to the temperature-scaled score before the Viterbi."""
+    ``extra`` (frames x K) is added to the temperature-scaled score before the Viterbi. ``final`` also adds the
+    per-(chunk, local speaker) vectors with weight ``loc_w``."""
 
     n, p = s.n, s.p
     K = len(C)
     score = np.zeros((n, K), np.float32)
     cnt = np.zeros(n, np.float32)
-    for scale, wgt in (("s1.5", 1.0), ("s3.0", p["w3"]), ("s0.75", p["w075"] if final else 0.0)):
+    if p["fast_sums"]:
+        F, cseg, lens = _frame_sums(s, final)
+        score = np.repeat((F @ C.T.astype(np.float64)).astype(np.float32), lens, axis=0)
+        cnt = np.repeat(cseg.astype(np.float32), lens)
+    for scale, wgt in (() if p["fast_sums"] else _scale_weights(p, final)):
         if wgt <= 0 or scale not in s.windows:
             continue
         st, en, X = s.windows[scale]
@@ -382,6 +520,16 @@ def _reseg(s: _State, C: np.ndarray, *, final: bool = False,
         np.add.at(dc, hi, -wgt)
         score += np.cumsum(dsc, 0)[:n].astype(np.float32)
         cnt += np.cumsum(dc)[:n].astype(np.float32)
+    if final and p["loc_w"] > 0:
+        if "loc" not in s.cache:
+            s.cache["loc"] = _local_speaker_vectors(s)
+        L = s.cache["loc"]
+        if L is not None:
+            Sl = (L["E"] @ C.T).astype(np.float64)
+            w = p["loc_w"]
+            for k in range(K):
+                score[:, k] += np.bincount(L["G"], weights=w * Sl[L["U"], k], minlength=n)[:n].astype(np.float32)
+            cnt += np.bincount(L["G"], weights=np.full(len(L["G"]), w), minlength=n)[:n].astype(np.float32)
     has = cnt > 1e-6
     score[has] /= cnt[has, None]
     if not has.all():
@@ -392,7 +540,63 @@ def _reseg(s: _State, C: np.ndarray, *, final: bool = False,
     scaled = score / p["temp"]
     if extra is not None:
         scaled = scaled + extra
-    return viterbi(scaled, p["penalty"], s.free), score
+    return (viterbi_nb if p["numba_viterbi"] else viterbi)(scaled, p["penalty"], s.free), score
+
+
+def _local_speaker_vectors(s: _State) -> Optional[Dict[str, Any]]:
+    """One vector per (chunk, local speaker) without a GPU pass: unit mean of the already embedded windows (scales
+    ``loc_scales``) that lie inside the chunk and are >= ``loc_own`` covered by that local speaker's sole frames.
+    Returns E (units x 192), U (unit of every entry), G (grid frame of every entry: the speaker's sole frames)."""
+
+    p = s.p
+    scs = str(p["loc_scales"]).split("+")
+    seg, gis = s.info.data > 0.5, s.info.gis
+    nc, nf, nk = seg.shape
+    sole = seg.sum(2) == 1
+    n = s.n
+    per = []
+    for sc in scs:
+        if sc not in s.windows or len(s.windows[sc][2]) == 0:
+            continue
+        st, en, X = s.windows[sc]
+        fa, fb = window_frames(st, en, n)
+        per.append((fa, fb, X))
+    if not per:
+        return None
+    units, U, G = [], [], []
+    own_min = p["loc_own"]
+    for c in range(nc):
+        g0, g1 = int(gis[c, 0]), int(gis[c, -1]) + 1
+        for k in range(nk):
+            m = seg[c, :, k] & sole[c]
+            if int(m.sum()) < p["loc_min_f"]:
+                continue
+            g = np.unique(gis[c][m])
+            ind = np.zeros(g1 - g0 + 1, np.int64)
+            ind[g - g0] = 1
+            cs = np.concatenate([[0], np.cumsum(ind)])
+            acc, cntw = np.zeros(192, np.float64), 0
+            for fa, fb, X in per:
+                i0, i1 = np.searchsorted(fa, g0), np.searchsorted(fa, g1)
+                if i1 <= i0:
+                    continue
+                a_, b_ = fa[i0:i1], fb[i0:i1]
+                ok = b_ <= g1
+                if not ok.any():
+                    continue
+                a2, b2 = a_[ok] - g0, b_[ok] - g0
+                share = (cs[b2] - cs[a2]) / np.maximum(b2 - a2, 1)
+                sel = np.flatnonzero(ok)[share >= own_min] + i0
+                if len(sel):
+                    acc += X[sel].sum(0)
+                    cntw += len(sel)
+            if cntw == 0:
+                continue
+            U.append(np.full(len(g), len(units), np.int64)); G.append(g)
+            units.append(acc / cntw)
+    if not units:
+        return None
+    return dict(E=unit(np.stack(units).astype(np.float32)), U=np.concatenate(U), G=np.concatenate(G))
 
 
 def _refine(s: _State, C: np.ndarray, path: np.ndarray) -> np.ndarray:
@@ -408,6 +612,44 @@ def _refine(s: _State, C: np.ndarray, path: np.ndarray) -> np.ndarray:
         sel = valid & (own > 0.9) & (speech > 0.6)
         newC.append(unit(X[sel].mean(0)) if int(sel.sum()) >= 3 else C[kk])
     return np.stack(newC)
+
+
+def _local_groups(s: _State):
+    """(group of every (chunk, local speaker) sole speech frame, its grid frame, number of groups), cached."""
+
+    cache = s.cache
+    if "lg" not in cache:
+        seg, gis = s.info.data, s.info.gis
+        sole = seg.sum(2) == 1
+        m = (seg > 0.5) & sole[:, :, None]
+        c_, f_, k_ = np.nonzero(m)
+        g = gis[c_, f_]
+        keep = s.sm[g]
+        c_, k_, g = c_[keep], k_[keep], g[keep]
+        gid = c_ * seg.shape[2] + k_
+        uniq, grp = np.unique(gid, return_inverse=True)
+        cache["lg"] = (grp, g, len(uniq))
+    return cache["lg"]
+
+
+def _local_vote_matrix(s: _State, path: np.ndarray, K: int) -> np.ndarray:
+    """``_local_votes`` as one (groups x K) matrix (the groups without a speech frame are left out there and add
+    nothing to ``_audit`` here)."""
+
+    grp, g, ng = _local_groups(s)
+    return np.bincount(grp * K + path[g], minlength=ng * K).reshape(ng, K).astype(np.float64)
+
+
+def _audit_fast(V: np.ndarray, K: int, dom_share: float) -> tuple[np.ndarray, np.ndarray]:
+    """``_audit`` on the vote matrix."""
+
+    tot = V.sum(0)
+    total = V.sum(1)
+    m = V.argmax(1)
+    vm = V[np.arange(len(V)), m]
+    d = vm >= dom_share * total
+    own = np.bincount(m[d], weights=vm[d], minlength=K)
+    return own / np.maximum(tot, 1), tot
 
 
 def _local_votes(s: _State, path: np.ndarray, K: int) -> list[tuple[int, int, np.ndarray]]:
@@ -501,7 +743,80 @@ def _overlap_activity_hung(s: _State, path: np.ndarray, K: int, score: np.ndarra
     return act
 
 
+def _overlap_activity_hung_fast(s: _State, path: np.ndarray, K: int, score: np.ndarray) -> np.ndarray:
+    """``_overlap_activity_hung`` with the per-chunk sums done as grouped bincounts (same mapping rule)."""
+
+    from scipy.optimize import linear_sum_assignment
+
+    seg, gis, win = s.info.data, s.info.gis, s.info.window
+    p = s.p
+    n = s.n
+    nc, nf, nk = seg.shape
+    cache = s.cache
+    if "hung" not in cache:
+        act_m = seg > 0.5
+        sole = seg.sum(2) == 1
+        nact = act_m.sum(1)
+        cand = nact >= p["map_min_f"]
+        ca, fa_, ka = np.nonzero(act_m & cand[:, None, :])
+        cv, fv, kv = np.nonzero(act_m & sole[:, :, None] & cand[:, None, :])
+        cover = np.bincount(gis.ravel(), np.broadcast_to(win, gis.shape).ravel().astype(np.float64), minlength=n)[:n]
+        cache["hung"] = (cand, nact, ca * nk + ka, gis[ca, fa_], cv * nk + kv, gis[cv, fv], cover)
+    cand, nact, ga, fra, gv, frv, cover = cache["hung"]
+    centred = (score - score.mean(1, keepdims=True)).astype(np.float64)
+    G = nc * nk
+    cs = np.stack([np.bincount(ga, centred[fra, j], minlength=G) for j in range(K)], 1)
+    vc = np.bincount(gv * K + path[frv], minlength=G * K).reshape(G, K).astype(np.float64)
+    nv = vc.sum(1, keepdims=True)
+    E_all = np.where(nv > 0, vc / np.maximum(nv, 1), 0.0) + p["map_lam"] * cs / np.maximum(nact.reshape(-1, 1), 1)
+    E_all = E_all.reshape(nc, nk, K)
+    A_c, A_k, A_g = [], [], []
+    for c in np.flatnonzero(cand.any(1)):
+        ks = np.flatnonzero(cand[c])
+        rows, cols = linear_sum_assignment(-E_all[c, ks])
+        A_c.extend([c] * len(rows)); A_k.extend(ks[rows].tolist()); A_g.extend(cols.tolist())
+    act = np.zeros((n, K))
+    if A_c:
+        A_c, A_k, A_g = np.array(A_c), np.array(A_k), np.array(A_g)
+        fr = gis[A_c]
+        vals = win[None, :] * seg[A_c, :, A_k]
+        act = np.bincount((fr * K + A_g[:, None]).ravel(), vals.ravel().astype(np.float64),
+                          minlength=n * K)[: n * K].reshape(n, K)
+    ok = cover > 0
+    act[ok] /= cover[ok, None]
+    return act.astype(np.float32)
+
+
+def _unsure_075(s: _State, path: np.ndarray, score: np.ndarray, st: np.ndarray, en: np.ndarray) -> np.ndarray:
+    """Which 0.75 s windows the final pass uses: those whose scoring core touches an unsure frame of the path so
+    far: a label change (both sides), a seg-3.0 overlap frame (``sel075_overlap``) or a top-2 score margin below
+    ``sel075_margin``, widened by ``sel075_dilate_s``."""
+
+    p, n = s.p, s.n
+    unc = np.zeros(n, bool)
+    unc[np.flatnonzero(path[1:] != path[:-1]) + 1] = True
+    unc[np.flatnonzero(path[:-1] != path[1:])] = True
+    if p["sel075_overlap"]:
+        unc |= s.count >= 2
+    if p["sel075_margin"] > 0 and score.shape[1] > 1:
+        srt = np.sort(score, 1)
+        unc |= (srt[:, -1] - srt[:, -2]) < p["sel075_margin"]
+    mfr = int(round(p["sel075_dilate_s"] / GRID_S))
+    if mfr > 0:
+        cs = np.concatenate([[0], np.cumsum(unc)])
+        unc = (cs[np.clip(np.arange(n) + mfr + 1, 0, n)] - cs[np.clip(np.arange(n) - mfr, 0, n)]) > 0
+    s.debug["unsure_share"] = float(unc[s.sm].mean()) if s.sm.any() else 0.0
+    fa, fb = window_frames(st, en, n)
+    mid = (fa + fb) // 2
+    half = np.maximum(1, ((fb - fa) * p["core"]).astype(int) // 2)
+    lo, hi = np.maximum(0, mid - half), np.minimum(n, mid + half)
+    cu = np.concatenate([[0], np.cumsum(unc)])
+    return (cu[hi] - cu[lo]) > 0
+
+
 def _activity(s: _State, path: np.ndarray, K: int, score: np.ndarray) -> np.ndarray:
+    if s.p["map_mode"] == "hung" and s.p["fast_sums"]:
+        return _overlap_activity_hung_fast(s, path, K, score)
     if s.p["map_mode"] == "hung":
         return _overlap_activity_hung(s, path, K, score)
     return _overlap_activity(s, path, K)
@@ -573,7 +888,7 @@ class DiarizationResult:
 
 def diarize_features(features: Features, *, num_speakers: Optional[int] = None, min_speakers: Optional[int] = None,
                      max_speakers: Optional[int] = None, params: Optional[Mapping[str, Any]] = None) -> DiarizationResult:
-    """Run the V4 pipeline on precomputed features (CPU only)."""
+    """Run the pipeline on precomputed features (CPU; ``features.embed075`` may call back into the GPU)."""
 
     p = dict(DEFAULT_PARAMS, **(params or {}))
     if num_speakers is not None:
@@ -625,7 +940,10 @@ def diarize_features(features: Features, *, num_speakers: Optional[int] = None, 
         K = len(C)
         if K < 2 or K <= min_k:
             break
-        pur, tot = _audit(_local_votes(s, path, K), K, p["dom_share"])
+        if p["fast_sums"]:
+            pur, tot = _audit_fast(_local_vote_matrix(s, path, K), K, p["dom_share"])
+        else:
+            pur, tot = _audit(_local_votes(s, path, K), K, p["dom_share"])
         s.debug.setdefault("pur", []).append([round(float(x), 3) for x in pur])
         j = int(np.argmin(pur))
         if pur[j] >= p["junk_pur"]:
@@ -697,10 +1015,23 @@ def diarize_features(features: Features, *, num_speakers: Optional[int] = None, 
     while max_k is not None and len(C) > max(1, max_k):
         C, path, score = settle(_merge_closest(C))
 
-    # ---- final pass with the 0.75 s windows: resegment, refine, resegment
+    # ---- final pass with the 0.75 s windows (and the local-speaker vectors): resegment, refine, resegment
     final = p["w075"] > 0 and "s0.75" in windows
     s.debug["final_pass"] = final
     if final:
+        st75, en75, X75 = windows["s0.75"]
+        if p["sel075"]:
+            keep = _unsure_075(s, path, score, st75, en75)
+            s.debug["n075"] = int(keep.sum())
+        else:
+            keep = np.ones(len(st75), bool)
+        if p["sel075"] or features.embed075 is not None:
+            if features.embed075 is not None:
+                X75 = unit(np.asarray(features.embed075(st75[keep]), np.float32).reshape(-1, 192))
+            else:
+                X75 = X75[keep]
+            s.windows = dict(s.windows, **{"s0.75": (st75[keep], en75[keep], X75)})
+            s.cache.pop(("F", True), None)
         path, score = _reseg(s, C, final=True)
         C = _refine(s, C, path)
         path, score = _reseg(s, C, final=True)
@@ -855,9 +1186,22 @@ def diarize_audio(audio: np.ndarray, *, num_speakers: Optional[int] = None, min_
         speech, frame_samples = np.asarray(speech_probs) > 0.5, 512
     else:
         speech, frame_samples = speech_frames_from_seg(segmentation, duration_s), int(GRID_S * SAMPLE_RATE)
-    windows = compute_window_features(samples, speech, frame_samples, embed=embed)
-    result = diarize_features(Features(segmentation, windows, duration_s), num_speakers=num_speakers,
-                              min_speakers=min_speakers, max_speakers=max_speakers, params=params)
+    embed = embed or embed_window_starts
+    starts = plan_scale_starts(len(samples), speech, frame_samples)
+    # the 0.75 s windows are embedded on demand: the final pass asks only for the ones it uses
+    vectors = {name: (embed(samples, starts[name], length_s) if len(starts[name]) and name != "s0.75"
+                      else np.zeros((len(starts[name]), 192), np.float32))
+               for name, (length_s, _) in BATCH_WINDOW_SCALES.items()}
+
+    def embed075(starts_s: np.ndarray) -> np.ndarray:
+        idx = np.round(np.asarray(starts_s, np.float64) * SAMPLE_RATE).astype(np.int64)
+        if len(idx) == 0:
+            return np.zeros((0, 192), np.float32)
+        return embed(samples, idx, BATCH_WINDOW_SCALES["s0.75"][0])
+
+    features = Features(segmentation, assemble_windows(starts, vectors), duration_s, embed075=embed075)
+    result = diarize_features(features, num_speakers=num_speakers, min_speakers=min_speakers,
+                              max_speakers=max_speakers, params=params)
     return result_to_dia_payload(result, round(duration_s * 1000), num_speakers=num_speakers,
                                  min_speakers=min_speakers, max_speakers=max_speakers, started=started)
 
@@ -865,6 +1209,7 @@ def diarize_audio(audio: np.ndarray, *, num_speakers: Optional[int] = None, min_
 __all__ = [
     "BATCH_WINDOW_SCALES",
     "DEFAULT_PARAMS",
+    "V5_PARAMS",
     "WINDOW_MIN_SPEECH",
     "aggregate_frames",
     "assemble_windows",
@@ -882,4 +1227,5 @@ __all__ = [
     "seg_info",
     "speech_frames_from_seg",
     "viterbi",
+    "viterbi_nb",
 ]
