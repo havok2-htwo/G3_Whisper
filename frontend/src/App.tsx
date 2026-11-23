@@ -1,4 +1,4 @@
-import { FormEvent, startTransition, useEffect, useRef, useState } from "react";
+import { FormEvent, KeyboardEvent, ReactNode, startTransition, useEffect, useRef, useState } from "react";
 
 import {
   ACTIVE_MODEL_CHANGED,
@@ -9,7 +9,6 @@ import {
   AudioProcessResponse,
   ApiKeyInfo,
   BenchmarkResponse,
-  CreatedApiKey,
   HistoryEntry,
   ManagedModel,
   QueueResponse,
@@ -26,7 +25,9 @@ import {
   deletePreset,
   downloadHistoryAudio,
   downloadModel,
+  getAuthSetup,
   getModels,
+  getPerf,
   getQueue,
   getSettings,
   getStats,
@@ -42,7 +43,11 @@ import {
   selectModel,
   whoami,
 } from "./api";
+import { ApiKeysPanel } from "./ApiKeysPanel";
+import { PerfPanel, clearPerfHistory, fmt, gpuTitle, usePerfFeed, usePerfLatest } from "./PerfPanel";
 import { KeepEdits, mergeServerSettings } from "./settingsForm";
+import { ToastHost, toast } from "./Toasts";
+import { useVisiblePolling } from "./usePolling";
 
 type BatchEntry = {
   batch_id?: string;
@@ -51,6 +56,7 @@ type BatchEntry = {
   audio_seconds?: number;
   duration_ms?: number;
   status?: string;
+  error?: string;
   unique_request_count?: number;
   fast_path?: boolean;
 };
@@ -67,17 +73,25 @@ type JobEntry = {
 };
 
 type BenchmarkWorkflow = "whisper_chunk_queue" | "cohere_audio_batch" | string;
-type DashboardHistoryPoint = {
-  queueSize: number;
-  pendingBufferSize: number;
-  activeBatchSize: number;
-  meanTotalDurationMs: number;
-  meanTranscriptionDurationMs: number;
-  batchRealtime: number;
-};
-
 type AuthState = "loading" | "login" | "change" | "ready";
 type HistoryActionKind = "retry" | "download";
+
+const TABS = [
+  { id: "dashboard", label: "Dashboard" },
+  { id: "playground", label: "Playground" },
+  { id: "models", label: "Models" },
+  { id: "settings", label: "Settings" },
+  { id: "benchmark", label: "Benchmark" },
+  { id: "history", label: "History" },
+  { id: "api-keys", label: "API keys" },
+  { id: "account", label: "Account" },
+] as const;
+type TabId = (typeof TABS)[number]["id"];
+
+function tabFromHash(): TabId {
+  const id = window.location.hash.replace(/^#/, "");
+  return (TABS.find((tab) => tab.id === id)?.id ?? "dashboard") as TabId;
+}
 
 const PIPELINE_MODES: Array<{ value: AudioProcessMode; label: string; description: string }> = [
   { value: "embedding", label: "Voice embedding", description: "One normalized 192-D ReDimNet2 voice vector." },
@@ -94,11 +108,13 @@ const PIPELINE_MODES: Array<{ value: AudioProcessMode; label: string; descriptio
   },
 ];
 
-const NUMBER_LOCALE = "de-DE";
-const DASHBOARD_POLL_SECONDS = 5;
-const DASHBOARD_HISTORY_POINTS = 72;
-const DASHBOARD_HISTORY_SECONDS = DASHBOARD_POLL_SECONDS * DASHBOARD_HISTORY_POINTS;
+const PUBLIC_ROUTES = "POST /transcribe/, POST /v1/audio/transcriptions, GET /v1/models and POST /v2/audio/process";
+const NUMBER_LOCALE = "en-US";
+const OPERATIONAL_POLL_MS = 5000;
+const API_KEYS_POLL_MS = 10000;
 const MODEL_STATUS_POLL_MS = 2000;
+const MIN_PASSWORD_LENGTH = 8;
+const DASH = "—";
 
 const emptySettings: AdminSettings = {
   local_model: "",
@@ -119,13 +135,19 @@ const emptySettings: AdminSettings = {
   redimnet_max_batch_size: 8,
   debug_retain_history_audio: false,
   huggingface_token: "",
+  huggingface_token_set: false,
   segmentation_model_path: "",
   speaker_turns_enabled: true,
 };
 
+// Keys that are not edited through the settings form (or only through the token field).
+const NON_FORM_KEYS = new Set<string>(["model_profiles", "huggingface_token", "huggingface_token_set", "local_model"]);
+
+// --------------------------------------------------------------------------------------------------- formatting
+
 function formatValue(value: number | null | undefined, suffix = "") {
   if (value === null || value === undefined || Number.isNaN(value)) {
-    return "n/a";
+    return DASH;
   }
   const maximumFractionDigits = Number.isInteger(value) ? 0 : 2;
   return `${new Intl.NumberFormat(NUMBER_LOCALE, { maximumFractionDigits }).format(value)}${suffix}`;
@@ -133,7 +155,7 @@ function formatValue(value: number | null | undefined, suffix = "") {
 
 function formatFixed(value: number | null | undefined, digits = 2, suffix = "") {
   if (value === null || value === undefined || Number.isNaN(value)) {
-    return "n/a";
+    return DASH;
   }
   return `${new Intl.NumberFormat(NUMBER_LOCALE, {
     minimumFractionDigits: digits,
@@ -141,38 +163,73 @@ function formatFixed(value: number | null | undefined, digits = 2, suffix = "") 
   }).format(value)}${suffix}`;
 }
 
-function formatVram(value: number | null | undefined) {
+/** ms: 1 decimal below 10 ms, integer up to 9,999 ms, then seconds with 1 decimal. */
+function formatMs(value: number | null | undefined) {
   if (value === null || value === undefined || Number.isNaN(value)) {
-    return "n/a";
+    return DASH;
   }
-  if (value >= 1024) {
-    return `${new Intl.NumberFormat(NUMBER_LOCALE, {
-      minimumFractionDigits: 2,
-      maximumFractionDigits: 2,
-    }).format(value / 1024)} GB`;
+  if (value < 10) {
+    return formatFixed(value, 1, " ms");
   }
-  return `${new Intl.NumberFormat(NUMBER_LOCALE, {
-    minimumFractionDigits: 1,
-    maximumFractionDigits: 1,
-  }).format(value)} MB`;
+  if (value < 10000) {
+    return formatFixed(value, 0, " ms");
+  }
+  return formatFixed(value / 1000, 1, " s");
+}
+
+/** MiB (torch peak numbers) as GB with one decimal, MB below 1 GB. */
+function formatMib(value: number | null | undefined) {
+  if (value === null || value === undefined || Number.isNaN(value)) {
+    return DASH;
+  }
+  return value >= 1024 ? fmt(value / 1024, 1, "GB") : fmt(value, 0, "MB");
 }
 
 function formatBytes(value: number | null | undefined) {
   if (value === null || value === undefined || Number.isNaN(value)) {
-    return "n/a";
+    return DASH;
+  }
+  if (value >= 1024 * 1024 * 1024) {
+    return formatFixed(value / (1024 * 1024 * 1024), 1, " GB");
   }
   if (value >= 1024 * 1024) {
-    return `${formatFixed(value / (1024 * 1024), 1)} MiB`;
+    return formatFixed(value / (1024 * 1024), 1, " MB");
   }
   if (value >= 1024) {
-    return `${formatFixed(value / 1024, 1)} KiB`;
+    return formatFixed(value / 1024, 1, " KB");
   }
   return `${formatValue(value)} B`;
 }
 
+const pad2 = (n: number) => String(n).padStart(2, "0");
+
+/** "2026-11-23 21:04" (local time); with seconds where they matter. Server wall-clock strings pass through. */
+function formatDateTime(value?: string | null, withSeconds = false) {
+  if (!value) {
+    return DASH;
+  }
+  const wall = /^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2})(:\d{2})?$/.exec(value);
+  if (wall) {
+    return `${wall[1]} ${wall[2]}${withSeconds && wall[3] ? wall[3] : ""}`;
+  }
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return value;
+  }
+  const base = `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())} ${pad2(date.getHours())}:${pad2(date.getMinutes())}`;
+  return withSeconds ? `${base}:${pad2(date.getSeconds())}` : base;
+}
+
+function formatRealtimeFactor(value: number | null | undefined) {
+  if (value === null || value === undefined || Number.isNaN(value)) {
+    return DASH;
+  }
+  return fmt(value, value >= 10 ? 0 : value >= 1 ? 1 : 2, "x");
+}
+
 function describeDebugAudioReason(reason?: string | null) {
   if (reason === "file_too_large") {
-    return "Not retained: file exceeds the 256 MiB limit.";
+    return "Not retained: file exceeds the 256 MB limit.";
   }
   if (reason === "storage_quota") {
     return "Not retained: debug-audio storage quota reached.";
@@ -186,44 +243,34 @@ function describeDebugAudioReason(reason?: string | null) {
   return reason ? `Not retained: ${reason.replace(/_/g, " ")}.` : "Audio was not retained.";
 }
 
-function formatDateTime(value?: string | null) {
-  if (!value) {
-    return "n/a";
-  }
-  return new Intl.DateTimeFormat(NUMBER_LOCALE, {
-    year: "2-digit",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-  }).format(new Date(value));
-}
-
 function formatModelSize(model: ManagedModel) {
   if (model.size_on_disk_gb !== null && model.size_on_disk_gb !== undefined) {
-    return `${formatFixed(model.size_on_disk_gb, model.size_on_disk_gb >= 10 ? 1 : 2)} GB`;
+    return model.size_on_disk_gb < 1
+      ? formatFixed(model.size_on_disk_gb * 1024, 0, " MB")
+      : formatFixed(model.size_on_disk_gb, 1, " GB");
   }
   if (model.approx_size_gb !== null && model.approx_size_gb !== undefined) {
-    return `~${formatFixed(model.approx_size_gb, model.approx_size_gb >= 10 ? 1 : 2)} GB`;
+    return model.approx_size_gb < 1
+      ? `~${formatFixed(model.approx_size_gb * 1024, 0, " MB")}`
+      : `~${formatFixed(model.approx_size_gb, 1, " GB")}`;
   }
-  return "n/a";
+  return DASH;
 }
 
-function formatModelStatus(status: string) {
+function modelStatusBadge(status: string): { text: string; tone: string } {
   if (status === "ready") {
-    return "Ready";
+    return { text: "Cached", tone: "ok" };
   }
   if (status === "downloading") {
-    return "Downloading";
+    return { text: "Downloading", tone: "warn" };
   }
   if (status === "partial") {
-    return "Partial";
+    return { text: "Partial", tone: "warn" };
   }
   if (status === "error") {
-    return "Error";
+    return { text: "Failed", tone: "danger" };
   }
-  return "Missing";
+  return { text: "Not cached", tone: "plain" };
 }
 
 function formatBackendLabel(backend: string) {
@@ -239,36 +286,20 @@ function resolveModelPath(model: ManagedModel) {
 
 function describeBenchmarkWorkflow(workflow: BenchmarkWorkflow) {
   if (workflow === "cohere_audio_batch") {
-    return "Cohere Whole-Audio Batch";
+    return "Cohere whole-audio batch";
   }
   if (workflow === "parakeet_audio_batch") {
-    return "Parakeet Whole-Audio Batch";
+    return "Parakeet whole-audio batch";
   }
   if (workflow === "whisper_chunk_queue") {
-    return "Whisper Chunk-Queue";
+    return "Whisper chunk queue";
   }
   return workflow;
 }
 
-function formatRealtimeFactor(value: number | null | undefined) {
-  if (value === null || value === undefined || Number.isNaN(value)) {
-    return "n/a";
-  }
-  if (value === 0) {
-    return "0x";
-  }
-  if (value >= 10) {
-    return `${value.toFixed(0)}x`;
-  }
-  if (value >= 1) {
-    return `${value.toFixed(1)}x`;
-  }
-  return `${value.toFixed(2)}x`;
-}
-
 function parseKnownSpeakerProfiles(rawValue: string) {
   if (new TextEncoder().encode(rawValue).byteLength > 16 * 1024 * 1024) {
-    throw new Error("Known-speaker JSON must not exceed 16 MiB.");
+    throw new Error("Known-speaker JSON must not exceed 16 MB.");
   }
 
   let parsed: unknown;
@@ -328,7 +359,7 @@ function parseKnownSpeakerProfiles(rawValue: string) {
 
 function describeModel(model: Record<string, unknown> | undefined) {
   if (!model) {
-    return "n/a";
+    return DASH;
   }
   const id = typeof model.id === "string" ? model.id : typeof model.model === "string" ? model.model : "configured";
   const dimension = typeof model.dimension === "number" ? ` · ${model.dimension}-D` : "";
@@ -350,174 +381,105 @@ function formatTimecode(milliseconds: number) {
   const minutes = Math.floor((totalMilliseconds % 3_600_000) / 60_000);
   const seconds = Math.floor((totalMilliseconds % 60_000) / 1000);
   const millis = totalMilliseconds % 1000;
-  return `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}.${String(millis).padStart(3, "0")}`;
+  return `${pad2(hours)}:${pad2(minutes)}:${pad2(seconds)}.${String(millis).padStart(3, "0")}`;
 }
 
 function speakerAudioSource(audio: UnknownSpeakerAudio) {
   return `data:${audio.mime_type};base64,${audio.data}`;
 }
 
-function computeNiceScaleMax(value: number) {
-  const safeValue = Math.max(1, Number(value || 0));
-  const magnitude = 10 ** Math.floor(Math.log10(safeValue));
-  const normalized = safeValue / magnitude;
-
-  if (normalized <= 1) {
-    return 1 * magnitude;
-  }
-  if (normalized <= 2) {
-    return 2 * magnitude;
-  }
-  if (normalized <= 5) {
-    return 5 * magnitude;
-  }
-  return 10 * magnitude;
-}
-
-function computeQueueScaleMax(value: number) {
-  const safeValue = Math.max(1, Math.ceil(Number(value || 0)));
-
-  if (safeValue <= 4) {
-    return 4;
-  }
-  if (safeValue <= 8) {
-    return 8;
-  }
-  if (safeValue <= 16) {
-    return 16;
-  }
-  if (safeValue <= 32) {
-    return 32;
-  }
-  if (safeValue <= 64) {
-    return 64;
-  }
-
-  return Math.ceil(safeValue / 32) * 32;
-}
-
-function computeBatchRealtime(entry?: BatchEntry | null) {
-  const audioSeconds = Number(entry?.audio_seconds ?? 0);
-  const durationMs = Number(entry?.duration_ms ?? 0);
-
-  if (!Number.isFinite(audioSeconds) || !Number.isFinite(durationMs) || audioSeconds <= 0 || durationMs <= 0) {
-    return 0;
-  }
-
-  return audioSeconds / (durationMs / 1000);
-}
-
-function resolveOptionLabel(options: AdminOption[], value: string | null | undefined, fallback = "n/a") {
+function resolveOptionLabel(options: AdminOption[], value: string | null | undefined, fallback = DASH) {
   if (!value) {
     return fallback;
   }
-
   return options.find((option) => option.value === value)?.label || value;
 }
 
-function DashboardSparkline({ history }: { history: DashboardHistoryPoint[] }) {
-  const visibleHistory = history.slice(-DASHBOARD_HISTORY_POINTS);
-  const realtimePoints = visibleHistory.map((entry) => Number(entry.batchRealtime || 0));
-  const queuePoints = visibleHistory.map((entry) => Number(entry.queueSize || 0));
-  const currentRealtime = realtimePoints.length > 0 ? realtimePoints[realtimePoints.length - 1] : 0;
-  const currentQueue = queuePoints.length > 0 ? queuePoints[queuePoints.length - 1] : 0;
-  const scaleMax = computeNiceScaleMax(Math.max(1, ...realtimePoints));
-  const queueScaleMax = computeQueueScaleMax(Math.max(1, ...queuePoints));
-  const width = 160;
-  const height = 228;
-  const leftPad = 42;
-  const rightPad = 42;
-  const topPad = 12;
-  const bottomPad = 26;
-  const chartWidth = width - leftPad - rightPad;
-  const chartHeight = height - topPad - bottomPad;
-  const tickValues = [scaleMax, scaleMax * 0.75, scaleMax * 0.5, scaleMax * 0.25, 0];
-  const queueTickValues = [queueScaleMax, queueScaleMax * 0.75, queueScaleMax * 0.5, queueScaleMax * 0.25, 0];
-  const getY = (value: number) => topPad + chartHeight - (Math.max(0, value) / scaleMax) * chartHeight;
-  const getQueueY = (value: number) => topPad + chartHeight - (Math.max(0, value) / queueScaleMax) * chartHeight;
-  const realtimePath = realtimePoints
-    .map((value, index) => {
-      const x = leftPad + (realtimePoints.length <= 1 ? 0 : (index / (realtimePoints.length - 1)) * chartWidth);
-      const y = getY(value);
-      return `${index === 0 ? "M" : "L"} ${x.toFixed(2)} ${y.toFixed(2)}`;
-    })
-    .join(" ");
-  const queuePath = queuePoints
-    .map((value, index) => {
-      const x = leftPad + (queuePoints.length <= 1 ? 0 : (index / (queuePoints.length - 1)) * chartWidth);
-      const y = getQueueY(value);
-      return `${index === 0 ? "M" : "L"} ${x.toFixed(2)} ${y.toFixed(2)}`;
-    })
-    .join(" ");
+function errorText(error: unknown, fallback: string) {
+  return error instanceof Error && error.message ? error.message : fallback;
+}
 
+function isAbort(error: unknown) {
+  return error instanceof DOMException && error.name === "AbortError";
+}
+
+// --------------------------------------------------------------------------------------------------- small parts
+
+function Card({ label, value, sub, title }: { label: string; value: ReactNode; sub?: ReactNode; title?: string }) {
   return (
-    <div className="sparkline-shell">
-      <svg className="graph" viewBox={`0 0 ${width} ${height}`} preserveAspectRatio="none" aria-label="Whisper queue and batch throughput history">
-        {tickValues.map((tickValue) => {
-          const y = getY(tickValue);
-          return (
-            <g key={tickValue}>
-              <line x1={leftPad} y1={y} x2={width - rightPad} y2={y} className="graph-grid-line" />
-              <text x={leftPad - 6} y={y + 3} textAnchor="end" className="graph-axis-label">
-                {formatRealtimeFactor(tickValue)}
-              </text>
-            </g>
-          );
-        })}
-        {queueTickValues.map((tickValue) => {
-          const y = getQueueY(tickValue);
-          return (
-            <g key={`queue-${tickValue}`}>
-              <text x={width - rightPad + 6} y={y + 3} textAnchor="start" className="graph-axis-label graph-axis-label-batch">
-                {Math.round(tickValue)}
-              </text>
-            </g>
-          );
-        })}
-        {scaleMax >= 1 ? (
-          <line
-            x1={leftPad}
-            y1={getY(1)}
-            x2={width - rightPad}
-            y2={getY(1)}
-            className="graph-reference-line"
-          />
-        ) : null}
-        {queuePath ? <path d={queuePath} fill="none" stroke="#ffc16c" strokeWidth="1" strokeLinecap="round" strokeLinejoin="round" opacity="0.5" /> : null}
-        {realtimePath ? <path d={realtimePath} fill="none" stroke="#95f2c7" strokeWidth="1" strokeLinecap="round" strokeLinejoin="round" opacity="0.65" /> : null}
-        <text x={leftPad} y={height - 4} textAnchor="start" className="graph-timeline-label">-{DASHBOARD_HISTORY_SECONDS}s</text>
-        <text x={width - rightPad} y={height - 4} textAnchor="end" className="graph-timeline-label">now</text>
-      </svg>
-      <div className="graph-caption">
-        <span className="graph-legend">
-          <span className="graph-legend-item"><span className="graph-legend-dot" style={{ backgroundColor: "#95f2c7" }} />Batch Realtime</span>
-          <span className="graph-legend-item"><span className="graph-legend-dot" style={{ backgroundColor: "#ffc16c" }} />Queue</span>
-        </span>
-        <strong>{formatRealtimeFactor(currentRealtime)} | {Math.round(currentQueue)}</strong>
-      </div>
+    <div className="card">
+      <span className="card-label">{label}</span>
+      <span className="card-value" title={title}>{value}</span>
+      {sub !== undefined && sub !== null && sub !== "" && <span className="card-sub">{sub}</span>}
     </div>
   );
 }
 
-async function copyTextToClipboard(value: string) {
-  if (!value) {
-    return;
-  }
-  if (navigator.clipboard?.writeText) {
-    await navigator.clipboard.writeText(value);
-    return;
-  }
+function Chip({ label, children, title, onClick }: { label: string; children: ReactNode; title?: string; onClick?: () => void }) {
+  const content = (
+    <>
+      <span className="card-label">{label}</span>
+      <span className="value" title={title}>{children}</span>
+    </>
+  );
+  return onClick ? (
+    <button type="button" className="chip chip-button" onClick={onClick} title={title}>{content}</button>
+  ) : (
+    <span className="chip">{content}</span>
+  );
+}
 
-  const textArea = document.createElement("textarea");
-  textArea.value = value;
-  textArea.setAttribute("readonly", "readonly");
-  textArea.style.position = "fixed";
-  textArea.style.opacity = "0";
-  document.body.appendChild(textArea);
-  textArea.select();
-  textArea.setSelectionRange(0, textArea.value.length);
-  document.execCommand("copy");
-  document.body.removeChild(textArea);
+type NumberFieldProps = {
+  label: string;
+  value: number;
+  min?: number;
+  max?: number;
+  step?: number | string;
+  hint?: ReactNode;
+  wide?: boolean;
+  onChange: (value: number) => void;
+};
+
+/** Empty means "not set" (NaN): it is never sent as 0 and blocks saving. */
+function NumberField({ label, value, min, max, step, hint, wide, onChange }: NumberFieldProps) {
+  const empty = Number.isNaN(value);
+  const outOfRange = !empty && ((min !== undefined && value < min) || (max !== undefined && value > max));
+  const invalid = empty || outOfRange;
+  return (
+    <label className={wide ? "span-2" : undefined}>
+      <span>{label}</span>
+      <input
+        type="number"
+        inputMode="decimal"
+        min={min}
+        max={max}
+        step={step}
+        value={empty ? "" : value}
+        aria-invalid={invalid || undefined}
+        onChange={(event) => onChange(event.target.value === "" ? Number.NaN : Number(event.target.value))}
+      />
+      {invalid && (
+        <span className="field-error">
+          {empty ? "Required." : `Allowed: ${min ?? "…"} to ${max ?? "…"}.`}
+        </span>
+      )}
+      {hint && <span className="hint">{hint}</span>}
+    </label>
+  );
+}
+
+function CheckField({ label, checked, onChange, hint, disabled, tone }: {
+  label: string; checked: boolean; onChange: (checked: boolean) => void; hint?: ReactNode; disabled?: boolean; tone?: "warn";
+}) {
+  return (
+    <label className={`check-field span-2 ${tone === "warn" ? "check-warn" : ""}`.trim()}>
+      <input type="checkbox" checked={checked} disabled={disabled} onChange={(event) => onChange(event.target.checked)} />
+      <span>
+        <span className="check-label">{label}</span>
+        {hint && <span className="hint">{hint}</span>}
+      </span>
+    </label>
+  );
 }
 
 type ModelPickerProps = {
@@ -525,30 +487,17 @@ type ModelPickerProps = {
   locked: boolean;
   selectingModelId: string | null;
   startingDownloadId: string | null;
-  message: string;
-  messageFailed: boolean;
   onLoad: (model: ManagedModel) => void;
   onDownload: (model: ManagedModel) => void;
 };
 
-function ModelPicker({
-  models,
-  locked,
-  selectingModelId,
-  startingDownloadId,
-  message,
-  messageFailed,
-  onLoad,
-  onDownload,
-}: ModelPickerProps) {
+function ModelPicker({ models, locked, selectingModelId, startingDownloadId, onLoad, onDownload }: ModelPickerProps) {
   const backends = Array.from(new Set(models.map((model) => model.backend)));
+  if (models.length === 0) {
+    return <div className="state"><span className="spinner" />Loading models…</div>;
+  }
   return (
-    <div className="preset-settings model-picker">
-      <span className="eyebrow">Step 1: Model</span>
-      <p className="field-note preset-copy">
-        The service runs one ASR model. Load model switches it right away and brings that model's saved settings
-        along; the presets and settings below always belong to the active model.
-      </p>
+    <div className="model-picker">
       {backends.map((backend) => (
         <div className="model-picker-group" key={backend}>
           <h3>{formatBackendLabel(backend)}</h3>
@@ -557,79 +506,84 @@ function ModelPicker({
             .map((model) => {
               const isDownloading = model.status === "downloading";
               const isSelecting = selectingModelId === model.id;
+              const status = modelStatusBadge(model.status);
               return (
                 <div className={`model-picker-row ${model.active ? "active" : ""}`} key={model.id}>
                   <div className="model-picker-name">
                     <strong>{model.label}</strong>
-                    <div className="muted mono model-id">{model.id}</div>
-                    {model.error && <span className="model-status-error">{model.error}</span>}
+                    <span className="mono hint">{model.id}</span>
+                    {model.error && <span className="field-error">{model.error}</span>}
                   </div>
                   <div className="model-picker-markers">
-                    <span className="connection-status">{formatModelStatus(model.status)}</span>
-                    {model.active && <span className="connection-status configured">Active</span>}
-                    {model.loaded && <span className="connection-status configured">Loaded</span>}
-                    {model.active && !model.loaded && <span className="connection-status">Not loaded</span>}
+                    <span className={`badge ${status.tone}`}>{status.text}</span>
+                    {model.active && <span className="badge accent">Active</span>}
+                    {model.loaded && <span className="badge ok">Loaded</span>}
+                    {model.active && !model.loaded && <span className="badge plain">Not loaded</span>}
                   </div>
-                  {model.status === "ready" ? (
-                    !(model.active && model.loaded) && (
+                  <div className="model-picker-action">
+                    {model.status === "ready" ? (
+                      !(model.active && model.loaded) && (
+                        <button
+                          type="button"
+                          className="secondary-button small-button"
+                          onClick={() => onLoad(model)}
+                          disabled={locked}
+                          aria-busy={isSelecting || undefined}
+                        >
+                          {isSelecting ? "Loading…" : "Load"}
+                        </button>
+                      )
+                    ) : (
                       <button
                         type="button"
-                        className="secondary-button"
-                        onClick={() => onLoad(model)}
-                        disabled={locked}
+                        className="secondary-button small-button"
+                        onClick={() => onDownload(model)}
+                        disabled={isDownloading || startingDownloadId === model.id}
+                        aria-busy={isDownloading || startingDownloadId === model.id || undefined}
                       >
-                        {isSelecting ? "Loading..." : "Load model"}
+                        {isDownloading ? "Downloading…" : startingDownloadId === model.id ? "Starting…" : "Download"}
                       </button>
-                    )
-                  ) : (
-                    <button
-                      type="button"
-                      className="secondary-button"
-                      onClick={() => onDownload(model)}
-                      disabled={isDownloading || startingDownloadId === model.id}
-                    >
-                      {isDownloading
-                        ? "Downloading..."
-                        : startingDownloadId === model.id
-                          ? "Starting..."
-                          : "Download"}
-                    </button>
-                  )}
+                    )}
+                  </div>
                 </div>
               );
             })}
         </div>
       ))}
-      {message && <p className={`message ${messageFailed ? "error" : ""}`}>{message}</p>}
     </div>
   );
 }
 
+// --------------------------------------------------------------------------------------------------- app
+
 export default function App() {
   const [authState, setAuthState] = useState<AuthState>("loading");
+  const [bootError, setBootError] = useState("");
+  const [setupRequired, setSetupRequired] = useState(false);
   const [currentUser, setCurrentUser] = useState("");
+  const [sessionExpiresAt, setSessionExpiresAt] = useState<string | null>(null);
   const [loginUsername, setLoginUsername] = useState("admin");
   const [loginPassword, setLoginPassword] = useState("");
   const [authBusy, setAuthBusy] = useState(false);
   const [authError, setAuthError] = useState("");
+  const [tab, setTab] = useState<TabId>(tabFromHash);
 
   const [pwCurrent, setPwCurrent] = useState("");
   const [pwNew, setPwNew] = useState("");
   const [pwConfirm, setPwConfirm] = useState("");
   const [pwBusy, setPwBusy] = useState(false);
   const [pwError, setPwError] = useState("");
-  const [pwMessage, setPwMessage] = useState("");
 
-  const [apiKeys, setApiKeys] = useState<ApiKeyInfo[]>([]);
-  const [newKeyAlias, setNewKeyAlias] = useState("");
-  const [createdKey, setCreatedKey] = useState<CreatedApiKey | null>(null);
-  const [apiKeyBusy, setApiKeyBusy] = useState(false);
+  const [apiKeys, setApiKeys] = useState<ApiKeyInfo[] | null>(null);
+  const [apiKeysError, setApiKeysError] = useState<string | null>(null);
 
-  const [actionMessage, setActionMessage] = useState("");
-  const [globalError, setGlobalError] = useState("");
   const [settingsForm, setSettingsForm] = useState<AdminSettings>(emptySettings);
   // What the server sent last. The form differs from it exactly where the admin has unsaved edits.
   const settingsBaseline = useRef<AdminSettings>(emptySettings);
+  const [settingsLoaded, setSettingsLoaded] = useState(false);
+  const [settingsError, setSettingsError] = useState("");
+  const [tokenDraft, setTokenDraft] = useState("");
+  const [tokenClear, setTokenClear] = useState(false);
   const [settingsOptions, setSettingsOptions] = useState<SettingsResponse["options"]>({
     models: [],
     devices: [],
@@ -643,19 +597,16 @@ export default function App() {
   const [loadedModelIdentifier, setLoadedModelIdentifier] = useState<string[] | null>(null);
   const [stats, setStats] = useState<StatsResponse | null>(null);
   const [queue, setQueue] = useState<QueueResponse | null>(null);
-  const [dashboardHistory, setDashboardHistory] = useState<DashboardHistoryPoint[]>([]);
+  const [liveError, setLiveError] = useState("");
   const [saveBusy, setSaveBusy] = useState(false);
-  const [saveMessage, setSaveMessage] = useState("");
-  const [saveFailed, setSaveFailed] = useState(false);
   const [presets, setPresets] = useState<SettingsPreset[]>([]);
-  const [presetName, setPresetName] = useState("");
+  const [presetSelected, setPresetSelected] = useState("");
+  const [presetSaveName, setPresetSaveName] = useState("");
   const [presetBusy, setPresetBusy] = useState(false);
-  const [presetMessage, setPresetMessage] = useState("");
-  const [presetFailed, setPresetFailed] = useState(false);
   const [benchmarkFile, setBenchmarkFile] = useState<File | null>(null);
-  const [benchmarkRepeatCount, setBenchmarkRepeatCount] = useState(1);
+  const [benchmarkRepeatInput, setBenchmarkRepeatInput] = useState("1");
   const [benchmarkBusy, setBenchmarkBusy] = useState(false);
-  const [benchmarkMessage, setBenchmarkMessage] = useState("");
+  const [benchmarkError, setBenchmarkError] = useState("");
   const [benchmarkResult, setBenchmarkResult] = useState<BenchmarkResponse | null>(null);
   const [pipelineMode, setPipelineMode] = useState<AudioProcessMode>("diarization");
   const [pipelineExpectedSpeakers, setPipelineExpectedSpeakers] = useState("");
@@ -665,15 +616,13 @@ export default function App() {
   const [pipelineApiKey, setPipelineApiKey] = useState("");
   const [pipelineBusy, setPipelineBusy] = useState(false);
   const [pipelineDragActive, setPipelineDragActive] = useState(false);
-  const [pipelineMessage, setPipelineMessage] = useState("");
+  const [pipelineError, setPipelineError] = useState("");
   const [pipelineResult, setPipelineResult] = useState<AudioProcessResponse | null>(null);
   const [pipelineWallTimeMs, setPipelineWallTimeMs] = useState<number | null>(null);
   const [pipelineJsonExpanded, setPipelineJsonExpanded] = useState(false);
   const [modelActionId, setModelActionId] = useState<string | null>(null);
   const [modelActionKind, setModelActionKind] = useState<"refresh" | "download" | "delete" | null>(null);
   const [selectingModelId, setSelectingModelId] = useState<string | null>(null);
-  const [modelSelectMessage, setModelSelectMessage] = useState("");
-  const [modelSelectFailed, setModelSelectFailed] = useState(false);
   const [historyActions, setHistoryActions] = useState<Record<string, HistoryActionKind>>({});
   const [historyActionErrors, setHistoryActionErrors] = useState<Record<string, string>>({});
   const hasDownloadingModels = managedModels.some((model) => model.status === "downloading");
@@ -684,28 +633,74 @@ export default function App() {
   const modelPresets = presets.filter(
     (preset) => preset.model_id == null || preset.model_id === settingsForm.local_model,
   );
+  // The saved cache path: listing, download and delete never follow an unsaved (maybe mistyped) path.
+  const savedCachePath = settingsBaseline.current.local_model_cache_path;
 
+  // ---- dirty tracking of the settings form ----
+  const formKeys = (Object.keys(settingsForm) as Array<keyof AdminSettings>).filter((key) => !NON_FORM_KEYS.has(key));
+  const dirtyKeys = formKeys.filter((key) => {
+    const a = settingsForm[key];
+    const b = settingsBaseline.current[key];
+    return !(a === b || (Number.isNaN(a as number) && Number.isNaN(b as number)));
+  });
+  const invalidKeys = formKeys.filter((key) => typeof settingsForm[key] === "number" && Number.isNaN(settingsForm[key] as number));
+  const dirtyCount = dirtyKeys.length + (tokenDraft.trim() ? 1 : 0) + (tokenClear ? 1 : 0);
+
+  const perfLatest = usePerfLatest();
+  usePerfFeed((signal) => getPerf(signal), isReady);
+
+  // ---- routing ----
+  useEffect(() => {
+    const onHash = () => setTab(tabFromHash());
+    window.addEventListener("hashchange", onHash);
+    return () => window.removeEventListener("hashchange", onHash);
+  }, []);
+
+  function goToTab(next: TabId) {
+    if (window.location.hash !== `#${next}`) {
+      window.location.hash = next;
+    }
+    setTab(next);
+  }
+
+  function onTabKeyDown(event: KeyboardEvent<HTMLButtonElement>) {
+    const index = TABS.findIndex((entry) => entry.id === tab);
+    let next = -1;
+    if (event.key === "ArrowRight") next = (index + 1) % TABS.length;
+    if (event.key === "ArrowLeft") next = (index - 1 + TABS.length) % TABS.length;
+    if (event.key === "Home") next = 0;
+    if (event.key === "End") next = TABS.length - 1;
+    if (next < 0) return;
+    event.preventDefault();
+    goToTab(TABS[next].id);
+    window.requestAnimationFrame(() => document.getElementById(`tab-${TABS[next].id}`)?.focus());
+  }
+
+  // ---- session ----
   function resetDashboardState() {
+    clearPerfHistory();
+    toast.clear();
     startTransition(() => {
       setStats(null);
       setQueue(null);
-      setDashboardHistory([]);
+      setLiveError("");
       settingsBaseline.current = emptySettings;
       setSettingsForm(emptySettings);
+      setSettingsLoaded(false);
+      setSettingsError("");
+      setTokenDraft("");
+      setTokenClear(false);
       setPresets([]);
-      setPresetName("");
-      setPresetMessage("");
-      setPresetFailed(false);
+      setPresetSelected("");
+      setPresetSaveName("");
       setManagedModels([]);
       setLoadedModelIdentifier(null);
       setSettingsOptions({ models: [], devices: [], precisions: [], languages: [], language_detection_models: [] });
       setModelFields({});
       setServiceFields([]);
-      setApiKeys([]);
-      setCreatedKey(null);
-      setSaveMessage("");
-      setSaveFailed(false);
-      setBenchmarkMessage("");
+      setApiKeys(null);
+      setApiKeysError(null);
+      setBenchmarkError("");
       setBenchmarkResult(null);
       setBenchmarkFile(null);
       setPipelineMode("diarization");
@@ -716,153 +711,80 @@ export default function App() {
       setPipelineApiKey("");
       setPipelineBusy(false);
       setPipelineDragActive(false);
-      setPipelineMessage("");
+      setPipelineError("");
       setPipelineResult(null);
       setPipelineWallTimeMs(null);
       setPipelineJsonExpanded(false);
       setModelActionId(null);
       setModelActionKind(null);
       setSelectingModelId(null);
-      setModelSelectMessage("");
-      setModelSelectFailed(false);
       setHistoryActions({});
       setHistoryActionErrors({});
-      setActionMessage("");
-      setGlobalError("");
+      setPwCurrent("");
+      setPwNew("");
+      setPwConfirm("");
+      setPwError("");
     });
   }
 
-  // Centralized reaction to auth failures raised by any admin call.
-  function handleApiError(error: unknown, fallback: string): boolean {
-    const message = error instanceof Error ? error.message : "";
+  function expireSession() {
+    resetDashboardState();
+    setAuthState("login");
+    void refreshSetupFlag();
+    toast.warn("Session expired. Please log in again.");
+  }
+
+  /** Session errors from any admin call: true when handled (then the caller stops). Otherwise a toast. */
+  function handleApiError(error: unknown, what: string, quiet = false): boolean {
+    if (isAbort(error)) {
+      return true;
+    }
+    const message = errorText(error, "");
     if (message === "unauthorized") {
-      resetDashboardState();
-      setAuthState("login");
-      setAuthError("Your session has expired. Please sign in again.");
+      expireSession();
       return true;
     }
     if (message === "password_change_required") {
       setAuthState("change");
       return true;
     }
-    setGlobalError(error instanceof Error ? error.message : fallback);
+    if (!quiet) {
+      toast.error(message ? `${what}: ${message}` : `${what}.`);
+    }
     return false;
   }
 
-  async function loadDashboard(keepEdits?: KeepEdits) {
+  async function refreshSetupFlag() {
     try {
-      const [settingsResponse, statsResponse, queueResponse, keysResponse] = await Promise.all([
-        getSettings(),
-        getStats(),
-        getQueue(),
-        listApiKeys(),
-      ]);
-      const modelChanged = keepEdits && settingsResponse.settings.local_model !== settingsBaseline.current.local_model;
-      startTransition(() => {
-        applySettings(settingsResponse, keepEdits);
-        if (modelChanged) {
-          setSaveMessage(
-            `${describeSelectedModel(settingsResponse)} was selected in another session. The form now shows its `
-              + "settings, only service-wide edits were kept.",
-          );
-          setSaveFailed(false);
-        }
-        setStats(statsResponse);
-        setQueue(queueResponse);
-        setApiKeys(keysResponse.keys);
-        setGlobalError("");
-      });
-      await reloadPresets();
-    } catch (error) {
-      handleApiError(error, "The dashboard could not be loaded.");
+      setSetupRequired((await getAuthSetup()).setup_required);
+    } catch {
+      setSetupRequired(false);
     }
   }
 
-  async function reloadPresets() {
+  async function bootstrap() {
+    setBootError("");
+    setAuthState("loading");
     try {
-      const response = await listPresets();
-      setPresets(response.presets);
+      const me = await whoami();
+      setCurrentUser(me.username);
+      setSessionExpiresAt(me.expires_at ?? null);
+      setAuthState(me.must_change_password ? "change" : "ready");
     } catch (error) {
-      if (handleApiError(error, "Presets could not be loaded.")) {
+      if (errorText(error, "") === "unauthorized") {
+        await refreshSetupFlag();
+        setAuthState("login");
         return;
       }
-      setPresetMessage(error instanceof Error ? error.message : "Presets could not be loaded.");
-      setPresetFailed(true);
+      setBootError(errorText(error, "The server did not answer."));
     }
   }
 
-  function handleLoadPreset() {
-    const preset = modelPresets.find((entry) => entry.name === presetName);
-    if (!preset) {
-      return;
-    }
-    // Into the form only: Save Settings applies it through the normal validated update.
-    setSettingsForm((current) => ({ ...current, ...preset.values }));
-    setSaveMessage("");
-    setPresetMessage(
-      `Preset "${preset.name}" loaded into the form; review it and click Save Settings to apply.`
-        + (preset.note ? ` ${preset.note}` : ""),
-    );
-    setPresetFailed(false);
-  }
+  useEffect(() => {
+    void bootstrap();
+  }, []);
 
-  async function handleSavePreset() {
-    const name = presetName.trim();
-    if (!name) {
-      return;
-    }
-    // Presets of other models are not listed here, saving would silently take that preset over.
-    if (presets.some((entry) => entry.name === name && !modelPresets.includes(entry))) {
-      setPresetMessage(`The name "${name}" is already used by a preset of another model.`);
-      setPresetFailed(true);
-      return;
-    }
-    setPresetBusy(true);
-    setPresetMessage("");
-    try {
-      const response = await savePreset(name, settingsForm);
-      await reloadPresets();
-      setPresetName(response.preset.name);
-      setPresetMessage(`Preset "${response.preset.name}" saved from the current form.`);
-      setPresetFailed(false);
-    } catch (error) {
-      if (handleApiError(error, "The preset could not be saved.")) {
-        return;
-      }
-      setPresetMessage(error instanceof Error ? error.message : "The preset could not be saved.");
-      setPresetFailed(true);
-    } finally {
-      setPresetBusy(false);
-    }
-  }
-
-  async function handleDeletePreset() {
-    const preset = modelPresets.find((entry) => entry.name === presetName);
-    if (!preset || preset.built_in) {
-      return;
-    }
-    if (!window.confirm(`Delete the saved preset "${preset.name}"?`)) {
-      return;
-    }
-    setPresetBusy(true);
-    setPresetMessage("");
-    try {
-      await deletePreset(preset.name);
-      setPresetName("");
-      await reloadPresets();
-      setPresetMessage(`Preset "${preset.name}" deleted.`);
-      setPresetFailed(false);
-    } catch (error) {
-      if (handleApiError(error, "The preset could not be deleted.")) {
-        return;
-      }
-      setPresetMessage(error instanceof Error ? error.message : "The preset could not be deleted.");
-      setPresetFailed(true);
-    } finally {
-      setPresetBusy(false);
-    }
-  }
-
+  // ---- data loading ----
   function describeSelectedModel(payload: SettingsResponse) {
     const selected = payload.options.models.find((option) => option.value === payload.settings.local_model);
     return selected?.label ?? payload.settings.local_model;
@@ -878,25 +800,400 @@ export default function App() {
     setLoadedModelIdentifier(payload.loaded_model_identifier);
     setModelFields(payload.model_fields ?? {});
     setServiceFields(payload.service_fields ?? []);
+    setSettingsLoaded(true);
+    setSettingsError("");
   }
 
-  async function refreshOperationalData() {
+  async function loadSettings(keepEdits?: KeepEdits) {
+    try {
+      const response = await getSettings();
+      const modelChanged = keepEdits && settingsLoaded && response.settings.local_model !== settingsBaseline.current.local_model;
+      startTransition(() => applySettings(response, keepEdits));
+      if (modelChanged) {
+        toast.info(
+          `${describeSelectedModel(response)} was selected in another session. The form now shows its settings; only service-wide edits were kept.`,
+        );
+      }
+    } catch (error) {
+      if (!handleApiError(error, "Could not load the settings", true)) {
+        setSettingsError(errorText(error, "Could not load the settings."));
+      }
+    }
+  }
+
+  async function reloadPresets() {
+    try {
+      const response = await listPresets();
+      setPresets(response.presets);
+    } catch (error) {
+      handleApiError(error, "Could not load the presets");
+    }
+  }
+
+  async function refreshOperationalData(signal?: AbortSignal) {
     if (!isReady) {
       return;
     }
+    const [statsResult, queueResult] = await Promise.allSettled([getStats(signal), getQueue(signal)]);
+    if (signal?.aborted) {
+      return;
+    }
+    for (const result of [statsResult, queueResult]) {
+      if (result.status === "rejected" && handleApiError(result.reason, "", true)) {
+        return;
+      }
+    }
+    startTransition(() => {
+      if (statsResult.status === "fulfilled") setStats(statsResult.value);
+      if (queueResult.status === "fulfilled") setQueue(queueResult.value);
+      const failed = [statsResult, queueResult].find((result) => result.status === "rejected") as PromiseRejectedResult | undefined;
+      setLiveError(failed ? errorText(failed.reason, "Live data unavailable.") : "");
+    });
+  }
+
+  async function refreshApiKeys(signal?: AbortSignal) {
     try {
-      const [statsResponse, queueResponse, keysResponse] = await Promise.all([getStats(), getQueue(), listApiKeys()]);
-      startTransition(() => {
-        setStats(statsResponse);
-        setQueue(queueResponse);
-        setApiKeys(keysResponse.keys);
-        setGlobalError("");
-      });
+      const response = await listApiKeys(signal);
+      if (!signal?.aborted) {
+        setApiKeys(response.keys);
+        setApiKeysError(null);
+      }
     } catch (error) {
-      handleApiError(error, "Live polling failed.");
+      if (!handleApiError(error, "Could not load the API keys", true)) {
+        setApiKeysError(errorText(error, "Could not load the API keys."));
+      }
     }
   }
 
+  useEffect(() => {
+    if (!isReady) {
+      return;
+    }
+    void loadSettings();
+    void reloadPresets();
+    void refreshApiKeys();
+  }, [authState]);
+
+  useVisiblePolling((signal) => refreshOperationalData(signal), OPERATIONAL_POLL_MS, isReady);
+  useVisiblePolling((signal) => refreshApiKeys(signal), API_KEYS_POLL_MS, isReady && tab === "api-keys");
+  useVisiblePolling(
+    async (signal) => {
+      try {
+        const response = await getModels(savedCachePath, signal);
+        if (!signal.aborted) setManagedModels(response.models ?? []);
+      } catch (error) {
+        handleApiError(error, "Could not refresh the model list", true);
+      }
+    },
+    MODEL_STATUS_POLL_MS,
+    isReady && hasDownloadingModels,
+  );
+
+  // ---- auth actions ----
+  async function handleLogin(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setAuthBusy(true);
+    setAuthError("");
+    try {
+      const me = await login(loginUsername.trim(), loginPassword);
+      setCurrentUser(me.username);
+      setLoginPassword("");
+      toast.clear();
+      const fresh = await whoami().catch(() => null);
+      setSessionExpiresAt(fresh?.expires_at ?? null);
+      setAuthState(me.must_change_password ? "change" : "ready");
+    } catch (error) {
+      setAuthError(errorText(error, "") === "unauthorized" ? "Invalid username or password." : errorText(error, "Login failed."));
+    } finally {
+      setAuthBusy(false);
+    }
+  }
+
+  async function handleChangePassword(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setPwError("");
+    if (pwNew.length < MIN_PASSWORD_LENGTH) {
+      setPwError(`The new password must be at least ${MIN_PASSWORD_LENGTH} characters.`);
+      return;
+    }
+    if (pwNew !== pwConfirm) {
+      setPwError("The new password and its confirmation do not match.");
+      return;
+    }
+    setPwBusy(true);
+    try {
+      await changePassword(pwCurrent, pwNew);
+      setPwCurrent("");
+      setPwNew("");
+      setPwConfirm("");
+      const fresh = await whoami().catch(() => null);
+      setSessionExpiresAt(fresh?.expires_at ?? null);
+      setSetupRequired(false);
+      toast.ok("Password changed.");
+      setAuthState("ready");
+    } catch (error) {
+      if (errorText(error, "") === "unauthorized") {
+        expireSession();
+        return;
+      }
+      setPwError(errorText(error, "The password could not be changed."));
+    } finally {
+      setPwBusy(false);
+    }
+  }
+
+  async function handleLogout() {
+    try {
+      await logout();
+    } catch {
+      // ignore: clear locally regardless
+    }
+    resetDashboardState();
+    setLoginPassword("");
+    void refreshSetupFlag();
+    setAuthState("login");
+  }
+
+  // ---- presets ----
+  function handleLoadPreset() {
+    const preset = modelPresets.find((entry) => entry.name === presetSelected);
+    if (!preset) {
+      return;
+    }
+    // Into the form only: Save changes applies it through the normal validated update.
+    setSettingsForm((current) => ({ ...current, ...preset.values }));
+    toast.info(`Preset "${preset.name}" loaded into the form. Review it and save the changes to apply it.`);
+    if (preset.note) {
+      toast.warn(preset.note);
+    }
+  }
+
+  async function handleSavePreset() {
+    const name = presetSaveName.trim();
+    if (!name) {
+      return;
+    }
+    // Presets of other models are not listed here, saving would silently take that preset over.
+    if (presets.some((entry) => entry.name === name && !modelPresets.includes(entry))) {
+      toast.error(`The name "${name}" is already used by a preset of another model.`);
+      return;
+    }
+    if (modelPresets.some((entry) => entry.name === name && entry.built_in)) {
+      toast.error(`"${name}" is a built-in preset and cannot be overwritten.`);
+      return;
+    }
+    if (modelPresets.some((entry) => entry.name === name) && !window.confirm(`Overwrite the saved preset "${name}"?`)) {
+      return;
+    }
+    setPresetBusy(true);
+    try {
+      const response = await savePreset(name, settingsForm);
+      await reloadPresets();
+      setPresetSelected(response.preset.name);
+      setPresetSaveName("");
+      toast.ok(`Preset "${response.preset.name}" saved from the current form.`);
+    } catch (error) {
+      handleApiError(error, "Could not save the preset");
+    } finally {
+      setPresetBusy(false);
+    }
+  }
+
+  async function handleDeletePreset() {
+    const preset = modelPresets.find((entry) => entry.name === presetSelected);
+    if (!preset || preset.built_in) {
+      return;
+    }
+    if (!window.confirm(`Delete preset "${preset.name}"?\n\nThe saved values are removed; the current settings stay.`)) {
+      return;
+    }
+    setPresetBusy(true);
+    try {
+      await deletePreset(preset.name);
+      setPresetSelected("");
+      await reloadPresets();
+      toast.ok(`Preset "${preset.name}" deleted.`);
+    } catch (error) {
+      handleApiError(error, "Could not delete the preset");
+    } finally {
+      setPresetBusy(false);
+    }
+  }
+
+  useEffect(() => {
+    setPresetSelected("");
+  }, [settingsForm.local_model]);
+
+  // ---- settings ----
+  function describeSaveResult(response: SettingsSaveResponse) {
+    if (!response.model_reloaded) {
+      return "Settings saved.";
+    }
+    if (response.model_loaded) {
+      return "Settings saved. The model was reloaded.";
+    }
+    return `Settings saved, but the model reload failed: ${response.load_error ?? "no cause reported."}`;
+  }
+
+  async function handleSaveSettings(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (invalidKeys.length > 0) {
+      toast.error("Some fields are empty or out of range. Fix them before saving.");
+      return;
+    }
+    setSaveBusy(true);
+    try {
+      const response = await saveSettings(settingsForm, { draft: tokenDraft, clear: tokenClear });
+      startTransition(() => {
+        applySettings(response);
+        setTokenDraft("");
+        setTokenClear(false);
+      });
+      if (response.model_reloaded && !response.model_loaded) {
+        toast.error(describeSaveResult(response));
+      } else {
+        toast.ok(describeSaveResult(response));
+      }
+      await refreshOperationalData();
+    } catch (error) {
+      if (errorText(error, "") === ACTIVE_MODEL_CHANGED) {
+        await reloadFormForActiveModel();
+        return;
+      }
+      handleApiError(error, "Could not save the settings");
+    } finally {
+      setSaveBusy(false);
+    }
+  }
+
+  function handleDiscardSettings() {
+    setSettingsForm(settingsBaseline.current);
+    setTokenDraft("");
+    setTokenClear(false);
+  }
+
+  async function handleReloadSettings() {
+    if (dirtyCount > 0 && !window.confirm("Reload the settings from the server?\n\nUnsaved changes are discarded.")) {
+      return;
+    }
+    setTokenDraft("");
+    setTokenClear(false);
+    await loadSettings();
+    await reloadPresets();
+  }
+
+  async function reloadFormForActiveModel() {
+    try {
+      const response = await getSettings();
+      startTransition(() => {
+        // The model settings in the form belong to the old model, service-wide edits are not tied to a model.
+        applySettings(response, "service");
+      });
+      toast.error(
+        `Nothing was saved: ${describeSelectedModel(response)} was selected in another session. The form now shows its settings; review them and save again.`,
+      );
+    } catch (error) {
+      handleApiError(error, "Could not reload the settings");
+    }
+  }
+
+  function updateSetting<K extends keyof AdminSettings>(key: K, value: AdminSettings[K]) {
+    setSettingsForm((current) => ({ ...current, [key]: value }));
+  }
+
+  // ---- models ----
+  async function handleRefreshModels() {
+    setModelActionId("__refresh__");
+    setModelActionKind("refresh");
+    try {
+      const response = await getModels(savedCachePath);
+      setManagedModels(response.models ?? []);
+    } catch (error) {
+      handleApiError(error, "Could not refresh the model list");
+    } finally {
+      setModelActionId(null);
+      setModelActionKind(null);
+    }
+  }
+
+  async function handleDownloadModel(model: ManagedModel) {
+    if (model.status === "ready" && !window.confirm(`Download "${model.label}" again?\n\nThe cached files are fetched once more.`)) {
+      return;
+    }
+    setModelActionId(model.id);
+    setModelActionKind("download");
+    try {
+      // A token typed but not yet saved is sent along; otherwise the server uses the saved one.
+      const response = await downloadModel(model.id, savedCachePath, tokenDraft.trim() || undefined);
+      setManagedModels(response.models ?? []);
+      toast.info(`Download of ${model.label} started.`);
+    } catch (error) {
+      handleApiError(error, `Could not download ${model.label}`);
+    } finally {
+      setModelActionId(null);
+      setModelActionKind(null);
+    }
+  }
+
+  async function handleSelectModel(model: ManagedModel) {
+    // Retrying the active model changes no setting, so the form keeps every edit.
+    const hasUnsavedModelEdits = !model.active && dirtyKeys.some((key) => !serviceFields.includes(key));
+    if (
+      hasUnsavedModelEdits
+      && !window.confirm(`Load "${model.label}"?\n\nThe unsaved model settings in the Settings tab are discarded.`)
+    ) {
+      return;
+    }
+
+    setSelectingModelId(model.id);
+    try {
+      const response = await selectModel(model.id);
+      startTransition(() => {
+        // The target's own values replace the model settings, service-wide edits are not tied to a model.
+        applySettings(response, model.active ? "all" : "service");
+      });
+      toast.ok(`${model.label} is loaded.`);
+      await refreshOperationalData();
+    } catch (error) {
+      if (handleApiError(error, `Could not load ${model.label}`)) {
+        return;
+      }
+      // On a failed load the server restored the old selection, the picker has to show what really runs now.
+      try {
+        applySettings(await getSettings(), "all");
+      } catch {
+        // The selection error above is the one the admin needs.
+      }
+    } finally {
+      setSelectingModelId(null);
+    }
+  }
+
+  async function handleDeleteModel(model: ManagedModel) {
+    if (
+      !window.confirm(
+        `Delete cached model "${model.id}"?\n\nIts files are removed from the cache; it must be downloaded again before it can be loaded.`,
+      )
+    ) {
+      return;
+    }
+    setModelActionId(model.id);
+    setModelActionKind("delete");
+    try {
+      const response = await deleteModel(model.id, savedCachePath);
+      setManagedModels(response.models ?? []);
+      toast.ok(
+        response.removed ? `Cached files of ${model.label} removed.` : `No cached files of ${model.label} were found.`,
+      );
+    } catch (error) {
+      handleApiError(error, `Could not delete ${model.label}`);
+    } finally {
+      setModelActionId(null);
+      setModelActionKind(null);
+    }
+  }
+
+  // ---- history ----
   function beginHistoryAction(historyId: string, action: HistoryActionKind) {
     setHistoryActions((current) => ({ ...current, [historyId]: action }));
     setHistoryActionErrors((current) => {
@@ -915,22 +1212,20 @@ export default function App() {
   }
 
   function reportHistoryActionError(historyId: string, error: unknown, fallback: string) {
-    const message = error instanceof Error ? error.message : fallback;
-    if (message === "unauthorized" || message === "password_change_required") {
-      handleApiError(error, fallback);
+    if (handleApiError(error, fallback, true)) {
       return;
     }
-    setHistoryActionErrors((current) => ({ ...current, [historyId]: message }));
+    setHistoryActionErrors((current) => ({ ...current, [historyId]: errorText(error, fallback) }));
   }
 
   async function handleRetryHistoryEntry(entry: HistoryEntry) {
     if (!entry.history_id || entry.debug_audio?.status !== "available" || !entry.retry_mode) {
       return;
     }
-
     beginHistoryAction(entry.history_id, "retry");
     try {
       await retryHistoryAudio(entry.history_id);
+      toast.ok("Retry finished; it is listed as a new history entry.");
       await refreshOperationalData();
     } catch (error) {
       reportHistoryActionError(entry.history_id, error, "The retained audio could not be retried.");
@@ -943,7 +1238,6 @@ export default function App() {
     if (!entry.history_id || entry.debug_audio?.status !== "available") {
       return;
     }
-
     beginHistoryAction(entry.history_id, "download");
     try {
       const download = await downloadHistoryAudio(entry.history_id, entry.debug_audio.filename);
@@ -962,380 +1256,21 @@ export default function App() {
     }
   }
 
-  // Bootstrap: check the session on mount.
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        const me = await whoami();
-        if (cancelled) return;
-        setCurrentUser(me.username);
-        setAuthState(me.must_change_password ? "change" : "ready");
-      } catch {
-        if (!cancelled) setAuthState("login");
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
-  useEffect(() => {
-    if (!isReady) {
-      return;
-    }
-    void loadDashboard();
-  }, [authState]);
-
-  useEffect(() => {
-    if (!isReady) {
-      return;
-    }
-    const intervalId = window.setInterval(() => {
-      void refreshOperationalData();
-    }, DASHBOARD_POLL_SECONDS * 1000);
-    return () => window.clearInterval(intervalId);
-  }, [authState]);
-
-  useEffect(() => {
-    setPresetName("");
-    setPresetMessage("");
-    setPresetFailed(false);
-  }, [settingsForm.local_model]);
-
-  useEffect(() => {
-    if (!isReady || !stats || !queue) {
-      return;
-    }
-    const nextPoint: DashboardHistoryPoint = {
-      queueSize: queue.queue_size ?? 0,
-      pendingBufferSize: queue.pending_buffer_size ?? 0,
-      activeBatchSize: queue.active_batch_size ?? 0,
-      meanTotalDurationMs: stats.summary.avg_total_duration_ms ?? 0,
-      meanTranscriptionDurationMs: stats.summary.avg_transcription_duration_ms ?? 0,
-      batchRealtime: computeBatchRealtime((queue.recent_batches?.[0] ?? null) as BatchEntry | null),
-    };
-    setDashboardHistory((current) => [...current.slice(-(DASHBOARD_HISTORY_POINTS - 1)), nextPoint]);
-  }, [authState, queue, stats]);
-
-  async function handleLogin(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    setAuthBusy(true);
-    setAuthError("");
-    try {
-      const me = await login(loginUsername.trim(), loginPassword);
-      setCurrentUser(me.username);
-      setLoginPassword("");
-      setAuthState(me.must_change_password ? "change" : "ready");
-    } catch (error) {
-      setAuthError(
-        error instanceof Error && error.message === "unauthorized"
-          ? "Invalid username or password."
-          : error instanceof Error
-            ? error.message
-            : "Login failed.",
-      );
-    } finally {
-      setAuthBusy(false);
-    }
-  }
-
-  async function handleChangePassword(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    setPwError("");
-    setPwMessage("");
-    if (pwNew.length < 4) {
-      setPwError("The new password must be at least 4 characters.");
-      return;
-    }
-    if (pwNew !== pwConfirm) {
-      setPwError("The new password and its confirmation do not match.");
-      return;
-    }
-    setPwBusy(true);
-    try {
-      await changePassword(pwCurrent, pwNew);
-      setPwCurrent("");
-      setPwNew("");
-      setPwConfirm("");
-      setPwMessage("Password updated.");
-      setAuthState("ready");
-    } catch (error) {
-      setPwError(error instanceof Error ? error.message : "Password change failed.");
-    } finally {
-      setPwBusy(false);
-    }
-  }
-
-  async function handleLogout() {
-    try {
-      await logout();
-    } catch {
-      // ignore — clear locally regardless
-    }
-    resetDashboardState();
-    setLoginPassword("");
-    setAuthState("login");
-  }
-
-  async function handleCreateApiKey(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    setApiKeyBusy(true);
-    setActionMessage("");
-    setGlobalError("");
-    try {
-      const created = await createApiKey(newKeyAlias.trim());
-      setCreatedKey(created);
-      setNewKeyAlias("");
-      setActionMessage(`API key "${created.alias}" created. Copy it now — it is shown only once.`);
-      const keysResponse = await listApiKeys();
-      setApiKeys(keysResponse.keys);
-    } catch (error) {
-      handleApiError(error, "The API key could not be created.");
-    } finally {
-      setApiKeyBusy(false);
-    }
-  }
-
-  async function handleDeleteApiKey(keyId: string, alias: string) {
-    setActionMessage("");
-    setGlobalError("");
-    try {
-      await deleteApiKey(keyId);
-      setCreatedKey((current) => (current?.id === keyId ? null : current));
-      setActionMessage(`API key "${alias}" deleted.`);
-      const keysResponse = await listApiKeys();
-      setApiKeys(keysResponse.keys);
-    } catch (error) {
-      handleApiError(error, "The API key could not be deleted.");
-    }
-  }
-
-  async function handleCopyCreatedKey() {
-    if (!createdKey?.token) {
-      return;
-    }
-    try {
-      await copyTextToClipboard(createdKey.token);
-      setActionMessage("API key copied to the clipboard.");
-    } catch (error) {
-      setGlobalError(error instanceof Error ? error.message : "Copying failed.");
-    }
-  }
-
-  function describeSaveResult(response: SettingsSaveResponse) {
-    if (!response.model_reloaded) {
-      return "Settings saved.";
-    }
-    if (response.model_loaded) {
-      return "Settings saved. Model reload succeeded.";
-    }
-    return `Settings saved. Model reload failed: ${response.load_error ?? "no cause reported."}`;
-  }
-
-  async function handleSaveSettings(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    setSaveBusy(true);
-    setSaveMessage("");
-    setSaveFailed(false);
-
-    try {
-      const response = await saveSettings(settingsForm);
-      startTransition(() => {
-        applySettings(response);
-        setSaveMessage(describeSaveResult(response));
-        setSaveFailed(response.model_reloaded && !response.model_loaded);
-      });
-      await refreshOperationalData();
-    } catch (error) {
-      if (error instanceof Error && error.message === ACTIVE_MODEL_CHANGED) {
-        await reloadFormForActiveModel();
-        return;
-      }
-      if (handleApiError(error, "Saving settings failed.")) {
-        return;
-      }
-      setSaveMessage(error instanceof Error ? error.message : "Saving settings failed.");
-      setSaveFailed(true);
-    } finally {
-      setSaveBusy(false);
-    }
-  }
-
-  async function reloadFormForActiveModel() {
-    try {
-      const response = await getSettings();
-      startTransition(() => {
-        // The model settings in the form belong to the old model, service-wide edits are not tied to a model.
-        applySettings(response, "service");
-        setSaveMessage(
-          `Nothing was saved: ${describeSelectedModel(response)} was selected in another session. `
-            + "The form now shows its settings, review them and save again.",
-        );
-        setSaveFailed(true);
-      });
-    } catch (error) {
-      if (handleApiError(error, "The settings could not be reloaded.")) {
-        return;
-      }
-      setSaveMessage(error instanceof Error ? error.message : "The settings could not be reloaded.");
-      setSaveFailed(true);
-    }
-  }
-
-  async function refreshManagedModels(options?: { silent?: boolean; storagePath?: string }) {
-    if (!isReady) {
-      return;
-    }
-
-    const silent = options?.silent ?? false;
-    const storagePath = options?.storagePath ?? managedModels[0]?.storage_root ?? settingsForm.local_model_cache_path;
-
-    try {
-      const response = await getModels(storagePath);
-      startTransition(() => {
-        setManagedModels(response.models ?? []);
-        if (!silent) {
-          setActionMessage("Model cache refreshed for the selected path.");
-        }
-      });
-    } catch (error) {
-      if (handleApiError(error, "Model cache refresh failed.")) {
-        return;
-      }
-      if (!silent) {
-        setGlobalError(error instanceof Error ? error.message : "Model cache refresh failed.");
-      }
-    }
-  }
-
-  async function handleRefreshModels() {
-    setModelActionId("__refresh__");
-    setModelActionKind("refresh");
-    setActionMessage("");
-    setGlobalError("");
-
-    try {
-      await refreshManagedModels({ storagePath: settingsForm.local_model_cache_path });
-    } finally {
-      setModelActionId(null);
-      setModelActionKind(null);
-    }
-  }
-
-  async function handleDownloadModel(model: ManagedModel) {
-    setModelActionId(model.id);
-    setModelActionKind("download");
-    setActionMessage("");
-    setGlobalError("");
-
-    try {
-      const response = await downloadModel(model.id, settingsForm.local_model_cache_path, settingsForm.huggingface_token);
-      startTransition(() => {
-        setManagedModels(response.models ?? []);
-        setActionMessage(`Download queued for ${model.label}.`);
-      });
-    } catch (error) {
-      handleApiError(error, "Model download failed.");
-    } finally {
-      setModelActionId(null);
-      setModelActionKind(null);
-    }
-  }
-
-  async function handleSelectModel(model: ManagedModel) {
-    // Retrying the active model changes no setting, so the form keeps every edit.
-    const hasUnsavedModelEdits = !model.active && (Object.keys(settingsForm) as Array<keyof AdminSettings>).some(
-      (key) => settingsForm[key] !== settingsBaseline.current[key] && !serviceFields.includes(key),
-    );
-    if (
-      hasUnsavedModelEdits
-      && !window.confirm(`Loading ${model.label} discards the unsaved model settings in the form. Continue?`)
-    ) {
-      return;
-    }
-
-    setSelectingModelId(model.id);
-    setModelSelectMessage("");
-    setModelSelectFailed(false);
-    setSaveMessage("");
-
-    try {
-      const response = await selectModel(model.id);
-      startTransition(() => {
-        // The target's own values replace the model settings, service-wide edits are not tied to a model.
-        applySettings(response, model.active ? "all" : "service");
-        // A load that failed comes back as an error, including a retry of the active model.
-        setModelSelectMessage(`${model.label} is loaded.`);
-      });
-      await refreshOperationalData();
-    } catch (error) {
-      const message = error instanceof Error ? error.message : "The model could not be loaded.";
-      if (message === "unauthorized" || message === "password_change_required") {
-        handleApiError(error, message);
-        return;
-      }
-      setModelSelectMessage(message);
-      setModelSelectFailed(true);
-      // On a failed load the server restored the old selection, the picker has to show what really runs now.
-      try {
-        applySettings(await getSettings(), "all");
-      } catch {
-        // The selection error above is the one the admin needs.
-      }
-    } finally {
-      setSelectingModelId(null);
-    }
-  }
-
-  async function handleDeleteModel(model: ManagedModel) {
-    setModelActionId(model.id);
-    setModelActionKind("delete");
-    setActionMessage("");
-    setGlobalError("");
-
-    try {
-      const response = await deleteModel(model.id, settingsForm.local_model_cache_path);
-      startTransition(() => {
-        setManagedModels(response.models ?? []);
-        setActionMessage(
-          response.removed
-            ? `Cached files removed for ${model.label}.`
-            : `No cached files found for ${model.label} in the selected path.`,
-        );
-      });
-    } catch (error) {
-      handleApiError(error, "Model deletion failed.");
-    } finally {
-      setModelActionId(null);
-      setModelActionKind(null);
-    }
-  }
-
-  useEffect(() => {
-    if (!isReady || !hasDownloadingModels) {
-      return;
-    }
-    const intervalId = window.setInterval(() => {
-      void refreshManagedModels({ silent: true });
-    }, MODEL_STATUS_POLL_MS);
-    return () => window.clearInterval(intervalId);
-  }, [authState, hasDownloadingModels, managedModels, settingsForm.local_model_cache_path]);
-
+  // ---- playground + benchmark ----
   function selectPipelineFile(file: File | null) {
     setBenchmarkFile(file);
-    setPipelineMessage("");
+    setPipelineError("");
     setPipelineResult(null);
     setPipelineWallTimeMs(null);
     setPipelineJsonExpanded(false);
-    setBenchmarkMessage("");
+    setBenchmarkError("");
     setBenchmarkResult(null);
   }
 
   async function handleRunPipeline(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!benchmarkFile) {
-      setPipelineMessage("Please select or drop an audio or video file first.");
+      setPipelineError("Choose or drop an audio or video file first.");
       return;
     }
 
@@ -1368,15 +1303,15 @@ export default function App() {
         };
       }
       if (new TextEncoder().encode(JSON.stringify(request)).byteLength > 16 * 1024 * 1024) {
-        throw new Error("Pipeline request JSON must not exceed 16 MiB.");
+        throw new Error("The request JSON must not exceed 16 MB.");
       }
     } catch (error) {
-      setPipelineMessage(error instanceof Error ? error.message : "The pipeline request is invalid.");
+      setPipelineError(errorText(error, "The request is invalid."));
       return;
     }
 
     setPipelineBusy(true);
-    setPipelineMessage("");
+    setPipelineError("");
     setPipelineResult(null);
     setPipelineWallTimeMs(null);
     setPipelineJsonExpanded(false);
@@ -1387,88 +1322,86 @@ export default function App() {
       startTransition(() => {
         setPipelineResult(response);
         setPipelineWallTimeMs(wallTimeMs);
-        setPipelineMessage(
-          `Pipeline finished with status ${response.status} in ${formatValue(response.timings_ms.total, " ms")} server time.`,
-        );
       });
+      toast.ok(`Finished with status ${response.status} in ${formatMs(response.timings_ms.total)} server time.`);
       await refreshOperationalData();
     } catch (error) {
       setPipelineWallTimeMs(Math.round(performance.now() - startedAt));
-      setPipelineMessage(error instanceof Error ? error.message : "Pipeline request failed.");
+      if (handleApiError(error, "", true)) {
+        return;
+      }
+      setPipelineError(errorText(error, "The request failed."));
     } finally {
       setPipelineBusy(false);
     }
   }
 
+  const benchmarkRepeatCount = /^\d+$/.test(benchmarkRepeatInput) ? Number(benchmarkRepeatInput) : Number.NaN;
+  const benchmarkRepeatInvalid = !(benchmarkRepeatCount >= 1 && benchmarkRepeatCount <= 64);
+
   async function handleRunBenchmark(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!benchmarkFile) {
-      setBenchmarkMessage("Please select an audio or video file first.");
+      setBenchmarkError("Choose an audio or video file first.");
       return;
     }
-
+    if (benchmarkRepeatInvalid) {
+      setBenchmarkError("Repeats must be a whole number from 1 to 64.");
+      return;
+    }
     setBenchmarkBusy(true);
-    setBenchmarkMessage("");
+    setBenchmarkError("");
     setBenchmarkResult(null);
-
     try {
       const result = await runBenchmark(benchmarkFile, benchmarkRepeatCount);
-      startTransition(() => {
-        setBenchmarkResult(result);
-        setBenchmarkMessage(
-          `Benchmark finished: ${formatValue(result.repeat_count)} run(s) in ${formatValue(result.total_wall_time_ms, " ms")}.`,
-        );
-      });
+      setBenchmarkResult(result);
+      toast.ok(`Benchmark finished: ${formatValue(result.repeat_count)} run(s) in ${formatMs(result.total_wall_time_ms)}.`);
       await refreshOperationalData();
     } catch (error) {
-      if (handleApiError(error, "Benchmark failed.")) {
+      if (handleApiError(error, "", true)) {
         return;
       }
-      setBenchmarkMessage(error instanceof Error ? error.message : "Benchmark failed.");
+      setBenchmarkError(errorText(error, "The benchmark failed."));
     } finally {
       setBenchmarkBusy(false);
     }
   }
 
-  function updateSetting<K extends keyof AdminSettings>(key: K, value: AdminSettings[K]) {
-    setSettingsForm((current) => ({
-      ...current,
-      [key]: value,
-    }));
-  }
+  // =========================================================================================== render: auth states
 
   if (authState === "loading") {
     return (
-      <main className="shell centered">
-        <section className="panel login-panel">
-          <p className="message">Loading...</p>
-        </section>
-      </main>
+      <div className="shell login-shell">
+        <ToastHost />
+        {bootError ? (
+          <section className="panel login-panel">
+            <div className="banner danger" role="alert">
+              <span>Could not reach the server: {bootError}</span>
+              <button type="button" className="secondary-button small-button" onClick={() => void bootstrap()}>
+                Retry
+              </button>
+            </div>
+          </section>
+        ) : (
+          <div className="state"><span className="spinner" />Loading…</div>
+        )}
+      </div>
     );
   }
 
   if (authState === "login") {
     return (
-      <main className="shell centered">
-        <section className="panel login-panel">
-          <div className="hero-copy">
-            <span className="eyebrow">Private Access</span>
-            <h1>GENESIS Whisper Admin</h1>
-            <p>
-              The public transcription API stays open until you create an API key. The private dashboard for queue
-              control, benchmarks, and history is protected by a username and password login.
-            </p>
+      <div className="shell login-shell">
+        <ToastHost />
+        <main className="panel login-panel">
+          <div className="titles">
+            <p className="eyebrow">G3 GPU service · Admin</p>
+            <h1>G3 Whisper</h1>
           </div>
-
-          <form className="login-form" onSubmit={handleLogin}>
+          <form className="form-stack" onSubmit={handleLogin}>
             <label>
               <span>Username</span>
-              <input
-                value={loginUsername}
-                autoComplete="username"
-                onChange={(event) => setLoginUsername(event.target.value)}
-                placeholder="admin"
-              />
+              <input value={loginUsername} autoComplete="username" onChange={(event) => setLoginUsername(event.target.value)} />
             </label>
             <label>
               <span>Password</span>
@@ -1477,1658 +1410,1480 @@ export default function App() {
                 value={loginPassword}
                 autoComplete="current-password"
                 onChange={(event) => setLoginPassword(event.target.value)}
-                placeholder="admin"
               />
             </label>
-
-            <button type="submit" disabled={!loginUsername.trim() || !loginPassword || authBusy}>
-              {authBusy ? "Signing in..." : "Sign In"}
-            </button>
-
-            <p className="message">Default credentials: admin / admin. You must change the password on first login.</p>
-            {authError && <p className="message error">{authError}</p>}
+            {authError && <div className="banner danger" role="alert">{authError}</div>}
+            <div className="form-actions">
+              <button type="submit" disabled={!loginUsername.trim() || !loginPassword || authBusy} aria-busy={authBusy || undefined}>
+                {authBusy ? "Logging in…" : "Log in"}
+              </button>
+            </div>
+            {setupRequired && (
+              <p className="hint">First start: log in with admin / admin. You must choose a new password right after.</p>
+            )}
           </form>
-        </section>
-      </main>
+        </main>
+      </div>
     );
   }
+
+  const passwordForm = (submitLabel: string, extra?: ReactNode) => (
+    <form className="form-stack" onSubmit={handleChangePassword}>
+      <label>
+        <span>Current password</span>
+        <input type="password" value={pwCurrent} autoComplete="current-password" onChange={(event) => setPwCurrent(event.target.value)} />
+      </label>
+      <label>
+        <span>New password</span>
+        <input
+          type="password"
+          value={pwNew}
+          autoComplete="new-password"
+          minLength={MIN_PASSWORD_LENGTH}
+          onChange={(event) => setPwNew(event.target.value)}
+        />
+        <span className="hint">At least {MIN_PASSWORD_LENGTH} characters.</span>
+      </label>
+      <label>
+        <span>Confirm new password</span>
+        <input type="password" value={pwConfirm} autoComplete="new-password" onChange={(event) => setPwConfirm(event.target.value)} />
+      </label>
+      {pwError && <div className="banner danger" role="alert">{pwError}</div>}
+      <div className="form-actions button-row">
+        <button type="submit" disabled={pwBusy || !pwCurrent || !pwNew || !pwConfirm} aria-busy={pwBusy || undefined}>
+          {pwBusy ? "Saving…" : submitLabel}
+        </button>
+        {extra}
+      </div>
+    </form>
+  );
 
   if (authState === "change") {
     return (
-      <main className="shell centered">
-        <section className="panel login-panel">
-          <div className="hero-copy">
-            <span className="eyebrow">Security</span>
-            <h1>Set a New Password</h1>
-            <p>
-              You are signed in as <strong>{currentUser || "admin"}</strong>. Choose a new password before continuing
-              to the dashboard.
+      <div className="shell login-shell">
+        <ToastHost />
+        <main className="panel login-panel">
+          <div className="titles">
+            <p className="eyebrow">G3 GPU service · Admin</p>
+            <h1>Change password</h1>
+            <p className="dim">
+              You are logged in as <strong>{currentUser || "admin"}</strong>. Choose a new password to continue.
             </p>
           </div>
-
-          <form className="login-form" onSubmit={handleChangePassword}>
-            <label>
-              <span>Current Password</span>
-              <input
-                type="password"
-                value={pwCurrent}
-                autoComplete="current-password"
-                onChange={(event) => setPwCurrent(event.target.value)}
-              />
-            </label>
-            <label>
-              <span>New Password</span>
-              <input
-                type="password"
-                value={pwNew}
-                autoComplete="new-password"
-                onChange={(event) => setPwNew(event.target.value)}
-              />
-            </label>
-            <label>
-              <span>Confirm New Password</span>
-              <input
-                type="password"
-                value={pwConfirm}
-                autoComplete="new-password"
-                onChange={(event) => setPwConfirm(event.target.value)}
-              />
-            </label>
-
-            <button type="submit" disabled={pwBusy || !pwCurrent || !pwNew || !pwConfirm}>
-              {pwBusy ? "Saving..." : "Save New Password"}
-            </button>
-
-            <button type="button" className="ghost-button" onClick={() => void handleLogout()}>
-              Cancel & Sign Out
-            </button>
-
-            {pwMessage && <p className="message">{pwMessage}</p>}
-            {pwError && <p className="message error">{pwError}</p>}
-          </form>
-        </section>
-      </main>
+          {passwordForm(
+            "Change password",
+            <button type="button" className="ghost-button" onClick={() => void handleLogout()}>Log out</button>,
+          )}
+        </main>
+      </div>
     );
   }
+
+  // =========================================================================================== render: dashboard
 
   const history = stats?.history ?? [];
   const recentBatches = (queue?.recent_batches ?? []) as BatchEntry[];
   const recentJobs = (queue?.recent_jobs ?? []) as JobEntry[];
   const queueJobs = queue?.jobs ?? [];
-  const latestBatchRealtime = computeBatchRealtime(recentBatches[0]);
-  const selectedPreset = modelPresets.find((preset) => preset.name === presetName);
-  const configuredDeviceLabel = resolveOptionLabel(settingsOptions.devices, settingsForm.local_gpu_device, "Auto");
+  const queuedChunks = (queue?.queue_size ?? 0) + (queue?.pending_buffer_size ?? 0);
+  const selectedPreset = modelPresets.find((preset) => preset.name === presetSelected);
   const configuredLanguageLabel =
     activeModelOption && !activeModelFields.includes("transcription_language")
       ? "Not used by this model"
-      : resolveOptionLabel(settingsOptions.languages, settingsForm.transcription_language, "Auto");
+      : resolveOptionLabel(settingsOptions.languages, settingsBaseline.current.transcription_language, "Auto");
   // The server identifies a loaded model as (model id, device, cache path, precision).
   const [loadedModelId, loadedDevice, , loadedPrecision] = loadedModelIdentifier ?? [];
   const loadedModelOption = settingsOptions.models.find((option) => option.value === loadedModelId);
-  const loadedModelLabel = loadedModelId ? (loadedModelOption?.label ?? loadedModelId) : "No model loaded";
+  const loadedModelLabel = loadedModelId ? (loadedModelOption?.label ?? loadedModelId) : "None";
   const loadedModelUsesPrecision = loadedModelOption
     && modelFields[loadedModelOption.backend]?.includes("local_model_precision");
-  const loadedModelDetails = loadedModelId && (
-    <>
-      <small className="loaded-model-detail">
-        Device: {resolveOptionLabel(settingsOptions.devices, loadedDevice, "Auto")}
-      </small>
-      {loadedModelUsesPrecision && (
-        <small className="loaded-model-detail">
-          Precision: {resolveOptionLabel(settingsOptions.precisions, loadedPrecision)}
-        </small>
-      )}
-    </>
+  const loadedModelSub = loadedModelId
+    ? [
+        resolveOptionLabel(settingsOptions.devices, loadedDevice, "Auto"),
+        loadedModelUsesPrecision ? resolveOptionLabel(settingsOptions.precisions, loadedPrecision) : null,
+      ].filter(Boolean).join(" · ")
+    : "Load a model in the Models tab.";
+
+  const serviceGpus = (perfLatest?.gpus ?? []).filter((gpu) => gpu.used_by_service);
+  const gpuChip = perfLatest ? (serviceGpus.length ? serviceGpus.map(gpuTitle).join(", ") : "CPU") : DASH;
+
+  let stateBadge: { text: string; tone: string; title?: string };
+  if (modelSelectRunning) {
+    stateBadge = { text: "Loading", tone: "warn" };
+  } else if (queue && !queue.worker_running) {
+    stateBadge = { text: "Error", tone: "danger", title: queue.last_error ?? "The batch worker is not running." };
+  } else if (!settingsLoaded) {
+    stateBadge = { text: DASH, tone: "plain" };
+  } else if (loadedModelId) {
+    stateBadge = { text: "Ready", tone: "ok" };
+  } else {
+    stateBadge = { text: "Idle · model unloaded", tone: "plain" };
+  }
+
+  const keyCount = apiKeys?.length ?? 0;
+  const apiKeyRows = (apiKeys ?? []).map((key) => ({
+    id: key.id,
+    alias: key.alias,
+    hint: key.hint ?? null,
+    created_at: key.created_at,
+    last_used_at: key.usage.last_used_at,
+    requests: key.usage.request_count,
+    usage: key.usage.total_seconds_processed,
+  }));
+  const baseUrl = window.location.origin;
+
+  const tokenSet = settingsBaseline.current.huggingface_token_set === true;
+  const tokenPlaceholder = tokenClear
+    ? "Will be removed on save"
+    : tokenSet
+      ? `Saved: ${settingsBaseline.current.huggingface_token} · leave empty to keep`
+      : "hf_… (optional)";
+
+  const queueTable = (
+    <div className="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Request</th>
+            <th>State</th>
+            <th className="num">Chunks</th>
+            <th className="num">Batches</th>
+            <th className="num">Queue wait</th>
+          </tr>
+        </thead>
+        <tbody>
+          {queueJobs.length === 0 && (
+            <tr>
+              <td colSpan={5} className="empty">No request is scheduled right now.</td>
+            </tr>
+          )}
+          {queueJobs.map((job) => (
+            <tr key={job.request_id}>
+              <td><span className="mono">{job.request_id}</span></td>
+              <td>
+                <span className={`badge ${job.state === "active" ? "ok" : "plain"}`}>{job.state}</span>
+                {job.is_long ? <span className="hint"> long</span> : null}
+              </td>
+              <td className="num">
+                {job.completed_chunks} / {job.total_chunks}
+                {job.inflight_chunks > 0 ? <span className="hint"> +{job.inflight_chunks} in batch</span> : null}
+              </td>
+              <td className="num">{job.batch_count}</td>
+              <td className="num">{formatMs(job.queue_wait_ms)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
   );
 
   return (
-    <main className="shell">
-      <section className="hero">
-        <div className="hero-copy-block">
-          <span className="eyebrow">Powered by SONS</span>
-          <h1>G3 Whisper Admin</h1>
-          <p className="hero-copy">
-            Manage model routing, batch-window tuning, queue visibility, and protected operator access from one
-            private Whisper control surface.
-          </p>
-          <div className="hero-actions">
-            <button
-              type="button"
-              className="secondary-button"
-              onClick={() => void loadDashboard("all")}
-              disabled={modelSelectRunning}
-            >
-              Refresh
-            </button>
-            <button type="button" className="ghost-button" onClick={() => void handleLogout()}>
-              Logout
-            </button>
+    <div className="shell">
+      <ToastHost />
+      <header className="app-header">
+        <div className="titles">
+          <p className="eyebrow">G3 GPU service · Admin</p>
+          <h1>G3 Whisper</h1>
+          <div className="status-strip">
+            <span className={`badge ${stateBadge.tone}`} title={stateBadge.title}>{stateBadge.text}</span>
+            <Chip label="Model" title={loadedModelId ?? undefined}>{loadedModelLabel}</Chip>
+            <Chip label="GPU">{gpuChip}</Chip>
+            <Chip label="API" title="Show the API keys" onClick={() => goToTab("api-keys")}>
+              {apiKeys === null ? DASH : keyCount > 0 ? (
+                <span className="badge ok">Protected</span>
+              ) : (
+                <span className="badge warn">Open</span>
+              )}
+            </Chip>
           </div>
         </div>
-
-        <div className="status-grid">
-          <div className="status-pill">
-            <span>Loaded Model</span>
-            <strong>{loadedModelLabel}</strong>
-            {loadedModelDetails}
-          </div>
-          <div className="status-pill">
-            <span>GPU</span>
-            <strong>{configuredDeviceLabel}</strong>
-          </div>
-          <div className="status-pill">
-            <span>Language</span>
-            <strong>{configuredLanguageLabel}</strong>
-          </div>
+        <div className="actions">
+          <a className="button-link ghost" href="/docs" target="_blank" rel="noreferrer">API docs</a>
+          <button type="button" className="ghost-button" onClick={() => void handleLogout()}>Log out</button>
         </div>
-      </section>
+      </header>
 
-      {actionMessage && <p className="message">{actionMessage}</p>}
-      {globalError && <p className="message error">{globalError}</p>}
+      <nav className="tab-bar" role="tablist" aria-label="Sections">
+        {TABS.map((entry) => (
+          <button
+            key={entry.id}
+            id={`tab-${entry.id}`}
+            type="button"
+            role="tab"
+            className="tab-button"
+            aria-selected={tab === entry.id}
+            aria-controls={`panel-${entry.id}`}
+            tabIndex={tab === entry.id ? 0 : -1}
+            onClick={() => goToTab(entry.id)}
+            onKeyDown={onTabKeyDown}
+          >
+            {entry.label}
+            {entry.id === "settings" && dirtyCount > 0 && <span className="tab-dot" aria-label="unsaved changes" />}
+          </button>
+        ))}
+      </nav>
 
-      <section className="panel-grid admin-overview-grid">
-        <section className="panel stack">
-          <p className="eyebrow">Dashboard</p>
-          <h2>Live Queue</h2>
-          <div className="metric-grid whisper-dashboard-metrics">
-            <div className="metric-card">
-              <span>Active Jobs</span>
-              <strong>{queue?.active_jobs ?? 0}</strong>
+      <main role="tabpanel" id={`panel-${tab}`} aria-labelledby={`tab-${tab}`} className="tab-panel">
+        {/* ------------------------------------------------------------------------------ Dashboard */}
+        {tab === "dashboard" && (
+          <>
+            <div className="grid stat-row">
+              <Card label="Model" value={loadedModelLabel} title={loadedModelId ?? undefined} sub={loadedModelSub} />
+              <Card
+                label="State"
+                value={<span className={`badge ${stateBadge.tone}`} title={stateBadge.title}>{stateBadge.text}</span>}
+                sub={queue ? `Queue: ${formatValue(queuedChunks)} chunk${queuedChunks === 1 ? "" : "s"}` : DASH}
+              />
+              <Card
+                label="Requests"
+                value={stats ? formatValue(stats.summary.total_requests) : DASH}
+                sub={stats?.summary.avg_total_duration_ms != null ? `Mean total ${formatMs(stats.summary.avg_total_duration_ms)}` : "Since start"}
+              />
+              <Card
+                label="Errors"
+                value={stats ? formatValue(stats.summary.failed_batches ?? 0) : DASH}
+                sub="Failed batches since start"
+              />
             </div>
-            <div className="metric-card">
-              <span>Waiting Long Jobs</span>
-              <strong>{queue?.waiting_jobs ?? 0}</strong>
-            </div>
-            <div className="metric-card">
-              <span>Pending Chunks</span>
-              <strong>{queue?.queue_size ?? 0}</strong>
-            </div>
-            <div className="metric-card">
-              <span>Active Batch</span>
-              <strong>
-                {queue?.active_batch_size ?? 0} / {settingsForm.batch_max_segments || "-"}
-                {queue?.active_batch_fast_path ? " (fast path)" : ""}
-              </strong>
-            </div>
-            <div className="metric-card">
-              <span>Mean Total</span>
-              <strong>{formatValue(stats?.summary.avg_total_duration_ms, " ms")}</strong>
-            </div>
-            <div className="metric-card">
-              <span>Mean ASR</span>
-              <strong>{formatValue(stats?.summary.avg_transcription_duration_ms, " ms")}</strong>
-            </div>
-            <div className="metric-card">
-              <span>Batch Realtime</span>
-              <strong>{latestBatchRealtime > 0 ? formatRealtimeFactor(latestBatchRealtime) : "n/a"}</strong>
-            </div>
-          </div>
 
-          <DashboardSparkline history={dashboardHistory} />
+            {liveError && <div className="banner danger" role="status">Live data unavailable: {liveError}</div>}
 
-          <div className="queue-insight-grid">
-            <div className="insight-card">
-              <span>Worker</span>
-              <strong>{queue?.worker_running ? "Running" : "Stopped"}</strong>
-            </div>
-            <div className="insight-card">
-              <span>Requests</span>
-              <strong>{stats?.summary.total_requests ?? 0}</strong>
-            </div>
-            <div className="insight-card">
-              <span>Processed Segments</span>
-              <strong>{queue?.total_segments_processed ?? 0}</strong>
-            </div>
-          </div>
+            <PerfPanel />
 
-          <div className="queue-summary-card">
-            <div className="queue-summary-head">
-              <div>
-                <h3>Current Batch</h3>
-                <p className="muted">Live worker snapshot for the active batch and the most recent runtime state.</p>
+            <section className="panel" aria-labelledby="live-title">
+              <div className="panel-head">
+                <h2 id="live-title">Live queue</h2>
+                <span className="hint">Every 5 s · ASR work is batched per model; long recordings share batches round-robin.</span>
               </div>
-            </div>
-            {queue?.active_batch_id ? (
-              <div className="queue-detail-grid">
-                <div>
-                  <span>Batch ID</span>
-                  <strong>{queue.active_batch_id}</strong>
-                </div>
-                <div>
-                  <span>Batch Size</span>
-                  <strong>{queue.active_batch_size ?? 0}</strong>
-                </div>
-                <div>
-                  <span>Audio</span>
-                  <strong>{formatValue(queue.active_batch_audio_seconds, " s")}</strong>
-                </div>
-                <div>
-                  <span>Started</span>
-                  <strong>{formatDateTime(queue.active_batch_started_at)}</strong>
-                </div>
+              <div className="grid grid-auto">
+                <Card label="Active jobs" value={formatValue(queue?.active_jobs)} />
+                <Card label="Waiting long jobs" value={formatValue(queue?.waiting_jobs)} />
+                <Card label="Queued chunks" value={formatValue(queue ? queuedChunks : null)} />
+                <Card
+                  label="Active batch"
+                  value={queue ? `${queue.active_batch_size ?? 0} / ${settingsBaseline.current.batch_max_segments || DASH}` : DASH}
+                  sub={queue?.active_batch_fast_path ? "Fast path" : undefined}
+                />
+                <Card label="Mean ASR" value={formatMs(stats?.summary.avg_transcription_duration_ms)} />
+                <Card label="Last batch" value={formatMs(queue?.last_batch_duration_ms ?? null)} />
               </div>
-            ) : (
-              <p className="muted">No batch is currently running.</p>
-            )}
-            <p className="dashboard-note">
-              {queue?.last_error ? `Last error: ${queue.last_error}` : "No current worker error."}
-            </p>
-          </div>
-        </section>
 
-        <div className="stack side-widget-stack">
-        <section className="panel stack">
-          <p className="eyebrow">Account</p>
-          <h2>Admin Access</h2>
-          <div className="metric-grid compact-metrics">
-            <div className="metric-card">
-              <span>Username</span>
-              <strong>{currentUser || "admin"}</strong>
+              <h3>Current batch</h3>
+              {queue?.active_batch_id ? (
+                <dl className="kv-grid">
+                  <div><dt>Batch</dt><dd className="mono">{queue.active_batch_id}</dd></div>
+                  <div><dt>Segments</dt><dd>{queue.active_batch_size ?? 0}</dd></div>
+                  <div><dt>Audio</dt><dd>{formatFixed(queue.active_batch_audio_seconds, 1, " s")}</dd></div>
+                  <div><dt>Started</dt><dd>{formatDateTime(queue.active_batch_started_at, true)}</dd></div>
+                </dl>
+              ) : (
+                <p className="dim">No batch is running.</p>
+              )}
+              {queue?.last_error && <div className="banner danger">Last worker error: {queue.last_error}</div>}
+
+              <h3>Scheduled jobs</h3>
+              {queueTable}
+
+              <h3>Recent batches</h3>
+              <div className="table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Time</th>
+                      <th>Batch</th>
+                      <th className="num">Segments</th>
+                      <th className="num">Requests</th>
+                      <th className="num">Audio</th>
+                      <th className="num">Duration</th>
+                      <th className="num">Realtime</th>
+                      <th>Status</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {recentBatches.length === 0 && (
+                      <tr>
+                        <td colSpan={8} className="empty">No batch has run yet. Send a request or run the benchmark.</td>
+                      </tr>
+                    )}
+                    {recentBatches.map((entry, index) => (
+                      <tr key={`${entry.batch_id ?? "batch"}-${index}`}>
+                        <td className="nowrap">{formatDateTime(entry.timestamp, true)}</td>
+                        <td><span className="mono">{entry.batch_id ?? DASH}</span></td>
+                        <td className="num">{entry.batch_size ?? 0}</td>
+                        <td className="num">
+                          {formatValue(entry.unique_request_count)}
+                          {entry.fast_path ? <span className="hint"> fast</span> : null}
+                        </td>
+                        <td className="num">{formatFixed(entry.audio_seconds, 1, " s")}</td>
+                        <td className="num">{formatMs(entry.duration_ms)}</td>
+                        <td className="num">
+                          {entry.status === "ok" && entry.audio_seconds && entry.duration_ms
+                            ? formatRealtimeFactor(entry.audio_seconds / (entry.duration_ms / 1000))
+                            : DASH}
+                        </td>
+                        <td>
+                          <span className={`badge ${entry.status === "ok" ? "ok" : "danger"}`} title={entry.error}>
+                            {entry.status === "ok" ? "OK" : entry.status ?? DASH}
+                          </span>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+
+              <h3>Recent jobs</h3>
+              <div className="table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Finished</th>
+                      <th>Request</th>
+                      <th className="num">Chunks</th>
+                      <th className="num">Batches</th>
+                      <th className="num">Queue wait</th>
+                      <th className="num">Total</th>
+                      <th>Status</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {recentJobs.length === 0 && (
+                      <tr>
+                        <td colSpan={7} className="empty">No job has finished yet.</td>
+                      </tr>
+                    )}
+                    {recentJobs.map((entry, index) => (
+                      <tr key={`${entry.request_id ?? "job"}-${index}`}>
+                        <td className="nowrap">{formatDateTime(entry.finished_at, true)}</td>
+                        <td>
+                          <span className="mono">{entry.request_id ?? DASH}</span>
+                          {entry.is_long ? <span className="hint"> long</span> : null}
+                        </td>
+                        <td className="num">{entry.total_chunks ?? 0}</td>
+                        <td className="num">{entry.batch_count ?? 0}</td>
+                        <td className="num">{formatMs(entry.queue_wait_ms ?? null)}</td>
+                        <td className="num">{formatMs(entry.duration_ms)}</td>
+                        <td>
+                          <span className={`badge ${entry.status === "completed" || entry.status === "ok" ? "ok" : entry.status === "cancelled" ? "plain" : "danger"}`}>
+                            {entry.status ?? DASH}
+                          </span>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </section>
+
+            <section className="panel" aria-labelledby="system-title">
+              <div className="panel-head">
+                <h2 id="system-title">System</h2>
+              </div>
+              <dl className="kv-grid">
+                <div><dt>Batch worker</dt><dd>{queue ? (queue.worker_running ? "Running" : "Stopped") : DASH}</dd></div>
+                <div><dt>Processed batches</dt><dd>{formatValue(queue?.total_batches_processed)}</dd></div>
+                <div><dt>Processed segments</dt><dd>{formatValue(queue?.total_segments_processed)}</dd></div>
+                <div><dt>Configured device</dt><dd>{resolveOptionLabel(settingsOptions.devices, settingsBaseline.current.local_gpu_device, "Auto")}</dd></div>
+                <div><dt>Language</dt><dd>{configuredLanguageLabel}</dd></div>
+                <div><dt>Model cache</dt><dd className="mono">{savedCachePath || "Default Hugging Face cache"}</dd></div>
+              </dl>
+            </section>
+          </>
+        )}
+
+        {/* ------------------------------------------------------------------------------ Playground */}
+        {tab === "playground" && (
+          <section className="panel" aria-labelledby="playground-title">
+            <div className="panel-head">
+              <h2 id="playground-title">Playground</h2>
+              <span className="badge accent plain">{PIPELINE_MODES.find((entry) => entry.value === pipelineMode)?.label}</span>
+              <p className="hint">
+                Drop one file, choose a mode, and inspect the complete response of <code>POST /v2/audio/process</code>.
+                Your login is used unless you type a client key.
+              </p>
             </div>
-            <div className="metric-card">
-              <span>Session</span>
-              <strong>Active (cookie)</strong>
-            </div>
-          </div>
 
-          <form className="login-form" onSubmit={handleChangePassword}>
-            <label>
-              <span>Current Password</span>
-              <input type="password" value={pwCurrent} autoComplete="current-password" onChange={(event) => setPwCurrent(event.target.value)} />
-            </label>
-            <label>
-              <span>New Password</span>
-              <input type="password" value={pwNew} autoComplete="new-password" onChange={(event) => setPwNew(event.target.value)} />
-            </label>
-            <label>
-              <span>Confirm New Password</span>
-              <input type="password" value={pwConfirm} autoComplete="new-password" onChange={(event) => setPwConfirm(event.target.value)} />
-            </label>
-            <button type="submit" disabled={pwBusy || !pwCurrent || !pwNew || !pwConfirm}>
-              {pwBusy ? "Saving..." : "Change Password"}
-            </button>
-            {pwMessage && <p className="message">{pwMessage}</p>}
-            {pwError && <p className="message error">{pwError}</p>}
-          </form>
-        </section>
+            <form className="form-stack" onSubmit={handleRunPipeline}>
+              <div
+                className={`drop-zone ${pipelineDragActive ? "drag-active" : ""} ${benchmarkFile ? "has-file" : ""}`.trim()}
+                onDragEnter={(event) => {
+                  event.preventDefault();
+                  setPipelineDragActive(true);
+                }}
+                onDragOver={(event) => {
+                  event.preventDefault();
+                  event.dataTransfer.dropEffect = "copy";
+                  setPipelineDragActive(true);
+                }}
+                onDragLeave={(event) => {
+                  event.preventDefault();
+                  setPipelineDragActive(false);
+                }}
+                onDrop={(event) => {
+                  event.preventDefault();
+                  setPipelineDragActive(false);
+                  selectPipelineFile(event.dataTransfer.files?.[0] ?? null);
+                }}
+              >
+                <input
+                  id="pipeline-file"
+                  className="drop-input"
+                  type="file"
+                  accept="audio/*,video/*"
+                  onChange={(event) => selectPipelineFile(event.target.files?.[0] ?? null)}
+                />
+                <label htmlFor="pipeline-file" className="drop-label">
+                  <strong>{benchmarkFile ? benchmarkFile.name : "Drop audio or video here"}</strong>
+                  <span className="hint">
+                    {benchmarkFile ? `${formatBytes(benchmarkFile.size)} · click to replace` : "or click to choose a file"}
+                  </span>
+                </label>
+              </div>
 
-        <section className="panel stack">
-          <p className="eyebrow">API Keys</p>
-          <h2>Public API Access</h2>
-          <p className="section-copy">
-            While no key exists, <code>POST /transcribe/</code> is open to everyone. As soon as one key exists, callers
-            must send a valid <code>X-API-Key</code> header. Usage (processed audio seconds) is tracked per key.
-          </p>
+              <div className="form-grid">
+                <label>
+                  <span>Mode</span>
+                  <select
+                    value={pipelineMode}
+                    onChange={(event) => {
+                      setPipelineMode(event.target.value as AudioProcessMode);
+                      setPipelineError("");
+                      setPipelineResult(null);
+                    }}
+                  >
+                    {PIPELINE_MODES.map((mode) => (
+                      <option key={mode.value} value={mode.value}>{mode.label}</option>
+                    ))}
+                  </select>
+                  <span className="hint">{PIPELINE_MODES.find((entry) => entry.value === pipelineMode)?.description}</span>
+                </label>
 
-          {createdKey && (
-            <div className="key-token-card">
-              <div className="key-card-head">
-                <div>
-                  <strong>{createdKey.alias}</strong>
-                  <p>Copy this key now — it is shown only once.</p>
-                </div>
-                <button type="button" className="secondary-button" onClick={() => void handleCopyCreatedKey()}>
-                  Copy
+                <label>
+                  <span>Client API key (optional)</span>
+                  <input
+                    type="password"
+                    autoComplete="off"
+                    value={pipelineApiKey}
+                    onChange={(event) => setPipelineApiKey(event.target.value)}
+                    placeholder="Empty: use your login"
+                  />
+                  <span className="hint">Sent as Authorization: Bearer. A wrong key fails even while you are logged in.</span>
+                </label>
+
+                {pipelineMode === "diarization" && (
+                  <>
+                    <label>
+                      <span>Expected speakers (optional)</span>
+                      <input
+                        type="number"
+                        min={1}
+                        max={64}
+                        step={1}
+                        value={pipelineExpectedSpeakers}
+                        onChange={(event) => setPipelineExpectedSpeakers(event.target.value)}
+                        placeholder="Automatic"
+                      />
+                    </label>
+
+                    <label>
+                      <span>Speaker refinement</span>
+                      <select
+                        value={pipelineSpeakerRefinement}
+                        onChange={(event) => setPipelineSpeakerRefinement(event.target.value as SpeakerRefinementMode)}
+                      >
+                        <option value="off">Off (existing behavior)</option>
+                        <option value="shadow">Shadow (diagnostics only)</option>
+                        <option value="conservative">Conservative (apply safe changes)</option>
+                      </select>
+                      <span className="hint">
+                        Shadow reports proposed label corrections without changing the transcript. Conservative applies
+                        only changes that pass all safety checks and otherwise rolls back the whole refinement pass.
+                      </span>
+                    </label>
+
+                    <CheckField
+                      label="Include playable MP3 samples for unknown and unresolved speakers"
+                      checked={pipelineUnknownSpeakerAudio}
+                      onChange={setPipelineUnknownSpeakerAudio}
+                    />
+
+                    <label className="span-2">
+                      <span>Known speakers (JSON array)</span>
+                      <textarea
+                        className="mono"
+                        value={pipelineKnownSpeakers}
+                        onChange={(event) => setPipelineKnownSpeakers(event.target.value)}
+                        spellCheck={false}
+                        placeholder={'[{"id":"person-17","embeddings":[[/* 192 values */]]}]'}
+                      />
+                      <span className="hint">
+                        Each id must be unique. Every profile needs one or more finite, non-zero 192-D ReDimNet2
+                        embeddings. Leave the array empty when no known profiles are available.
+                      </span>
+                    </label>
+                  </>
+                )}
+              </div>
+
+              {pipelineError && <div className="banner danger" role="alert">{pipelineError}</div>}
+
+              <div className="form-actions button-row">
+                <button type="submit" disabled={pipelineBusy || !benchmarkFile} aria-busy={pipelineBusy || undefined}>
+                  {pipelineBusy ? "Processing…" : "Run"}
                 </button>
               </div>
-              <div className="key-token-value mono">{createdKey.token}</div>
-            </div>
-          )}
+            </form>
 
-          <form className="benchmark-form" onSubmit={handleCreateApiKey}>
-            <label className="full-width">
-              <span>Alias</span>
-              <input
-                value={newKeyAlias}
-                onChange={(event) => setNewKeyAlias(event.target.value)}
-                placeholder="e.g. Key fuer Projekt X"
-              />
-            </label>
-            <div className="form-actions full-width">
-              <button type="submit" disabled={apiKeyBusy || !newKeyAlias.trim()}>
-                {apiKeyBusy ? "Creating..." : "Create API Key"}
-              </button>
-            </div>
-          </form>
+            {pipelineResult && (
+              <div className="result-stack">
+                <div className="grid grid-auto">
+                  <Card
+                    label="Status"
+                    value={<span className={`badge ${pipelineResult.status === "completed" ? "ok" : "warn"}`}>{pipelineResult.status}</span>}
+                  />
+                  <Card label="Mode" value={PIPELINE_MODES.find((entry) => entry.value === pipelineResult.mode)?.label ?? pipelineResult.mode} />
+                  <Card label="Server total" value={formatMs(pipelineResult.timings_ms.total)} />
+                  <Card label="Client wall time" value={formatMs(pipelineWallTimeMs)} />
+                  <Card label="Audio" value={formatFixed(pipelineResult.audio.duration_ms / 1000, 1, " s")} />
+                  <Card
+                    label="Embedding"
+                    value={resolveEmbeddingDimension(pipelineResult) === null ? DASH : `${resolveEmbeddingDimension(pipelineResult)}-D`}
+                  />
+                  <Card label="Warnings" value={pipelineResult.warnings.length} />
+                </div>
 
-          <div className="table-wrap">
-            <table>
-              <thead>
-                <tr>
-                  <th>Alias</th>
-                  <th>Created</th>
-                  <th>Audio (s)</th>
-                  <th>Requests</th>
-                  <th>Last Used</th>
-                  <th></th>
-                </tr>
-              </thead>
-              <tbody>
-                {apiKeys.length === 0 && (
-                  <tr>
-                    <td colSpan={6}>No API keys — the public API is currently open.</td>
-                  </tr>
+                <div>
+                  <h3>Phase timings</h3>
+                  <dl className="kv-grid">
+                    {Object.entries(pipelineResult.timings_ms).map(([phase, duration]) => (
+                      <div key={phase}>
+                        <dt>{phase.replace(/_/g, " ")}</dt>
+                        <dd>{formatMs(duration)}</dd>
+                      </div>
+                    ))}
+                  </dl>
+                </div>
+
+                <div>
+                  <h3>Models</h3>
+                  {Object.keys(pipelineResult.models).length === 0 ? (
+                    <p className="dim">No model metadata returned.</p>
+                  ) : (
+                    <dl className="kv-grid">
+                      {Object.entries(pipelineResult.models).map(([role, model]) => (
+                        <div key={role}>
+                          <dt>{role}</dt>
+                          <dd className="mono">{describeModel(model)}</dd>
+                        </div>
+                      ))}
+                    </dl>
+                  )}
+                </div>
+
+                {pipelineResult.result.speaker_counts && (
+                  <div>
+                    <h3>Speakers</h3>
+                    <dl className="kv-grid">
+                      {Object.entries(pipelineResult.result.speaker_counts).map(([label, value]) => (
+                        <div key={label}>
+                          <dt>{label.replace(/_/g, " ")}</dt>
+                          <dd>{value ?? "auto"}</dd>
+                        </div>
+                      ))}
+                    </dl>
+                  </div>
                 )}
-                {apiKeys.map((key) => (
-                  <tr key={key.id}>
-                    <td>{key.alias}</td>
-                    <td>{formatDateTime(key.created_at)}</td>
-                    <td>{formatFixed(key.usage.total_seconds_processed, 1)}</td>
-                    <td>{key.usage.request_count}</td>
-                    <td>{formatDateTime(key.usage.last_used_at)}</td>
-                    <td>
+
+                {[
+                  ...(pipelineResult.result.unknown_speakers ?? []),
+                  ...(pipelineResult.result.unresolved_speakers ?? []),
+                ].some((speaker) => speaker.audio) && (
+                  <div>
+                    <h3>Unknown-speaker MP3 samples</h3>
+                    <div className="speaker-audio-grid">
+                      {[
+                        ...(pipelineResult.result.unknown_speakers ?? []),
+                        ...(pipelineResult.result.unresolved_speakers ?? []),
+                      ].filter((speaker) => speaker.audio).map((speaker) => (
+                        <article className="card" key={`${speaker.speaker_kind}-${speaker.diarization_speaker_id}`}>
+                          <span className="card-label">{speaker.speaker_kind}</span>
+                          <strong>{speaker.speaker_id}</strong>
+                          <span className="hint">
+                            Original label: {speaker.diarization_speaker_id} ·{" "}
+                            {formatFixed((speaker.audio?.duration_ms ?? 0) / 1000, 1, " s")} ·{" "}
+                            {speaker.audio?.snippets.length ?? 0} snippets
+                          </span>
+                          {speaker.audio && (
+                            <audio controls preload="none" src={speakerAudioSource(speaker.audio)}>
+                              Your browser does not support embedded MP3 playback.
+                            </audio>
+                          )}
+                        </article>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {pipelineResult.result.speaker_refinement && (
+                  <div>
+                    <h3>Speaker refinement</h3>
+                    <dl className="kv-grid">
+                      <div><dt>Mode</dt><dd>{pipelineResult.result.speaker_refinement.mode}</dd></div>
+                      <div><dt>Status</dt><dd>{pipelineResult.result.speaker_refinement.status.replace(/_/g, " ")}</dd></div>
+                      <div><dt>Eligible windows</dt><dd>{pipelineResult.result.speaker_refinement.eligible_windows}</dd></div>
+                      <div><dt>Proposed turns</dt><dd>{pipelineResult.result.speaker_refinement.proposed_turns}</dd></div>
+                      <div><dt>Applied turns</dt><dd>{pipelineResult.result.speaker_refinement.applied_turns}</dd></div>
+                      <div>
+                        <dt>Reassigned audio</dt>
+                        <dd>{formatFixed(pipelineResult.result.speaker_refinement.reassigned_duration_ms / 1000, 1, " s")}</dd>
+                      </div>
+                      <div><dt>Processing time</dt><dd>{formatMs(pipelineResult.result.speaker_refinement.processing_ms)}</dd></div>
+                      <div><dt>Rollback</dt><dd>{pipelineResult.result.speaker_refinement.rollback_reason ?? "None"}</dd></div>
+                    </dl>
+
+                    {pipelineResult.result.speaker_refinement.changes.length > 0 && (
+                      <div className="table-wrap">
+                        <table>
+                          <thead>
+                            <tr>
+                              <th>Time</th>
+                              <th>Speaker label</th>
+                              <th>Support</th>
+                              <th>Similarity evidence</th>
+                              <th>Outcome</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {pipelineResult.result.speaker_refinement.changes.map((change) => (
+                              <tr key={`${change.turn_index}-${change.start_ms}-${change.end_ms}`}>
+                                <td className="mono nowrap">
+                                  {formatTimecode(change.start_ms)}–{formatTimecode(change.end_ms)}
+                                </td>
+                                <td>
+                                  <strong>{change.from_speaker_id}</strong>
+                                  <span className="cell-sub">→ {change.to_speaker_id}</span>
+                                </td>
+                                <td>
+                                  <strong>
+                                    {change.supporting_windows} windows · {formatFixed(change.evidence_duration_ms / 1000, 1, " s")}
+                                  </strong>
+                                  <span className="cell-sub">
+                                    {formatFixed(change.evidence_coverage * 100, 1, "%")} coverage ·{" "}
+                                    {formatFixed(change.weighted_vote_share * 100, 1, "%")} vote
+                                  </span>
+                                </td>
+                                <td className="mono">
+                                  <strong>target {formatFixed(change.target_cosine, 3)} · own {formatFixed(change.own_cosine, 3)}</strong>
+                                  <span className="cell-sub">
+                                    gain {formatFixed(change.similarity_gain, 3)} · runner-up {formatFixed(change.runner_up_margin, 3)}
+                                  </span>
+                                </td>
+                                <td>
+                                  <span className={`badge ${change.applied ? "ok" : "plain"}`}>{change.applied ? "Applied" : "Proposed"}</span>
+                                  {change.short_turn_exception && <span className="cell-sub">short-turn exception</span>}
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    )}
+                    {pipelineResult.result.speaker_refinement.changes_truncated && (
+                      <p className="hint">Only the first 100 refinement changes are shown.</p>
+                    )}
+                  </div>
+                )}
+
+                {pipelineResult.result.transcript && (
+                  <div>
+                    <h3>
+                      Transcript
+                      {pipelineResult.result.transcript.segments
+                        ? ` · ${pipelineResult.result.transcript.segments.length} speaker segments`
+                        : ""}
+                    </h3>
+                    <pre className="transcript">{pipelineResult.result.transcript.text || "No transcript available."}</pre>
+                  </div>
+                )}
+
+                {pipelineResult.result.transcript?.segments && pipelineResult.result.transcript.segments.length > 0 && (
+                  <div>
+                    <h3>Speaker turns</h3>
+                    <div className="table-wrap">
+                      <table>
+                        <thead>
+                          <tr>
+                            <th>Time</th>
+                            <th>Speaker</th>
+                            <th>Kind</th>
+                            <th>Overlap</th>
+                            <th>Text</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {pipelineResult.result.transcript.segments.map((segment, index) => (
+                            <tr key={`${segment.start_ms}-${segment.end_ms}-${index}`}>
+                              <td className="mono nowrap">{formatTimecode(segment.start_ms)}–{formatTimecode(segment.end_ms)}</td>
+                              <td>
+                                <strong>{segment.speaker_id}</strong>
+                                <span className="cell-sub">Original label: {segment.diarization_speaker_id}</span>
+                                {segment.refined_diarization_speaker_id && (
+                                  <span
+                                    className={`cell-sub ${
+                                      segment.refined_diarization_speaker_id !== segment.diarization_speaker_id ? "refined" : ""
+                                    }`}
+                                  >
+                                    Refined label: {segment.refined_diarization_speaker_id}
+                                  </span>
+                                )}
+                              </td>
+                              <td>{segment.speaker_kind}</td>
+                              <td>{segment.overlap ? "Yes" : "No"}</td>
+                              <td className="text-cell">{segment.text}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                )}
+
+                {pipelineResult.warnings.length > 0 && (
+                  <div className="banner warn">
+                    <div>
+                      <strong>Warnings</strong>
+                      <ul className="plain-list">
+                        {pipelineResult.warnings.map((warning, index) => (
+                          <li key={index}>{typeof warning === "string" ? warning : JSON.stringify(warning)}</li>
+                        ))}
+                      </ul>
+                    </div>
+                  </div>
+                )}
+
+                <details onToggle={(event) => setPipelineJsonExpanded(event.currentTarget.open)}>
+                  <summary className="dim">Full JSON response · request {pipelineResult.request_id}</summary>
+                  {pipelineJsonExpanded && <pre>{JSON.stringify(pipelineResult, null, 2)}</pre>}
+                </details>
+              </div>
+            )}
+          </section>
+        )}
+
+        {/* ------------------------------------------------------------------------------ Models */}
+        {tab === "models" && (
+          <>
+            <section className="panel" aria-labelledby="picker-title">
+              <div className="panel-head">
+                <h2 id="picker-title">Active model</h2>
+                <span className="dim">Loaded: <strong>{loadedModelLabel}</strong>{loadedModelId ? ` · ${loadedModelSub}` : ""}</span>
+                <p className="hint">
+                  The service runs one ASR model. Load switches it right away and brings that model's saved settings
+                  along; presets and settings in the Settings tab always belong to the active model.
+                </p>
+              </div>
+              <ModelPicker
+                models={managedModels}
+                locked={modelSelectRunning || saveBusy}
+                selectingModelId={selectingModelId}
+                startingDownloadId={modelActionKind === "download" ? modelActionId : null}
+                onLoad={(model) => void handleSelectModel(model)}
+                onDownload={(model) => void handleDownloadModel(model)}
+              />
+            </section>
+
+            <section className="panel" aria-labelledby="cache-title">
+              <div className="panel-head">
+                <h2 id="cache-title">Model cache</h2>
+                <button
+                  type="button"
+                  className="secondary-button"
+                  onClick={() => void handleRefreshModels()}
+                  disabled={modelActionId === "__refresh__"}
+                  aria-busy={modelActionId === "__refresh__" || undefined}
+                >
+                  {modelActionId === "__refresh__" ? "Refreshing…" : "Refresh"}
+                </button>
+                <p className="hint">
+                  Downloads and deletes use the saved cache path <span className="mono">{savedCachePath || "(default Hugging Face cache)"}</span>.
+                  Sizes on disk are measured; the others are estimates. The active model cannot be deleted; load another one first.
+                </p>
+              </div>
+
+              <div className="table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Model</th>
+                      <th>Backend</th>
+                      <th className="num">Size</th>
+                      <th>Status</th>
+                      <th>Path</th>
+                      <th className="actions"><span className="sr-only">Actions</span></th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {managedModels.length === 0 && (
+                      <tr>
+                        <td colSpan={6} className="empty">No model list yet. Use Refresh, or check the cache path in Settings.</td>
+                      </tr>
+                    )}
+                    {managedModels.map((model) => {
+                      const rowBusy = modelActionId === model.id;
+                      const isDownloading = model.status === "downloading";
+                      const canDelete = Boolean(model.cache_path) && !model.active && !modelSelectRunning;
+                      const status = modelStatusBadge(model.status);
+                      return (
+                        <tr key={model.id}>
+                          <td>
+                            <strong>{model.label}</strong>
+                            {model.active && <> <span className="badge accent">Active</span></>}
+                            <span className="cell-sub mono">{model.id}</span>
+                          </td>
+                          <td className="nowrap">{formatBackendLabel(model.backend)}</td>
+                          <td className="num nowrap">{formatModelSize(model)}</td>
+                          <td>
+                            <span className={`badge ${status.tone}`}>{status.text}</span>
+                            {model.error && <span className="cell-sub field-error">{model.error}</span>}
+                          </td>
+                          <td className="path-cell"><span className="mono">{resolveModelPath(model)}</span></td>
+                          <td className="actions">
+                            <button
+                              type="button"
+                              className="secondary-button"
+                              onClick={() => void handleDownloadModel(model)}
+                              disabled={isDownloading || rowBusy}
+                              aria-busy={isDownloading || (rowBusy && modelActionKind === "download") || undefined}
+                            >
+                              {isDownloading
+                                ? "Downloading…"
+                                : rowBusy && modelActionKind === "download"
+                                  ? "Starting…"
+                                  : model.status === "ready"
+                                    ? "Download again"
+                                    : "Download"}
+                            </button>
+                            <button
+                              type="button"
+                              className="danger-button"
+                              onClick={() => void handleDeleteModel(model)}
+                              disabled={!canDelete || isDownloading || rowBusy}
+                              aria-busy={(rowBusy && modelActionKind === "delete") || undefined}
+                              title={model.active ? "The active model cannot be deleted." : undefined}
+                            >
+                              {rowBusy && modelActionKind === "delete" ? "Deleting…" : "Delete"}
+                            </button>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </section>
+          </>
+        )}
+
+        {/* ------------------------------------------------------------------------------ Settings */}
+        {tab === "settings" && (
+          <form className="settings-page" onSubmit={handleSaveSettings}>
+            {settingsError && (
+              <div className="banner danger" role="alert">
+                <span>Could not load the settings: {settingsError}</span>
+                <button type="button" className="secondary-button small-button" onClick={() => void loadSettings()}>Retry</button>
+              </div>
+            )}
+            {!settingsLoaded && !settingsError && <div className="state"><span className="spinner" />Loading settings…</div>}
+
+            {settingsLoaded && (
+              <fieldset className="settings-lock" disabled={modelSelectRunning}>
+                <section className="panel" aria-labelledby="presets-title">
+                  <div className="panel-head">
+                    <h2 id="presets-title">Presets</h2>
+                    <p className="hint">
+                      Only presets of the active model ({activeModelOption?.label ?? DASH}) are listed. Built-in presets
+                      exist for Cohere Transcribe (by GPU memory) and Parakeet; Whisper models have none. Loading fills the
+                      form below; Save changes applies it. A preset stores model, device, precision, batching and VRAM
+                      settings only, never the cache path, the language or the Hugging Face token.
+                    </p>
+                  </div>
+                  <div className="form-grid">
+                    <label>
+                      <span>Preset</span>
+                      <select value={selectedPreset ? presetSelected : ""} onChange={(event) => setPresetSelected(event.target.value)}>
+                        <option value="">Choose a preset…</option>
+                        {modelPresets.map((preset) => (
+                          <option key={preset.name} value={preset.name}>
+                            {preset.built_in ? `${preset.name} (built-in)` : preset.name}
+                          </option>
+                        ))}
+                      </select>
+                      {selectedPreset?.description && <span className="hint">{selectedPreset.description}</span>}
+                      {selectedPreset?.note && <span className="field-error">{selectedPreset.note}</span>}
+                    </label>
+                    <div className="button-row align-end">
                       <button
                         type="button"
-                        className="ghost-button danger-button"
-                        onClick={() => void handleDeleteApiKey(key.id, key.alias)}
+                        className="secondary-button"
+                        onClick={handleLoadPreset}
+                        disabled={!selectedPreset || presetBusy || saveBusy}
+                      >
+                        Load into form
+                      </button>
+                      <button
+                        type="button"
+                        className="danger-button"
+                        onClick={() => void handleDeletePreset()}
+                        disabled={!selectedPreset || selectedPreset.built_in || presetBusy}
                       >
                         Delete
                       </button>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </section>
-
-        </div>
-      </section>
-
-      <section className="panel stack pipeline-tester">
-        <div className="pipeline-heading">
-          <div>
-            <p className="eyebrow">API v2 Pipeline Tester</p>
-            <h2>Process Audio in Any Production Mode</h2>
-            <p className="section-copy">
-              Drop one file, choose a mode, and inspect the complete response from <code>POST /v2/audio/process</code>.
-            </p>
-          </div>
-          <span className="pipeline-mode-pill">
-            {PIPELINE_MODES.find((entry) => entry.value === pipelineMode)?.label}
-          </span>
-        </div>
-
-        <form className="pipeline-form" onSubmit={handleRunPipeline}>
-          <div
-            className={`pipeline-drop-zone ${pipelineDragActive ? "drag-active" : ""} ${benchmarkFile ? "has-file" : ""}`.trim()}
-            onDragEnter={(event) => {
-              event.preventDefault();
-              setPipelineDragActive(true);
-            }}
-            onDragOver={(event) => {
-              event.preventDefault();
-              event.dataTransfer.dropEffect = "copy";
-              setPipelineDragActive(true);
-            }}
-            onDragLeave={(event) => {
-              event.preventDefault();
-              setPipelineDragActive(false);
-            }}
-            onDrop={(event) => {
-              event.preventDefault();
-              setPipelineDragActive(false);
-              selectPipelineFile(event.dataTransfer.files?.[0] ?? null);
-            }}
-          >
-            <input
-              id="pipeline-file"
-              className="pipeline-file-input"
-              type="file"
-              accept="audio/*,video/*"
-              onChange={(event) => selectPipelineFile(event.target.files?.[0] ?? null)}
-            />
-            <label htmlFor="pipeline-file" className="pipeline-drop-label">
-              <strong>{benchmarkFile ? benchmarkFile.name : "Drop audio or video here"}</strong>
-              <span>
-                {benchmarkFile
-                  ? `${formatFixed(benchmarkFile.size / 1024 / 1024, 2, " MiB")} · click to replace`
-                  : "or click to choose a file"}
-              </span>
-            </label>
-          </div>
-
-          <div className="pipeline-control-grid">
-            <label>
-              <span>Processing Mode</span>
-              <select
-                value={pipelineMode}
-                onChange={(event) => {
-                  setPipelineMode(event.target.value as AudioProcessMode);
-                  setPipelineMessage("");
-                  setPipelineResult(null);
-                }}
-              >
-                {PIPELINE_MODES.map((mode) => (
-                  <option key={mode.value} value={mode.value}>{mode.label}</option>
-                ))}
-              </select>
-            </label>
-
-            <label>
-              <span>Whisper API Key (optional)</span>
-              <input
-                type="password"
-                autoComplete="off"
-                value={pipelineApiKey}
-                onChange={(event) => setPipelineApiKey(event.target.value)}
-                placeholder="Optional credential override; admin session is used otherwise"
-              />
-            </label>
-          </div>
-
-          <p className="pipeline-mode-description">
-            {PIPELINE_MODES.find((entry) => entry.value === pipelineMode)?.description}
-          </p>
-
-          {pipelineMode === "diarization" && (
-            <div className="pipeline-diarization-fields">
-              <label>
-                <span>Expected Speakers (optional)</span>
-                <input
-                  type="number"
-                  min={1}
-                  max={64}
-                  step={1}
-                  value={pipelineExpectedSpeakers}
-                  onChange={(event) => setPipelineExpectedSpeakers(event.target.value)}
-                  placeholder="Automatic"
-                />
-              </label>
-
-              <label>
-                <span>Speaker Refinement</span>
-                <select
-                  value={pipelineSpeakerRefinement}
-                  onChange={(event) => setPipelineSpeakerRefinement(event.target.value as SpeakerRefinementMode)}
-                >
-                  <option value="off">Off (existing behavior)</option>
-                  <option value="shadow">Shadow (diagnostics only)</option>
-                  <option value="conservative">Conservative (apply safe changes)</option>
-                </select>
-              </label>
-
-              <p className="field-note pipeline-json-note">
-                Shadow reports proposed label corrections without changing the transcript. Conservative applies
-                only changes that pass all safety checks and otherwise rolls back the full refinement pass.
-              </p>
-
-              <label className="pipeline-checkbox pipeline-json-field">
-                <input
-                  type="checkbox"
-                  checked={pipelineUnknownSpeakerAudio}
-                  onChange={(event) => setPipelineUnknownSpeakerAudio(event.target.checked)}
-                />
-                <span>Include playable MP3 samples for unknown and unresolved speakers</span>
-              </label>
-
-              <label className="pipeline-json-field">
-                <span>Known Speakers (JSON array)</span>
-                <textarea
-                  value={pipelineKnownSpeakers}
-                  onChange={(event) => setPipelineKnownSpeakers(event.target.value)}
-                  spellCheck={false}
-                  placeholder={'[{"id":"person-17","embeddings":[[/* 192 values */]]}]'}
-                />
-              </label>
-              <p className="field-note pipeline-json-note">
-                Each id must be unique. Every profile needs one or more finite, non-zero 192-D ReDimNet2 embeddings.
-                Leave the array empty when no known profiles are available.
-              </p>
-            </div>
-          )}
-
-          <div className="form-actions">
-            <button type="submit" disabled={pipelineBusy || !benchmarkFile}>
-              {pipelineBusy ? "Processing..." : "Run v2 Pipeline"}
-            </button>
-            {pipelineMessage && (
-              <p className={`message ${pipelineResult ? "" : "error"}`.trim()}>{pipelineMessage}</p>
-            )}
-          </div>
-        </form>
-
-        {pipelineResult && (
-          <div className="pipeline-results">
-            <div className="pipeline-summary-grid">
-              <article className="benchmark-card">
-                <span>Status</span>
-                <strong className={`pipeline-status ${pipelineResult.status}`}>{pipelineResult.status}</strong>
-              </article>
-              <article className="benchmark-card">
-                <span>Mode</span>
-                <strong>{PIPELINE_MODES.find((entry) => entry.value === pipelineResult.mode)?.label ?? pipelineResult.mode}</strong>
-              </article>
-              <article className="benchmark-card">
-                <span>Server Total</span>
-                <strong>{formatValue(pipelineResult.timings_ms.total, " ms")}</strong>
-              </article>
-              <article className="benchmark-card">
-                <span>Client Wall Time</span>
-                <strong>{formatValue(pipelineWallTimeMs, " ms")}</strong>
-              </article>
-              <article className="benchmark-card">
-                <span>Audio</span>
-                <strong>{formatFixed(pipelineResult.audio.duration_ms / 1000, 3, " s")}</strong>
-              </article>
-              <article className="benchmark-card">
-                <span>Embedding</span>
-                <strong>{resolveEmbeddingDimension(pipelineResult) === null ? "n/a" : `${resolveEmbeddingDimension(pipelineResult)}-D`}</strong>
-              </article>
-              <article className="benchmark-card">
-                <span>Warnings</span>
-                <strong>{pipelineResult.warnings.length}</strong>
-              </article>
-            </div>
-
-            <div className="pipeline-result-section">
-              <h3>Phase Timings</h3>
-              <div className="pipeline-timing-grid">
-                {Object.entries(pipelineResult.timings_ms).map(([phase, duration]) => (
-                  <div key={phase}>
-                    <span>{phase.replace(/_/g, " ")}</span>
-                    <strong>{formatValue(duration, " ms")}</strong>
-                  </div>
-                ))}
-              </div>
-            </div>
-
-            <div className="pipeline-result-section">
-              <h3>Models</h3>
-              <div className="pipeline-model-grid">
-                {Object.entries(pipelineResult.models).map(([role, model]) => (
-                  <div key={role}>
-                    <span>{role}</span>
-                    <strong>{describeModel(model)}</strong>
-                  </div>
-                ))}
-                {Object.keys(pipelineResult.models).length === 0 && <p className="muted">No model metadata returned.</p>}
-              </div>
-            </div>
-
-            {pipelineResult.result.speaker_counts && (
-              <div className="pipeline-result-section">
-                <h3>Speakers</h3>
-                <div className="pipeline-speaker-grid">
-                  {Object.entries(pipelineResult.result.speaker_counts).map(([label, value]) => (
-                    <div key={label}>
-                      <span>{label.replace(/_/g, " ")}</span>
-                      <strong>{value ?? "auto"}</strong>
                     </div>
-                  ))}
-                </div>
-              </div>
-            )}
+                    <label>
+                      <span>Save the current form as</span>
+                      <input
+                        value={presetSaveName}
+                        maxLength={64}
+                        placeholder="Preset name"
+                        onChange={(event) => setPresetSaveName(event.target.value)}
+                        onKeyDown={(event) => {
+                          if (event.key === "Enter") {
+                            event.preventDefault();
+                            void handleSavePreset();
+                          }
+                        }}
+                      />
+                    </label>
+                    <div className="button-row align-end">
+                      <button
+                        type="button"
+                        className="secondary-button"
+                        onClick={() => void handleSavePreset()}
+                        disabled={!presetSaveName.trim() || presetBusy}
+                        aria-busy={presetBusy || undefined}
+                      >
+                        {presetBusy ? "Saving…" : "Save as preset"}
+                      </button>
+                    </div>
+                  </div>
+                </section>
 
-            {[
-              ...(pipelineResult.result.unknown_speakers ?? []),
-              ...(pipelineResult.result.unresolved_speakers ?? []),
-            ].some((speaker) => speaker.audio) && (
-              <div className="pipeline-result-section">
-                <h3>Unknown-Speaker MP3 Samples</h3>
-                <div className="pipeline-speaker-audio-grid">
-                  {[
-                    ...(pipelineResult.result.unknown_speakers ?? []),
-                    ...(pipelineResult.result.unresolved_speakers ?? []),
-                  ].filter((speaker) => speaker.audio).map((speaker) => (
-                    <article key={`${speaker.speaker_kind}-${speaker.diarization_speaker_id}`}>
-                      <div className="pipeline-speaker-audio-heading">
-                        <div>
-                          <span>{speaker.speaker_kind}</span>
-                          <strong>{speaker.speaker_id}</strong>
-                          <small>Original label: {speaker.diarization_speaker_id}</small>
+                <section className="panel" aria-labelledby="model-settings-title">
+                  <div className="panel-head">
+                    <h2 id="model-settings-title">Model settings</h2>
+                    <p className="hint">Settings of {activeModelOption?.label ?? "the active model"}. Each model keeps its own values.</p>
+                  </div>
+                  <div className="form-grid">
+                    {activeModelFields.includes("local_gpu_device") && (
+                      <label>
+                        <span>Device</span>
+                        <select value={settingsForm.local_gpu_device} onChange={(event) => updateSetting("local_gpu_device", event.target.value)}>
+                          {settingsOptions.devices.map((option) => (
+                            <option key={option.value} value={option.value}>{option.label}</option>
+                          ))}
+                        </select>
+                        <span className="hint">Named like nvidia-smi.</span>
+                      </label>
+                    )}
+                    {activeModelFields.includes("transcription_language") && (
+                      <label>
+                        <span>Language</span>
+                        <select
+                          value={settingsForm.transcription_language}
+                          onChange={(event) => updateSetting("transcription_language", event.target.value)}
+                        >
+                          {settingsOptions.languages.map((option) => (
+                            <option key={option.value} value={option.value}>{option.label}</option>
+                          ))}
+                        </select>
+                      </label>
+                    )}
+                    {activeModelFields.includes("local_model_precision") && (
+                      <label>
+                        <span>Precision</span>
+                        <select
+                          value={settingsForm.local_model_precision}
+                          onChange={(event) => updateSetting("local_model_precision", event.target.value)}
+                        >
+                          {settingsOptions.precisions.map((option) => (
+                            <option key={option.value} value={option.value}>{option.label}</option>
+                          ))}
+                        </select>
+                      </label>
+                    )}
+                    {activeModelFields.includes("batch_wait_time_ms") && (
+                      <NumberField
+                        label="Batch wait time (ms)"
+                        min={0}
+                        value={settingsForm.batch_wait_time_ms}
+                        onChange={(value) => updateSetting("batch_wait_time_ms", value)}
+                        hint="How long the worker waits for more chunks before it starts a batch."
+                      />
+                    )}
+                    {activeModelFields.includes("batch_max_segments") && (
+                      <NumberField
+                        label="Max segments per batch"
+                        min={1}
+                        value={settingsForm.batch_max_segments}
+                        onChange={(value) => updateSetting("batch_max_segments", value)}
+                      />
+                    )}
+                    {activeModelFields.includes("batch_max_audio_seconds") && (
+                      <NumberField
+                        label="Max audio per batch (s)"
+                        min={1}
+                        step="0.5"
+                        value={settingsForm.batch_max_audio_seconds}
+                        onChange={(value) => updateSetting("batch_max_audio_seconds", value)}
+                      />
+                    )}
+                    {activeModelFields.includes("scheduler_long_job_min_chunks") && (
+                      <NumberField
+                        label="Long job from (chunks)"
+                        min={1}
+                        value={settingsForm.scheduler_long_job_min_chunks}
+                        onChange={(value) => updateSetting("scheduler_long_job_min_chunks", value)}
+                      />
+                    )}
+                    {activeModelFields.includes("scheduler_max_parallel_long_jobs") && (
+                      <NumberField
+                        label="Max parallel long jobs"
+                        min={0}
+                        value={settingsForm.scheduler_max_parallel_long_jobs}
+                        onChange={(value) => updateSetting("scheduler_max_parallel_long_jobs", value)}
+                        hint="0 = unlimited."
+                      />
+                    )}
+                    {activeModelFields.includes("redimnet_max_batch_size") && (
+                      <label>
+                        <span>ReDimNet max batch (voice ID)</span>
+                        <select
+                          value={settingsForm.redimnet_max_batch_size}
+                          onChange={(event) => updateSetting("redimnet_max_batch_size", Number(event.target.value))}
+                        >
+                          {[8, 4, 2, 1].map((size) => (
+                            <option key={size} value={size}>{size}</option>
+                          ))}
+                        </select>
+                        <span className="hint">
+                          Largest CUDA batch of 3 s windows for speaker clouds, sentence verification and embeddings.
+                          The reserved VRAM pool grows with it (roughly 0.35 GB per window); larger batches make long
+                          diarizations faster. Applies on save, no restart needed.
+                        </span>
+                      </label>
+                    )}
+                    {activeModelFields.includes("language_detection_model") && (
+                      <label>
+                        <span>Language detection model</span>
+                        <select
+                          value={settingsForm.language_detection_model}
+                          disabled={!settingsForm.cohere_language_detection}
+                          onChange={(event) => updateSetting("language_detection_model", event.target.value)}
+                        >
+                          {(settingsOptions.language_detection_models ?? []).map((option) => (
+                            <option key={option.value} value={option.value}>{option.label}</option>
+                          ))}
+                        </select>
+                        <span className="hint">
+                          Downloaded into the model cache on first use. Base is enough for most audio; Small and Large v3
+                          Turbo are steadier on very short clips for more VRAM. Applies on save, never reloads the ASR model.
+                        </span>
+                      </label>
+                    )}
+                    {activeModelFields.includes("scheduler_first_chunk_fast_path") && (
+                      <CheckField
+                        label="First-chunk fast path"
+                        checked={settingsForm.scheduler_first_chunk_fast_path}
+                        onChange={(value) => updateSetting("scheduler_first_chunk_fast_path", value)}
+                        hint={
+                          'A request that has not been served yet gets its first chunk into a small batch of its own instead of riding along in a full batch of a long recording. Batches are always shared round-robin between active requests; short requests (below "Long job from") never wait for a long-job slot.'
+                        }
+                      />
+                    )}
+                    {activeModelFields.includes("cuda_memory_trim_after_batch") && (
+                      <CheckField
+                        label="Release idle VRAM after batches"
+                        checked={settingsForm.cuda_memory_trim_after_batch}
+                        onChange={(value) => updateSetting("cuda_memory_trim_after_batch", value)}
+                        hint="Releases the CUDA allocator pool once every GPU phase (ASR batches, diarization, embeddings, warmup) has been idle for 5 s, so the idle footprint stays near the model size on a shared GPU. The next request reserves its pool again (a one-off delay of well under a second). Turn it off only on a GPU this service has to itself."
+                      />
+                    )}
+                    {activeModelFields.includes("cohere_language_detection") && (
+                      <CheckField
+                        label="Detect the language (Cohere, language Auto)"
+                        checked={settingsForm.cohere_language_detection}
+                        onChange={(value) => updateSetting("cohere_language_detection", value)}
+                        hint="Cohere cannot detect a language itself. With Auto, a small Whisper model picks one of the 14 Cohere languages per request before transcription: per clip, per ~25 s chunk of a long file, per speaker in diarization. An explicit language (setting or request) always wins. Off, or when the detection model cannot be loaded, Auto transcribes as German."
+                      />
+                    )}
+                    {activeModelFields.includes("cohere_cuda_graphs") && (
+                      <CheckField
+                        label="Cohere CUDA graphs"
+                        checked={settingsForm.cohere_cuda_graphs}
+                        onChange={(value) => updateSetting("cohere_cuda_graphs", value)}
+                        hint="Replays the Cohere encoder and greedy decoder as captured CUDA graphs: short clips run several times faster with identical transcripts, for about 0.5 GB more VRAM (hard cap 1.5 GB) and a few seconds of extra warmup. fp16/bf16 on CUDA only. Takes effect on the next model (re)load."
+                      />
+                    )}
+                  </div>
+                </section>
+
+                <section className="panel" aria-labelledby="service-settings-title">
+                  <div className="panel-head">
+                    <h2 id="service-settings-title">Service-wide settings</h2>
+                    <p className="hint">These apply to the whole service, whichever model is active.</p>
+                  </div>
+                  <div className="form-grid">
+                    {serviceFields.includes("local_model_cache_path") && (
+                      <label className="span-2">
+                        <span>Model cache path</span>
+                        <input
+                          className="mono"
+                          value={settingsForm.local_model_cache_path}
+                          placeholder="Empty: default Hugging Face cache"
+                          onChange={(event) => updateSetting("local_model_cache_path", event.target.value)}
+                        />
+                      </label>
+                    )}
+                    {serviceFields.includes("huggingface_token") && (
+                      <label className="span-2">
+                        <span>Hugging Face token</span>
+                        <div className="input-with-action">
+                          <input
+                            type="password"
+                            autoComplete="new-password"
+                            value={tokenDraft}
+                            disabled={tokenClear}
+                            placeholder={tokenPlaceholder}
+                            onChange={(event) => setTokenDraft(event.target.value)}
+                          />
+                          {(tokenSet || tokenClear) && (
+                            <button
+                              type="button"
+                              className="ghost-button"
+                              onClick={() => {
+                                setTokenDraft("");
+                                setTokenClear((current) => !current);
+                              }}
+                            >
+                              {tokenClear ? "Keep" : "Clear"}
+                            </button>
+                          )}
                         </div>
-                        <div className="pipeline-speaker-audio-meta">
-                          <strong>{formatFixed((speaker.audio?.duration_ms ?? 0) / 1000, 2, " s")}</strong>
-                          <small>{speaker.audio?.snippets.length ?? 0} snippets</small>
-                        </div>
-                      </div>
-                      {speaker.audio && (
-                        <audio controls preload="none" src={speakerAudioSource(speaker.audio)}>
-                          Your browser does not support embedded MP3 playback.
-                        </audio>
-                      )}
-                    </article>
-                  ))}
-                </div>
-              </div>
+                        <span className="hint">
+                          Needed for gated models such as Cohere Transcribe (the default). Accept its license on{" "}
+                          <a href="https://huggingface.co/CohereLabs/cohere-transcribe-03-2026" target="_blank" rel="noreferrer">
+                            Hugging Face
+                          </a>{" "}
+                          with the account that owns the token. The saved token is never shown again; a newly typed one is
+                          also used for downloads before you save.
+                        </span>
+                      </label>
+                    )}
+                    {serviceFields.includes("segmentation_model_path") && (
+                      <label className="span-2">
+                        <span>Segmentation checkpoint (diarization)</span>
+                        <input
+                          className="mono"
+                          type="text"
+                          placeholder="Empty: pyannote segmentation-3.0 from the local Hugging Face cache"
+                          value={settingsForm.segmentation_model_path}
+                          onChange={(event) => updateSetting("segmentation_model_path", event.target.value)}
+                        />
+                        <span className="hint">
+                          Path to a <code>pytorch_model.bin</code> of pyannote segmentation-3.0 (about 6 MB). Empty searches
+                          the model cache; nothing is ever downloaded. Without a usable checkpoint diarization requests
+                          answer 503 MODEL_UNAVAILABLE.
+                        </span>
+                      </label>
+                    )}
+                    {serviceFields.includes("speaker_turns_enabled") && (
+                      <CheckField
+                        label="Offer live speaker turns"
+                        checked={settingsForm.speaker_turns_enabled}
+                        onChange={(value) => updateSetting("speaker_turns_enabled", value)}
+                        hint={
+                          <>
+                            Transcript requests may carry <code>speaker_turns</code> (live speakers in Genesis3). Offered
+                            in <code>/v2/capabilities</code> only while the segmentation checkpoint loads.
+                          </>
+                        }
+                      />
+                    )}
+                    {serviceFields.includes("debug_retain_history_audio") && (
+                      <CheckField
+                        tone="warn"
+                        label="Keep the original audio for history debugging"
+                        checked={settingsForm.debug_retain_history_audio}
+                        onChange={(value) => updateSetting("debug_retain_history_audio", value)}
+                        hint="Sensitive audio data: keeps the byte-identical upload only while its item stays in the visible history. Turning this off deletes every retained recording right after saving."
+                      />
+                    )}
+                  </div>
+                </section>
+              </fieldset>
             )}
 
-            {pipelineResult.result.speaker_refinement && (
-              <div className="pipeline-result-section">
-                <h3>Speaker Refinement</h3>
-                <div className="pipeline-refinement-grid">
-                  <div>
-                    <span>Mode</span>
-                    <strong>{pipelineResult.result.speaker_refinement.mode}</strong>
-                  </div>
-                  <div>
-                    <span>Status</span>
-                    <strong className={`pipeline-refinement-status ${pipelineResult.result.speaker_refinement.status}`}>
-                      {pipelineResult.result.speaker_refinement.status.replace(/_/g, " ")}
-                    </strong>
-                  </div>
-                  <div>
-                    <span>Eligible Windows</span>
-                    <strong>{pipelineResult.result.speaker_refinement.eligible_windows}</strong>
-                  </div>
-                  <div>
-                    <span>Proposed Turns</span>
-                    <strong>{pipelineResult.result.speaker_refinement.proposed_turns}</strong>
-                  </div>
-                  <div>
-                    <span>Applied Turns</span>
-                    <strong>{pipelineResult.result.speaker_refinement.applied_turns}</strong>
-                  </div>
-                  <div>
-                    <span>Reassigned Audio</span>
-                    <strong>
-                      {formatFixed(pipelineResult.result.speaker_refinement.reassigned_duration_ms / 1000, 3, " s")}
-                    </strong>
-                  </div>
-                  <div>
-                    <span>Processing Time</span>
-                    <strong>{formatValue(pipelineResult.result.speaker_refinement.processing_ms, " ms")}</strong>
-                  </div>
-                  <div>
-                    <span>Rollback</span>
-                    <strong>{pipelineResult.result.speaker_refinement.rollback_reason ?? "none"}</strong>
-                  </div>
-                </div>
-
-                {pipelineResult.result.speaker_refinement.changes.length > 0 && (
-                  <div className="table-wrap">
-                    <table className="pipeline-refinement-table">
-                      <thead>
-                        <tr>
-                          <th>Time</th>
-                          <th>Speaker Label</th>
-                          <th>Support</th>
-                          <th>Similarity Evidence</th>
-                          <th>Outcome</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {pipelineResult.result.speaker_refinement.changes.map((change) => (
-                          <tr key={`${change.turn_index}-${change.start_ms}-${change.end_ms}`}>
-                            <td className="mono">
-                              {formatTimecode(change.start_ms)}–{formatTimecode(change.end_ms)}
-                            </td>
-                            <td>
-                              <strong>{change.from_speaker_id}</strong>
-                              <small>→ {change.to_speaker_id}</small>
-                            </td>
-                            <td>
-                              <strong>{change.supporting_windows} windows · {formatFixed(change.evidence_duration_ms / 1000, 2, " s")}</strong>
-                              <small>{formatFixed(change.evidence_coverage * 100, 1, "%")} coverage · {formatFixed(change.weighted_vote_share * 100, 1, "%")} vote</small>
-                            </td>
-                            <td className="mono">
-                              <strong>target {formatFixed(change.target_cosine, 3)} · own {formatFixed(change.own_cosine, 3)}</strong>
-                              <small>gain {formatFixed(change.similarity_gain, 3)} · runner-up {formatFixed(change.runner_up_margin, 3)}</small>
-                            </td>
-                            <td>
-                              <strong>{change.applied ? "applied" : "proposed"}</strong>
-                              {change.short_turn_exception && <small>short-turn exception</small>}
-                            </td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
-                )}
-
-                {pipelineResult.result.speaker_refinement.changes_truncated && (
-                  <p className="field-note">Only the first 100 refinement changes are shown.</p>
-                )}
-              </div>
-            )}
-
-            {pipelineResult.result.transcript && (
-              <div className="benchmark-transcript-wrap">
-                <span className="benchmark-transcript-label">
-                  Transcript
-                  {pipelineResult.result.transcript.segments
-                    ? ` · ${pipelineResult.result.transcript.segments.length} speaker segments`
-                    : ""}
+            {settingsLoaded && (
+              <div className={`save-bar ${dirtyCount > 0 ? "dirty" : ""}`} role="region" aria-label="Save settings">
+                <span className="save-bar-status">
+                  {dirtyCount > 0
+                    ? `${dirtyCount} unsaved change${dirtyCount === 1 ? "" : "s"}${invalidKeys.length ? ` · ${invalidKeys.length} invalid` : ""}`
+                    : "All changes saved"}
                 </span>
-                <pre className="benchmark-transcript">
-                  {pipelineResult.result.transcript.text || "No transcript available."}
-                </pre>
-              </div>
-            )}
-
-            {pipelineResult.result.transcript?.segments && pipelineResult.result.transcript.segments.length > 0 && (
-              <div className="pipeline-result-section">
-                <h3>Speaker Turns</h3>
-                <div className="table-wrap">
-                  <table className="pipeline-segment-table">
-                    <thead>
-                      <tr>
-                        <th>Time</th>
-                        <th>Speaker</th>
-                        <th>Kind</th>
-                        <th>Overlap</th>
-                        <th>Text</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {pipelineResult.result.transcript.segments.map((segment, index) => (
-                        <tr key={`${segment.start_ms}-${segment.end_ms}-${index}`}>
-                          <td className="mono">{formatTimecode(segment.start_ms)}–{formatTimecode(segment.end_ms)}</td>
-                          <td>
-                            <strong>{segment.speaker_id}</strong>
-                            <small>Original label: {segment.diarization_speaker_id}</small>
-                            {segment.refined_diarization_speaker_id && (
-                              <small
-                                className={
-                                  segment.refined_diarization_speaker_id !== segment.diarization_speaker_id
-                                    ? "refined-speaker-label"
-                                    : ""
-                                }
-                              >
-                                Refined label: {segment.refined_diarization_speaker_id}
-                              </small>
-                            )}
-                          </td>
-                          <td>{segment.speaker_kind}</td>
-                          <td>{segment.overlap ? "yes" : "no"}</td>
-                          <td>{segment.text}</td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
+                <div className="button-row">
+                  <button type="button" className="ghost-button" onClick={handleDiscardSettings} disabled={dirtyCount === 0 || saveBusy}>
+                    Discard
+                  </button>
+                  <button type="button" className="secondary-button" onClick={() => void handleReloadSettings()} disabled={saveBusy}>
+                    Reload
+                  </button>
+                  <button
+                    type="submit"
+                    disabled={saveBusy || modelSelectRunning || dirtyCount === 0 || invalidKeys.length > 0}
+                    aria-busy={saveBusy || undefined}
+                  >
+                    {saveBusy ? "Saving…" : "Save changes"}
+                  </button>
                 </div>
               </div>
             )}
-
-            {pipelineResult.warnings.length > 0 && (
-              <div className="pipeline-warnings">
-                <strong>Warnings</strong>
-                <ul>
-                  {pipelineResult.warnings.map((warning, index) => (
-                    <li key={index}>{typeof warning === "string" ? warning : JSON.stringify(warning)}</li>
-                  ))}
-                </ul>
-              </div>
-            )}
-
-            <details
-              className="pipeline-json-response"
-              onToggle={(event) => setPipelineJsonExpanded(event.currentTarget.open)}
-            >
-              <summary>Full JSON response · request {pipelineResult.request_id}</summary>
-              {pipelineJsonExpanded && <pre>{JSON.stringify(pipelineResult, null, 2)}</pre>}
-            </details>
-          </div>
+          </form>
         )}
 
-        <details className="legacy-benchmark">
-          <summary>Parallel ASR benchmark (repeat / RTF)</summary>
-          <div className="legacy-benchmark-body">
-            <p className="section-copy">
-              Reuse the file above for repeated runs through the active ASR batch and chunk pipeline.
-            </p>
-            <form className="benchmark-form" onSubmit={handleRunBenchmark}>
+        {/* ------------------------------------------------------------------------------ Benchmark */}
+        {tab === "benchmark" && (
+          <section className="panel" aria-labelledby="benchmark-title">
+            <div className="panel-head">
+              <h2 id="benchmark-title">Parallel ASR benchmark</h2>
+              <p className="hint">
+                Runs the file several times in parallel through the active ASR batch and chunk pipeline and reports the
+                realtime factor and the peak VRAM of this process. The file is shared with the Playground.
+              </p>
+            </div>
+            <form className="form-grid" onSubmit={handleRunBenchmark}>
+              <label>
+                <span>Audio or video file</span>
+                <input type="file" accept="audio/*,video/*" onChange={(event) => selectPipelineFile(event.target.files?.[0] ?? null)} />
+                <span className="hint">{benchmarkFile ? `${benchmarkFile.name} · ${formatBytes(benchmarkFile.size)}` : "No file chosen."}</span>
+              </label>
               <label>
                 <span>Repeats (parallel)</span>
                 <input
                   type="number"
                   min={1}
                   max={64}
-                  value={benchmarkRepeatCount}
-                  onChange={(event) => setBenchmarkRepeatCount(Math.max(1, Math.min(64, Number(event.target.value) || 1)))}
+                  step={1}
+                  value={benchmarkRepeatInput}
+                  aria-invalid={benchmarkRepeatInvalid || undefined}
+                  onChange={(event) => setBenchmarkRepeatInput(event.target.value)}
                 />
+                {benchmarkRepeatInvalid ? <span className="field-error">A whole number from 1 to 64.</span> : <span className="hint">1 to 64.</span>}
               </label>
-              <div className="form-actions full-width">
-                <button type="submit" disabled={benchmarkBusy || !benchmarkFile}>
-                  {benchmarkBusy ? "Benchmark running..." : "Run ASR Benchmark"}
+              {benchmarkError && <div className="banner danger span-2" role="alert">{benchmarkError}</div>}
+              <div className="form-actions button-row span-2">
+                <button type="submit" disabled={benchmarkBusy || !benchmarkFile || benchmarkRepeatInvalid} aria-busy={benchmarkBusy || undefined}>
+                  {benchmarkBusy ? "Running…" : "Run benchmark"}
                 </button>
-                {benchmarkMessage && (
-                  <p className={`message ${benchmarkResult ? "" : "error"}`.trim()}>{benchmarkMessage}</p>
-                )}
               </div>
             </form>
 
             {benchmarkResult && (
-              <div className="benchmark-results">
-                <div className="benchmark-grid">
-                  <article className="benchmark-card"><span>Workflow</span><strong>{describeBenchmarkWorkflow(benchmarkResult.workflow)}</strong></article>
-                  <article className="benchmark-card"><span>RTF</span><strong>{formatFixed(benchmarkResult.rtf, 3)}</strong></article>
-                  <article className="benchmark-card"><span>Total Time</span><strong>{formatValue(benchmarkResult.total_wall_time_ms, " ms")}</strong></article>
-                  <article className="benchmark-card"><span>Time / Run</span><strong>{formatFixed(benchmarkResult.avg_wall_time_per_run_ms, 2, " ms")}</strong></article>
-                  <article className="benchmark-card"><span>Chunks / Run</span><strong>{benchmarkResult.chunks_per_run}</strong></article>
-                  <article className="benchmark-card"><span>Total Chunks</span><strong>{benchmarkResult.total_chunks}</strong></article>
-                  <article className="benchmark-card"><span>Audio / Run</span><strong>{formatFixed(benchmarkResult.audio_seconds, 3, " s")}</strong></article>
-                  <article className="benchmark-card"><span>Total Audio</span><strong>{formatFixed(benchmarkResult.total_audio_seconds, 3, " s")}</strong></article>
-                  <article className="benchmark-card"><span>Batches Used</span><strong>{benchmarkResult.batches_used}</strong></article>
-                  <article className="benchmark-card"><span>Peak VRAM</span><strong>{formatVram(benchmarkResult.peak_vram_reserved_mb)}</strong></article>
-                  <article className="benchmark-card"><span>Allocated VRAM</span><strong>{formatVram(benchmarkResult.peak_vram_allocated_mb)}</strong></article>
-                  <article className="benchmark-card"><span>Text Match</span><strong>{benchmarkResult.transcripts_match ? "yes" : "no"}</strong></article>
+              <div className="result-stack">
+                <div className="grid grid-auto">
+                  <Card label="Realtime factor" value={formatRealtimeFactor(benchmarkResult.rtf)} sub="Audio seconds per wall second" />
+                  <Card label="Total time" value={formatMs(benchmarkResult.total_wall_time_ms)} />
+                  <Card label="Time per run" value={formatMs(benchmarkResult.avg_wall_time_per_run_ms)} />
+                  <Card label="Audio per run" value={formatFixed(benchmarkResult.audio_seconds, 1, " s")} />
+                  <Card label="Total audio" value={formatFixed(benchmarkResult.total_audio_seconds, 1, " s")} />
+                  <Card label="Chunks per run" value={formatValue(benchmarkResult.chunks_per_run)} />
+                  <Card label="Total chunks" value={formatValue(benchmarkResult.total_chunks)} />
+                  <Card label="Batches used" value={formatValue(benchmarkResult.batches_used)} />
+                  <Card label="Peak VRAM reserved" value={formatMib(benchmarkResult.peak_vram_reserved_mb)} />
+                  <Card label="Peak VRAM allocated" value={formatMib(benchmarkResult.peak_vram_allocated_mb)} />
+                  <Card
+                    label="Transcripts"
+                    value={<span className={`badge ${benchmarkResult.transcripts_match ? "ok" : "warn"}`}>{benchmarkResult.transcripts_match ? "Identical" : "Differ"}</span>}
+                  />
                 </div>
-                <div className="benchmark-meta">
-                  <div><span>File</span><strong>{benchmarkResult.file_name}</strong></div>
-                  <div><span>Model</span><strong>{benchmarkResult.model_id}</strong></div>
-                  <div><span>Language</span><strong>{benchmarkResult.transcription_language}</strong></div>
-                  <div><span>Repeats</span><strong>{benchmarkResult.repeat_count}</strong></div>
-                </div>
-                <div className="benchmark-transcript-wrap">
-                  <span className="benchmark-transcript-label">Transcript</span>
-                  <pre className="benchmark-transcript">{benchmarkResult.transcript || "No transcript available."}</pre>
+                <dl className="kv-grid">
+                  <div><dt>Workflow</dt><dd>{describeBenchmarkWorkflow(benchmarkResult.workflow)}</dd></div>
+                  <div><dt>File</dt><dd>{benchmarkResult.file_name}</dd></div>
+                  <div><dt>Model</dt><dd className="mono">{benchmarkResult.model_id}</dd></div>
+                  <div><dt>Language</dt><dd>{benchmarkResult.transcription_language}</dd></div>
+                  <div><dt>Repeats</dt><dd>{benchmarkResult.repeat_count}</dd></div>
+                </dl>
+                <div>
+                  <h3>Transcript</h3>
+                  <pre className="transcript">{benchmarkResult.transcript || "No transcript available."}</pre>
                 </div>
               </div>
             )}
-          </div>
-        </details>
-      </section>
+          </section>
+        )}
 
-      <div className="content-grid">
-        <section className="panel">
-          <div className="section-heading">
-            <div>
-              <span className="eyebrow">Settings</span>
-              <h2>ASR Model, Presets, and Settings</h2>
-            </div>
-            <div className="loaded-model">
-              <span>Loaded Model</span>
-              <strong>{loadedModelLabel}</strong>
-              {loadedModelDetails}
-            </div>
-          </div>
-
-          <ModelPicker
-            models={managedModels}
-            locked={modelSelectRunning || saveBusy}
-            selectingModelId={selectingModelId}
-            startingDownloadId={modelActionKind === "download" ? modelActionId : null}
-            message={modelSelectMessage}
-            messageFailed={modelSelectFailed}
-            onLoad={(model) => void handleSelectModel(model)}
-            onDownload={(model) => void handleDownloadModel(model)}
-          />
-
-          <fieldset className="settings-lock" disabled={modelSelectRunning}>
-            <div className="settings-form preset-settings">
-              <div className="full-width">
-                <span className="eyebrow">Step 2: Presets</span>
-                <p className="field-note preset-copy">
-                  Only presets of the active model are listed. Cohere Transcribe has the built-in GPU tiers 32GB VRAM
-                  (RTX 5090) and 24GB VRAM (RTX 4090) with every G3 service on one card, and 24+8 VRAM on the 24 GB
-                  card of a two-GPU box (the GPU is picked by card size). Parakeet has Parakeet 8GB VRAM. Whisper
-                  models have no built-in tier. Loading fills the form below; Save Settings applies it.
-                </p>
-              </div>
-              <label>
-                <span>Preset</span>
-                <select value={selectedPreset ? presetName : ""} onChange={(event) => setPresetName(event.target.value)}>
-                  <option value="">(choose)</option>
-                  {modelPresets.map((preset) => (
-                    <option key={preset.name} value={preset.name}>
-                      {preset.built_in ? `${preset.name} (built-in)` : preset.name}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <label>
-                <span>Save the Current Form As</span>
-                <input
-                  value={presetName}
-                  maxLength={64}
-                  placeholder="preset name"
-                  onChange={(event) => setPresetName(event.target.value)}
-                />
-              </label>
-              {selectedPreset?.description && <p className="field-note full-width">{selectedPreset.description}</p>}
-              {selectedPreset?.note && <p className="message error full-width">{selectedPreset.note}</p>}
-              <p className="field-note full-width">
-                Built-in names cannot be overwritten. A saved preset belongs to the active model. It stores only model,
-                device, precision, batching and VRAM settings; the model cache path, the language, the Hugging Face
-                token are never stored in a preset.
+        {/* ------------------------------------------------------------------------------ History */}
+        {tab === "history" && (
+          <section className="panel" aria-labelledby="history-title">
+            <div className="panel-head">
+              <h2 id="history-title">Latest transcriptions</h2>
+              <p className="hint">
+                The last 25 requests. Transcription and embedding are wall-clock times and include waiting for the queue
+                and the shared GPU lock. Original audio is kept only while "Keep the original audio" is on (Settings).
               </p>
-              <div className="button-row full-width">
-                <button
-                  type="button"
-                  className="secondary-button"
-                  onClick={handleLoadPreset}
-                  disabled={!selectedPreset || presetBusy || saveBusy}
-                >
-                  Load into Form
-                </button>
-                <button
-                  type="button"
-                  className="secondary-button"
-                  onClick={() => void handleSavePreset()}
-                  disabled={!presetName.trim() || selectedPreset?.built_in === true || presetBusy}
-                >
-                  {presetBusy ? "Working..." : "Save as Preset"}
-                </button>
-                <button
-                  type="button"
-                  className="ghost-button danger-button"
-                  onClick={() => void handleDeletePreset()}
-                  disabled={!selectedPreset || selectedPreset.built_in || presetBusy}
-                >
-                  Delete Preset
-                </button>
-              </div>
-              {presetMessage && <p className={`message full-width ${presetFailed ? "error" : ""}`}>{presetMessage}</p>}
             </div>
-
-            <form className="settings-form" onSubmit={handleSaveSettings}>
-              <div className="full-width">
-                <span className="eyebrow">Step 3: Settings</span>
-                <p className="field-note preset-copy">
-                  Settings of {activeModelOption?.label ?? "the active model"}. Each model keeps its own values.
-                </p>
-              </div>
-
-              {activeModelFields.includes("local_gpu_device") && (
-                <label>
-                  <span>Device</span>
-                  <select
-                    value={settingsForm.local_gpu_device}
-                    onChange={(event) => updateSetting("local_gpu_device", event.target.value)}
-                  >
-                    {settingsOptions.devices.map((option) => (
-                      <option key={option.value} value={option.value}>
-                        {option.label}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-              )}
-
-              {activeModelFields.includes("transcription_language") && (
-                <label>
-                  <span>Language</span>
-                  <select
-                    value={settingsForm.transcription_language}
-                    onChange={(event) => updateSetting("transcription_language", event.target.value)}
-                  >
-                    {settingsOptions.languages.map((option) => (
-                      <option key={option.value} value={option.value}>
-                        {option.label}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-              )}
-
-              {activeModelFields.includes("local_model_precision") && (
-                <label>
-                  <span>Precision</span>
-                  <select
-                    value={settingsForm.local_model_precision}
-                    onChange={(event) => updateSetting("local_model_precision", event.target.value)}
-                  >
-                    {settingsOptions.precisions.map((option) => (
-                      <option key={option.value} value={option.value}>
-                        {option.label}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-              )}
-
-              {activeModelFields.includes("batch_wait_time_ms") && (
-                <label>
-                  <span>Wait Time (ms)</span>
-                  <input
-                    type="number"
-                    min={0}
-                    value={settingsForm.batch_wait_time_ms}
-                    onChange={(event) => updateSetting("batch_wait_time_ms", Number(event.target.value))}
-                  />
-                </label>
-              )}
-
-              {activeModelFields.includes("batch_max_segments") && (
-                <label>
-                  <span>Max Segments</span>
-                  <input
-                    type="number"
-                    min={1}
-                    value={settingsForm.batch_max_segments}
-                    onChange={(event) => updateSetting("batch_max_segments", Number(event.target.value))}
-                  />
-                </label>
-              )}
-
-              {activeModelFields.includes("batch_max_audio_seconds") && (
-                <label>
-                  <span>Max Audio (s)</span>
-                  <input
-                    type="number"
-                    min={1}
-                    step="0.5"
-                    value={settingsForm.batch_max_audio_seconds}
-                    onChange={(event) => updateSetting("batch_max_audio_seconds", Number(event.target.value))}
-                  />
-                </label>
-              )}
-
-              {activeModelFields.includes("scheduler_long_job_min_chunks") && (
-                <label>
-                  <span>Long Job Min Chunks</span>
-                  <input
-                    type="number"
-                    min={1}
-                    value={settingsForm.scheduler_long_job_min_chunks}
-                    onChange={(event) => updateSetting("scheduler_long_job_min_chunks", Number(event.target.value))}
-                  />
-                </label>
-              )}
-
-              {activeModelFields.includes("scheduler_max_parallel_long_jobs") && (
-                <label>
-                  <span>Max Parallel Long Jobs (0 = unlimited)</span>
-                  <input
-                    type="number"
-                    min={0}
-                    value={settingsForm.scheduler_max_parallel_long_jobs}
-                    onChange={(event) => updateSetting("scheduler_max_parallel_long_jobs", Number(event.target.value))}
-                  />
-                </label>
-              )}
-
-              {activeModelFields.includes("redimnet_max_batch_size") && (
-                <>
-                  <label className="full-width">
-                    <span>ReDimNet Max Batch (voice ID)</span>
-                    <select
-                      value={settingsForm.redimnet_max_batch_size}
-                      onChange={(event) => updateSetting("redimnet_max_batch_size", Number(event.target.value))}
-                    >
-                      {[8, 4, 2, 1].map((size) => (
-                        <option key={size} value={size}>
-                          {size}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-                  <p className="field-note full-width">
-                    Largest CUDA batch of 3 s windows for speaker clouds, sentence verification and embeddings. The
-                    reserved pool scales with it (RTX 5090: about 2.8 GB at 8, 1.4 GB at 4, 0.75 GB at 2); a 60-min
-                    diarization took 19.6 s at 8 and 23.2 s at 4. Applies on save, no restart needed.
-                  </p>
-                </>
-              )}
-
-              {activeModelFields.includes("scheduler_first_chunk_fast_path") && (
-                <label className="settings-checkbox full-width">
-                  <input
-                    type="checkbox"
-                    checked={settingsForm.scheduler_first_chunk_fast_path}
-                    onChange={(event) => updateSetting("scheduler_first_chunk_fast_path", event.target.checked)}
-                  />
-                  <span>
-                    First-chunk fast path
-                    <small>
-                      A request that has not been served yet gets its first chunk into a small batch of its own instead
-                      of riding along in a full batch of a long recording. Batches are always shared round-robin between
-                      active requests; short requests (below "Long Job Min Chunks") never wait for a long-job slot.
-                    </small>
-                  </span>
-                </label>
-              )}
-
-              {activeModelFields.includes("cuda_memory_trim_after_batch") && (
-                <label className="settings-checkbox full-width">
-                  <input
-                    type="checkbox"
-                    checked={settingsForm.cuda_memory_trim_after_batch}
-                    onChange={(event) => updateSetting("cuda_memory_trim_after_batch", event.target.checked)}
-                  />
-                  <span>
-                    Auto VRAM trim after batch
-                    <small>
-                      Releases the process-wide CUDA allocator pool once every local GPU phase (ASR batches,
-                      diarization, embeddings, startup warmup) has been idle for 5 s, so the idle footprint stays near
-                      the model floor on a shared GPU (RTX 5090: about 6.3 GB). The next request re-reserves its pool
-                      (measured: about +80 ms once for a ReDimNet batch). Disable only on a GPU this server has to itself.
-                    </small>
-                  </span>
-                </label>
-              )}
-
-              {activeModelFields.includes("cohere_language_detection") && (
-                <label className="settings-checkbox full-width">
-                  <input
-                    type="checkbox"
-                    checked={settingsForm.cohere_language_detection}
-                    onChange={(event) => updateSetting("cohere_language_detection", event.target.checked)}
-                  />
-                  <span>
-                    Detect the language (Cohere, language Auto detect)
-                    <small>
-                      Cohere cannot detect a language itself. With Auto detect, a small Whisper model picks one of the
-                      14 Cohere languages per request before transcription: per clip, per ~25 s chunk of a long file,
-                      per speaker in diarization. An explicit language (setting or request) always wins. Off, or when
-                      the detection model cannot be loaded, Auto detect transcribes as German.
-                    </small>
-                  </span>
-                </label>
-              )}
-
-              {activeModelFields.includes("language_detection_model") && (
-                <>
-                  <label className="full-width">
-                    <span>Language detection model</span>
-                    <select
-                      value={settingsForm.language_detection_model}
-                      disabled={!settingsForm.cohere_language_detection}
-                      onChange={(event) => updateSetting("language_detection_model", event.target.value)}
-                    >
-                      {(settingsOptions.language_detection_models ?? []).map((option) => (
-                        <option key={option.value} value={option.value}>
-                          {option.label}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-                  <p className="field-note full-width">
-                    Downloaded into the model cache on first use. Base is enough for most audio; Small and Large v3
-                    Turbo are steadier on very short clips for more VRAM. Applies on save and never reloads the ASR
-                    model.
-                  </p>
-                </>
-              )}
-
-              {activeModelFields.includes("cohere_cuda_graphs") && (
-                <label className="settings-checkbox full-width">
-                  <input
-                    type="checkbox"
-                    checked={settingsForm.cohere_cuda_graphs}
-                    onChange={(event) => updateSetting("cohere_cuda_graphs", event.target.checked)}
-                  />
-                  <span>
-                    Cohere CUDA graphs
-                    <small>
-                      Replays the Cohere encoder and greedy decoder as captured CUDA graphs (measured on an RTX 4090:
-                      2 s clip 270 to 30 ms, 14 s file 0.9 to 0.12 s, identical transcripts) for about +0.55 GB VRAM
-                      (hard cap 1.5 GB) and about 5 s of extra warmup. fp16/bf16 on CUDA only. Takes effect on the next
-                      model (re)load: restart the server or change model, device, precision or cache path.
-                    </small>
-                  </span>
-                </label>
-              )}
-
-              <div className="settings-form preset-settings service-settings full-width">
-                <div className="full-width">
-                  <span className="eyebrow">Service-wide</span>
-                  <p className="field-note preset-copy">
-                    These apply to the whole service, whichever model is active. Save Settings below saves them too.
-                  </p>
-                </div>
-
-                {serviceFields.includes("local_model_cache_path") && (
-                  <label className="full-width">
-                    <span>Cache Path</span>
-                    <input
-                      value={settingsForm.local_model_cache_path}
-                      onChange={(event) => updateSetting("local_model_cache_path", event.target.value)}
-                    />
-                  </label>
-                )}
-
-                {serviceFields.includes("huggingface_token") && (
-                  <>
-                    <label className="full-width">
-                      <span>Hugging Face Token</span>
-                      <input
-                        type="password"
-                        placeholder="hf_... (optional)"
-                        value={settingsForm.huggingface_token}
-                        onChange={(event) => updateSetting("huggingface_token", event.target.value)}
-                      />
-                    </label>
-                    <p className="field-note full-width">
-                      Used for gated ASR models such as Cohere Transcribe (the default model). Accept its license on{" "}
-                      <a href="https://huggingface.co/CohereLabs/cohere-transcribe-03-2026" target="_blank" rel="noreferrer">
-                        Hugging Face
-                      </a>{" "}
-                      with the account that owns this token. Save the settings to persist it; the current typed value is
-                      also sent with manual model downloads.
-                    </p>
-                  </>
-                )}
-
-                {(serviceFields.includes("segmentation_model_path")
-                  || serviceFields.includes("speaker_turns_enabled")) && (
-                  <div className="diarization-settings full-width">
-                    <div className="settings-subheading">
-                      <div>
-                        <span className="eyebrow">Diarization</span>
-                        <h3>Diarization and Live Speaker Turns</h3>
-                      </div>
-                    </div>
-
-                    <div className="diarization-settings-grid">
-                      {serviceFields.includes("segmentation_model_path") && (
-                        <>
-                          <label className="full-width">
-                            <span>Segmentation checkpoint</span>
-                            <input
-                              type="text"
-                              placeholder="Empty: pyannote segmentation-3.0 from the local Hugging Face cache"
-                              value={settingsForm.segmentation_model_path}
-                              onChange={(event) => updateSetting("segmentation_model_path", event.target.value)}
-                            />
-                          </label>
-                          <p className="field-note full-width">
-                            Path to a <code>pytorch_model.bin</code> of pyannote segmentation-3.0 (about 6 MB). Empty
-                            searches the model cache; nothing is ever downloaded. The diarization runs in this server
-                            (seg-3.0 + ReDimNet2); without a usable checkpoint diarization requests answer 503
-                            MODEL_UNAVAILABLE.
-                          </p>
-                        </>
-                      )}
-
-                      {serviceFields.includes("speaker_turns_enabled") && (
-                        <label className="settings-checkbox full-width">
-                          <input
-                            type="checkbox"
-                            checked={settingsForm.speaker_turns_enabled}
-                            onChange={(event) => updateSetting("speaker_turns_enabled", event.target.checked)}
-                          />
-                          <span>
-                            Offer live speaker turns
-                            <small>
-                              Transcript requests may carry <code>speaker_turns</code> (live text speakers in Genesis3).
-                              Offered in <code>/v2/capabilities</code> only while the segmentation checkpoint loads.
-                            </small>
-                          </span>
-                        </label>
-                      )}
-                    </div>
-                  </div>
-                )}
-
-                {serviceFields.includes("debug_retain_history_audio") && (
-                  <label className="settings-checkbox sensitive-setting full-width">
-                    <input
-                      type="checkbox"
-                      checked={settingsForm.debug_retain_history_audio}
-                      onChange={(event) => updateSetting("debug_retain_history_audio", event.target.checked)}
-                    />
-                    <span>
-                      Retain original audio for history debugging
-                      <small>
-                        Sensitive audio data: keeps the byte-identical upload only while its item remains in the visible
-                        history. Disabling this setting deletes every retained debug recording immediately after saving.
-                      </small>
-                    </span>
-                  </label>
-                )}
-              </div>
-
-              <div className="form-actions full-width">
-                <button type="submit" disabled={saveBusy}>
-                  {saveBusy ? "Saving..." : "Save Settings"}
-                </button>
-                {saveMessage && <p className={`message ${saveFailed ? "error" : ""}`.trim()}>{saveMessage}</p>}
-              </div>
-            </form>
-          </fieldset>
-        </section>
-
-        <section className="panel">
-          <div className="section-heading">
-            <div>
-              <span className="eyebrow">Queue</span>
-              <h2>Batch Details</h2>
-            </div>
-          </div>
-
-          <div className="queue-metrics">
-            <div>
-              <span>Active Batch</span>
-              <strong>{queue?.active_batch_id ?? "No active batch"}</strong>
-            </div>
-            <div>
-              <span>Active Batch Size</span>
-              <strong>{queue?.active_batch_size ?? 0}</strong>
-            </div>
-            <div>
-              <span>Active Audio</span>
-              <strong>{formatValue(queue?.active_batch_audio_seconds, " s")}</strong>
-            </div>
-            <div>
-              <span>Last Batch</span>
-              <strong>{queue?.last_batch_duration_ms ? `${queue.last_batch_duration_ms} ms` : "n/a"}</strong>
-            </div>
-            <div>
-              <span>Processed Batches</span>
-              <strong>{queue?.total_batches_processed ?? 0}</strong>
-            </div>
-            <div>
-              <span>Processed Segments</span>
-              <strong>{queue?.total_segments_processed ?? 0}</strong>
-            </div>
-          </div>
-
-          <h3>Scheduled Jobs</h3>
-          <div className="table-wrap">
-            <table>
-              <thead>
-                <tr>
-                  <th>Request</th>
-                  <th>State</th>
-                  <th>Chunks</th>
-                  <th>Batches</th>
-                  <th>Queue Wait</th>
-                </tr>
-              </thead>
-              <tbody>
-                {queueJobs.length === 0 && (
+            <div className="table-wrap">
+              <table className="history-table">
+                <thead>
                   <tr>
-                    <td colSpan={5}>No request is currently scheduled.</td>
+                    <th>Time</th>
+                    <th>Client</th>
+                    <th>Model</th>
+                    <th>Language</th>
+                    <th className="num">Total</th>
+                    <th className="num" title="Wall time including queue and shared GPU-lock waits.">Transcription</th>
+                    <th className="num" title="Wall time including queue and shared GPU-lock waits.">Embedding</th>
+                    <th className="num">Segments</th>
+                    <th>Text</th>
+                    <th>Audio</th>
                   </tr>
-                )}
-                {queueJobs.map((job) => (
-                  <tr key={job.request_id}>
-                    <td>{job.request_id}</td>
-                    <td>
-                      {job.state}
-                      {job.is_long ? " (long)" : ""}
-                    </td>
-                    <td>
-                      {job.completed_chunks} / {job.total_chunks}
-                      {job.inflight_chunks > 0 ? ` (+${job.inflight_chunks} in batch)` : ""}
-                    </td>
-                    <td>{job.batch_count}</td>
-                    <td>{formatValue(job.queue_wait_ms, " ms")}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+                </thead>
+                <tbody>
+                  {!stats && (
+                    <tr>
+                      <td colSpan={10} className="empty"><span className="spinner" /> Loading…</td>
+                    </tr>
+                  )}
+                  {stats && history.length === 0 && (
+                    <tr>
+                      <td colSpan={10} className="empty">No transcription yet. Send a request or try the Playground.</td>
+                    </tr>
+                  )}
+                  {history.map((entry) => {
+                    const action = historyActions[entry.history_id];
+                    const audioAvailable = entry.debug_audio?.status === "available";
+                    return (
+                      <tr key={entry.history_id}>
+                        <td className="nowrap">
+                          {formatDateTime(entry.timestamp, true)}
+                          {entry.retry_of && (
+                            <span className="cell-sub" title={entry.retry_of}>Retry of {entry.retry_of.slice(0, 8)}</span>
+                          )}
+                        </td>
+                        <td className="nowrap">{entry.source_ip ?? DASH}</td>
+                        <td>
+                          <span className="mono">{entry.model_id ?? entry.engine ?? DASH}</span>
+                          {entry.mode && <span className="cell-sub">{entry.mode}{entry.batched ? " · batched" : ""}</span>}
+                        </td>
+                        <td>{entry.transcription_language ?? DASH}</td>
+                        <td className="num">{formatMs(entry.total_duration_ms)}</td>
+                        <td className="num">{formatMs(entry.transcription_duration_ms)}</td>
+                        <td className="num">{formatMs(entry.voice_vector_duration_ms)}</td>
+                        <td className="num">{entry.segment_count ?? 1}</td>
+                        <td className="text-cell">{entry.transcript || <span className="dim">{DASH}</span>}</td>
+                        <td className="audio-cell">
+                          {audioAvailable ? (
+                            <>
+                              <span className="cell-sub">
+                                {entry.debug_audio?.filename || "Original audio"} · {formatBytes(entry.debug_audio?.size_bytes)}
+                              </span>
+                              <div className="button-row">
+                                {entry.retry_mode && (
+                                  <button
+                                    type="button"
+                                    className="secondary-button"
+                                    disabled={Boolean(action)}
+                                    aria-busy={action === "retry" || undefined}
+                                    onClick={() => void handleRetryHistoryEntry(entry)}
+                                  >
+                                    {action === "retry" ? "Retrying…" : "Retry"}
+                                  </button>
+                                )}
+                                <button
+                                  type="button"
+                                  className="ghost-button"
+                                  disabled={Boolean(action)}
+                                  aria-busy={action === "download" || undefined}
+                                  onClick={() => void handleDownloadHistoryEntry(entry)}
+                                >
+                                  {action === "download" ? "Downloading…" : "Download"}
+                                </button>
+                              </div>
+                            </>
+                          ) : (
+                            <span className="hint">{describeDebugAudioReason(entry.debug_audio?.reason)}</span>
+                          )}
+                          {historyActionErrors[entry.history_id] && (
+                            <span className="field-error" role="alert">{historyActionErrors[entry.history_id]}</span>
+                          )}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </section>
+        )}
+
+        {/* ------------------------------------------------------------------------------ API keys */}
+        {tab === "api-keys" && (
+          <ApiKeysPanel
+            keys={apiKeys === null ? null : apiKeyRows}
+            loadError={apiKeysError}
+            usageLabel="Audio (s)"
+            formatUsage={(value) => formatFixed(value, 1)}
+            baseUrl={baseUrl}
+            exampleCurl={(key) =>
+              `curl -H "Authorization: Bearer ${key}" -F "file=@audio.wav" -F "model=whisper-1" ${baseUrl}/v1/audio/transcriptions`
+            }
+            routesText={PUBLIC_ROUTES}
+            onCreate={async (alias) => {
+              try {
+                return await createApiKey(alias);
+              } catch (error) {
+                if (handleApiError(error, "", true)) throw new Error("Session expired.");
+                throw error;
+              }
+            }}
+            onRevoke={async (id) => {
+              try {
+                await deleteApiKey(id);
+              } catch (error) {
+                if (handleApiError(error, "", true)) throw new Error("Session expired.");
+                throw error;
+              }
+            }}
+            onChanged={() => void refreshApiKeys()}
+          />
+        )}
+
+        {/* ------------------------------------------------------------------------------ Account */}
+        {tab === "account" && (
+          <div className="grid grid-2">
+            <section className="panel" aria-labelledby="account-title">
+              <div className="panel-head">
+                <h2 id="account-title">Account</h2>
+              </div>
+              <dl className="kv-grid">
+                <div><dt>Signed in as</dt><dd>{currentUser || DASH}</dd></div>
+                <div><dt>Session expires</dt><dd>{formatDateTime(sessionExpiresAt)}</dd></div>
+              </dl>
+              <p className="hint">
+                The admin login is separate from client API keys. Changing the password ends every other session of this user.
+              </p>
+              <div className="button-row">
+                <button type="button" className="ghost-button" onClick={() => void handleLogout()}>Log out</button>
+              </div>
+            </section>
+            <section className="panel" aria-labelledby="password-title">
+              <div className="panel-head">
+                <h2 id="password-title">Change password</h2>
+              </div>
+              {passwordForm("Change password")}
+            </section>
           </div>
-
-          <h3>Recent Batches</h3>
-          <div className="table-wrap">
-            <table>
-              <thead>
-                <tr>
-                  <th>Time</th>
-                  <th>Batch</th>
-                  <th>Segments</th>
-                  <th>Requests</th>
-                  <th>Audio</th>
-                  <th>Duration</th>
-                  <th>Status</th>
-                </tr>
-              </thead>
-              <tbody>
-                {recentBatches.length === 0 && (
-                  <tr>
-                    <td colSpan={7}>No batch history recorded yet.</td>
-                  </tr>
-                )}
-                {recentBatches.map((entry, index) => (
-                  <tr key={`${entry.batch_id ?? "batch"}-${index}`}>
-                    <td>{entry.timestamp ?? "n/a"}</td>
-                    <td>{entry.batch_id ?? "n/a"}</td>
-                    <td>{entry.batch_size ?? 0}</td>
-                    <td>
-                      {entry.unique_request_count ?? "n/a"}
-                      {entry.fast_path ? " (fast path)" : ""}
-                    </td>
-                    <td>{formatValue(entry.audio_seconds, " s")}</td>
-                    <td>{formatValue(entry.duration_ms, " ms")}</td>
-                    <td>{entry.status ?? "n/a"}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-
-          <h3>Recent Jobs</h3>
-          <div className="table-wrap">
-            <table>
-              <thead>
-                <tr>
-                  <th>Finished</th>
-                  <th>Request</th>
-                  <th>Chunks</th>
-                  <th>Batches</th>
-                  <th>Queue Wait</th>
-                  <th>Total</th>
-                  <th>Status</th>
-                </tr>
-              </thead>
-              <tbody>
-                {recentJobs.length === 0 && (
-                  <tr>
-                    <td colSpan={7}>No job history recorded yet.</td>
-                  </tr>
-                )}
-                {recentJobs.map((entry, index) => (
-                  <tr key={`${entry.request_id ?? "job"}-${index}`}>
-                    <td>{entry.finished_at ?? "n/a"}</td>
-                    <td>
-                      {entry.request_id ?? "n/a"}
-                      {entry.is_long ? " (long)" : ""}
-                    </td>
-                    <td>{entry.total_chunks ?? 0}</td>
-                    <td>{entry.batch_count ?? 0}</td>
-                    <td>{formatValue(entry.queue_wait_ms, " ms")}</td>
-                    <td>{formatValue(entry.duration_ms, " ms")}</td>
-                    <td>{entry.status ?? "n/a"}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </section>
-      </div>
-
-      <section className="panel">
-        <div className="section-heading">
-          <div>
-            <span className="eyebrow">Models</span>
-            <h2>Cache Manager</h2>
-            <p className="section-copy">
-              Download or remove the supported ASR models directly in the cache path currently typed in the
-              settings form. Downloaded sizes reflect local cache usage; other values are rough estimates. The active
-              model cannot be deleted, load another model first.
-            </p>
-          </div>
-          <div className="button-row">
-            <button
-              type="button"
-              className="secondary-button"
-              onClick={() => void handleRefreshModels()}
-              disabled={modelActionId === "__refresh__"}
-            >
-              {modelActionId === "__refresh__" && modelActionKind === "refresh" ? "Refreshing..." : "Refresh Models"}
-            </button>
-          </div>
-        </div>
-
-        <div className="model-path-card">
-          <span>Selected Cache Path</span>
-          <strong className="mono">{settingsForm.local_model_cache_path || "Default Hugging Face cache"}</strong>
-        </div>
-
-        <div className="table-wrap">
-          <table className="model-table">
-            <thead>
-              <tr>
-                <th>Model</th>
-                <th>Backend</th>
-                <th>Size</th>
-                <th>Status</th>
-                <th>Path</th>
-                <th>Actions</th>
-              </tr>
-            </thead>
-            <tbody>
-              {managedModels.length === 0 && (
-                <tr>
-                  <td colSpan={6}>No supported model entries are available.</td>
-                </tr>
-              )}
-              {managedModels.map((model) => {
-                const rowBusy = modelActionId === model.id;
-                const isDownloading = model.status === "downloading";
-                const canDelete = Boolean(model.cache_path) && !model.active && !modelSelectRunning;
-                return (
-                  <tr key={model.id}>
-                    <td>
-                      <strong>{model.label}</strong>
-                      {model.active && <span className="connection-status configured model-active-marker">Active</span>}
-                      <div className="muted mono model-id">{model.id}</div>
-                    </td>
-                    <td>{formatBackendLabel(model.backend)}</td>
-                    <td>{formatModelSize(model)}</td>
-                    <td className="model-status-cell">
-                      <strong>{formatModelStatus(model.status)}</strong>
-                      {model.error && <span className="model-status-error">{model.error}</span>}
-                    </td>
-                    <td className="mono model-path-cell">{resolveModelPath(model)}</td>
-                    <td className="model-actions-cell">
-                      <div className="table-actions">
-                        <button
-                          type="button"
-                          className="secondary-button"
-                          onClick={() => void handleDownloadModel(model)}
-                          disabled={isDownloading || rowBusy}
-                        >
-                          {isDownloading
-                            ? "Downloading..."
-                            : rowBusy && modelActionKind === "download"
-                              ? "Starting..."
-                              : model.status === "ready"
-                                ? "Download Again"
-                                : "Download"}
-                        </button>
-                        <button
-                          type="button"
-                          className="ghost-button danger-button"
-                          onClick={() => void handleDeleteModel(model)}
-                          disabled={!canDelete || isDownloading || rowBusy}
-                        >
-                          {rowBusy && modelActionKind === "delete" ? "Deleting..." : "Delete"}
-                        </button>
-                      </div>
-                    </td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
-        </div>
-      </section>
-
-      <section className="panel">
-        <div className="section-heading">
-          <div>
-            <span className="eyebrow">History</span>
-            <h2>Latest Transcriptions</h2>
-            <p className="section-copy">
-              Transcription and embedding are wall-clock timings and include time spent waiting for the request queue
-              and the shared GPU lock.
-            </p>
-          </div>
-        </div>
-
-        <div className="table-wrap">
-          <table className="history-table">
-            <thead>
-              <tr>
-                <th>Time</th>
-                <th>IP</th>
-                <th>Model</th>
-                <th>Language</th>
-                <th>Total</th>
-                <th title="Wall time including request-queue and shared GPU-lock waits.">Transcription</th>
-                <th title="Wall time including request-queue and shared GPU-lock waits.">Embedding</th>
-                <th>Batch</th>
-                <th>Segments</th>
-                <th>Text</th>
-                <th>Audio / Actions</th>
-              </tr>
-            </thead>
-            <tbody>
-              {history.length === 0 && (
-                <tr>
-                  <td colSpan={11}>No transcription history recorded yet.</td>
-                </tr>
-              )}
-              {history.map((entry) => {
-                const action = historyActions[entry.history_id];
-                const audioAvailable = entry.debug_audio?.status === "available";
-                return (
-                  <tr key={entry.history_id}>
-                    <td>
-                      {entry.timestamp ?? "n/a"}
-                      {entry.retry_of && (
-                        <small className="history-retry-reference" title={entry.retry_of}>
-                          Retry of {entry.retry_of.slice(0, 8)}
-                        </small>
-                      )}
-                    </td>
-                    <td>{entry.source_ip ?? "n/a"}</td>
-                    <td>
-                      {entry.model_id ?? entry.engine ?? "n/a"}
-                      {entry.mode && <small className="history-mode">{entry.mode}</small>}
-                    </td>
-                    <td>{entry.transcription_language ?? "n/a"}</td>
-                    <td>{formatValue(entry.total_duration_ms, " ms")}</td>
-                    <td>{formatValue(entry.transcription_duration_ms, " ms")}</td>
-                    <td>{formatValue(entry.voice_vector_duration_ms, " ms")}</td>
-                    <td>{entry.batched ? "yes" : "no"}</td>
-                    <td>{entry.segment_count ?? 1}</td>
-                    <td className="transcript-cell">{entry.transcript ?? ""}</td>
-                    <td className="history-audio-cell">
-                      {audioAvailable ? (
-                        <>
-                          <div className="history-audio-meta">
-                            <strong>{entry.debug_audio?.filename || "Retained original audio"}</strong>
-                            <small>
-                              {formatBytes(entry.debug_audio?.size_bytes)}
-                              {entry.debug_audio?.capture_duration_ms !== null
-                                && entry.debug_audio?.capture_duration_ms !== undefined
-                                ? ` · captured in ${formatValue(entry.debug_audio.capture_duration_ms, " ms")}`
-                                : ""}
-                            </small>
-                          </div>
-                          <div className="table-actions history-actions">
-                            {entry.retry_mode && (
-                              <button
-                                type="button"
-                                className="secondary-button"
-                                disabled={Boolean(action)}
-                                onClick={() => void handleRetryHistoryEntry(entry)}
-                              >
-                                {action === "retry" ? "Retrying..." : "Retry"}
-                              </button>
-                            )}
-                            <button
-                              type="button"
-                              className="ghost-button"
-                              disabled={Boolean(action)}
-                              onClick={() => void handleDownloadHistoryEntry(entry)}
-                            >
-                              {action === "download" ? "Downloading..." : "Download"}
-                            </button>
-                          </div>
-                        </>
-                      ) : (
-                        <span className="muted">{describeDebugAudioReason(entry.debug_audio?.reason)}</span>
-                      )}
-                      {historyActionErrors[entry.history_id] && (
-                        <p className="history-action-error" role="alert">
-                          {historyActionErrors[entry.history_id]}
-                        </p>
-                      )}
-                    </td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
-        </div>
-      </section>
-    </main>
+        )}
+      </main>
+    </div>
   );
 }

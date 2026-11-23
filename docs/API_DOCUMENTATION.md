@@ -29,7 +29,8 @@ OpenAPI / interactive docs:
 Open/public routes:
 
 - no API key is required while no client API keys exist
-- once at least one client API key exists, public transcription clients must send `X-API-Key`
+- once at least one client API key exists, clients of `/transcribe/`, `/v1/audio/transcriptions`, `/v1/models` and `/v2/audio/process` must send `Authorization: Bearer <key>` or `X-API-Key: <key>`; `/v2/capabilities` stays public
+- the logged-in admin session is accepted instead of a key (the admin Playground); an explicitly sent wrong key is still a 401
 
 Protected admin routes:
 
@@ -41,7 +42,8 @@ Protected admin routes:
 Client API key example:
 
 ```http
-X-API-Key: genesis_whisper_xxxxxxxxxxxxxxxxxxxxxxxx
+Authorization: Bearer whisper_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+X-API-Key: whisper_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 ```
 
 ## Versioned Audio Processing API

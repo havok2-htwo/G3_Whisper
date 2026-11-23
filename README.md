@@ -172,7 +172,7 @@ speech/overlap count; speaker identity comes from ReDimNet2 windows. Public voic
 use only ReDimNet2.
 
 The authenticated admin SPA can call this route with its existing same-origin session.
-Machine clients continue to use `X-API-Key` whenever client keys are configured. If the
+Machine clients send `Authorization: Bearer <key>` or `X-API-Key: <key>` whenever client keys are configured. If the
 tester explicitly supplies an API key, that key is validated normally and an invalid key
 is not hidden by the admin session.
 
@@ -757,7 +757,7 @@ Principle:
 - `/api/admin/auth/login`, `/logout`, `/whoami`, and `/change-password` manage the browser session
 - all operational `/api/admin/...` routes require a valid session and block access until the first password change is complete
 - `/api/admin/api-keys` lets admins create or delete client API keys
-- the public transcription endpoints stay open while no client API keys exist; once at least one key exists, clients must send `X-API-Key`
+- the public transcription endpoints stay open while no client API keys exist; once at least one key exists, clients must send `Authorization: Bearer <key>` or `X-API-Key: <key>` on `/transcribe/`, `/v1/audio/transcriptions`, `/v1/models` and `/v2/audio/process` (`/v2/capabilities` stays public)
 - users, sessions, and client API keys are stored hashed/serialized in [`logs/genesis_whisper_secrets.json`](x:/dev/G3_WHISPER/logs/genesis_whisper_secrets.json)
 
 ## Environment Variables

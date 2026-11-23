@@ -1,3 +1,5 @@
+import type { PerfSnapshot } from "./PerfPanel";
+
 export type AdminOption = {
   label: string;
   value: string;
@@ -27,7 +29,9 @@ export type AdminSettings = {
   language_detection_model: string;
   redimnet_max_batch_size: number;
   debug_retain_history_audio: boolean;
+  // Masked by the server ("hf_…abcd"); the clear text never reaches the browser.
   huggingface_token: string;
+  huggingface_token_set?: boolean;
   segmentation_model_path: string;
   speaker_turns_enabled: boolean;
   model_profiles?: Record<string, Partial<AdminSettings>>;
@@ -115,6 +119,7 @@ export type SettingsSaveResponse = SettingsResponse & {
 export type StatsResponse = {
   summary: {
     total_requests: number;
+    failed_batches?: number;
     avg_total_duration_ms: number | null;
     avg_transcription_duration_ms: number | null;
   };
@@ -296,6 +301,7 @@ export type AudioProcessResponse = {
 export type WhoAmI = {
   username: string;
   must_change_password: boolean;
+  expires_at?: string | null;
 };
 
 export type ApiKeyUsage = {
@@ -307,6 +313,7 @@ export type ApiKeyUsage = {
 export type ApiKeyInfo = {
   id: string;
   alias: string;
+  hint: string | null;
   created_at: string | null;
   usage: ApiKeyUsage;
 };
@@ -314,6 +321,7 @@ export type ApiKeyInfo = {
 export type CreatedApiKey = {
   id: string;
   alias: string;
+  hint: string | null;
   created_at: string;
   token: string;
 };
@@ -335,34 +343,48 @@ async function requestJson<T>(input: string, init?: RequestInit): Promise<T> {
     headers: nextHeaders,
   });
 
-  if (response.status === 401) {
-    throw new Error("unauthorized");
-  }
-  if (response.status === 403) {
-    const payload = (await response.json().catch(() => ({}))) as { detail?: string };
-    if (payload.detail === "password_change_required") {
-      throw new Error("password_change_required");
-    }
-    throw new Error(payload.detail ?? "Forbidden");
-  }
-  if (!response.ok) {
-    const payload = (await response.json().catch(() => ({ detail: `HTTP ${response.status}` }))) as {
-      detail?: string;
-    };
-    throw new Error(payload.detail ?? `HTTP ${response.status}`);
-  }
-
+  await throwForStatus(response);
   if (response.status === 204) {
     return undefined as T;
   }
   return response.json() as Promise<T>;
 }
 
+/** FastAPI details are a string, or for 422 a list of {loc, msg}: "batch_size: must be <= 256". */
+export function describeErrorDetail(detail: unknown, status: number): string {
+  if (typeof detail === "string" && detail) {
+    return detail;
+  }
+  if (Array.isArray(detail) && detail.length > 0) {
+    return detail
+      .map((item) => {
+        const entry = item as { loc?: unknown[]; msg?: string };
+        const field = Array.isArray(entry.loc) ? entry.loc.filter((part) => part !== "body").join(".") : "";
+        return field ? `${field}: ${entry.msg ?? "invalid"}` : entry.msg ?? "invalid";
+      })
+      .join("; ");
+  }
+  return `HTTP ${status}`;
+}
+
 async function readErrorDetail(response: Response): Promise<string> {
-  const payload = (await response.json().catch(() => ({ detail: `HTTP ${response.status}` }))) as {
-    detail?: string;
-  };
-  return payload.detail ?? `HTTP ${response.status}`;
+  const payload = (await response.json().catch(() => ({}))) as { detail?: unknown };
+  return describeErrorDetail(payload.detail, response.status);
+}
+
+/** 401 -> "unauthorized", 403 password_change_required -> "password_change_required", else the server message. */
+async function throwForStatus(response: Response): Promise<void> {
+  if (response.ok) {
+    return;
+  }
+  if (response.status === 401) {
+    throw new Error("unauthorized");
+  }
+  const message = await readErrorDetail(response);
+  if (response.status === 403 && message === "password_change_required") {
+    throw new Error("password_change_required");
+  }
+  throw new Error(message);
 }
 
 export async function login(username: string, password: string) {
@@ -387,8 +409,12 @@ export async function changePassword(currentPassword: string, newPassword: strin
   });
 }
 
-export async function listApiKeys() {
-  return requestJson<{ keys: ApiKeyInfo[] }>("/api/admin/api-keys", { method: "GET" });
+export async function getAuthSetup() {
+  return requestJson<{ setup_required: boolean }>("/api/admin/auth/setup", { method: "GET" });
+}
+
+export async function listApiKeys(signal?: AbortSignal) {
+  return requestJson<{ keys: ApiKeyInfo[] }>("/api/admin/api-keys", { method: "GET", signal });
 }
 
 export async function createApiKey(alias: string) {
@@ -399,7 +425,7 @@ export async function createApiKey(alias: string) {
 }
 
 export async function deleteApiKey(id: string) {
-  return requestJson<{ ok: boolean }>(`/api/admin/api-keys/${encodeURIComponent(id)}`, { method: "DELETE" });
+  return requestJson<void>(`/api/admin/api-keys/${encodeURIComponent(id)}`, { method: "DELETE" });
 }
 
 export async function getSettings() {
@@ -411,13 +437,22 @@ export const ACTIVE_MODEL_CHANGED = "active_model_changed";
 // local_model stays out: only selectModel changes the model, a form opened before a switch must not switch it back.
 // expected_local_model stops that form from writing the old model's values onto the new one: the save then fails with
 // ACTIVE_MODEL_CHANGED.
-export async function saveSettings(settings: AdminSettings) {
+// The Hugging Face token travels only when a new one was typed (tokenDraft) or an explicit clear was asked for;
+// the masked value in `settings` is never sent back.
+export async function saveSettings(settings: AdminSettings, token?: { draft: string; clear: boolean }) {
   const {
     local_model: _localModel,
     model_profiles: _modelProfiles,
+    huggingface_token: _maskedToken,
+    huggingface_token_set: _tokenSet,
     ...editableSettings
   } = settings;
   const payload: Record<string, unknown> = { ...editableSettings, expected_local_model: settings.local_model };
+  if (token?.clear) {
+    payload.huggingface_token_clear = true;
+  } else if (token?.draft.trim()) {
+    payload.huggingface_token = token.draft.trim();
+  }
 
   return requestJson<SettingsSaveResponse>("/api/admin/settings", {
     method: "PUT",
@@ -461,9 +496,9 @@ export async function deletePreset(name: string) {
   return requestJson<{ ok: boolean }>(`/api/admin/settings/presets/${encodeURIComponent(name)}`, { method: "DELETE" });
 }
 
-export async function getModels(storagePath?: string) {
+export async function getModels(storagePath?: string, signal?: AbortSignal) {
   const query = storagePath !== undefined ? `?storage_path=${encodeURIComponent(storagePath)}` : "";
-  return requestJson<{ models: ManagedModel[] }>(`/api/admin/models${query}`, { method: "GET" });
+  return requestJson<{ models: ManagedModel[] }>(`/api/admin/models${query}`, { method: "GET", signal });
 }
 
 export async function downloadModel(modelId: string, storagePath: string, huggingfaceToken?: string) {
@@ -490,8 +525,8 @@ export async function deleteModel(modelId: string, storagePath: string) {
   );
 }
 
-export async function getStats() {
-  return requestJson<StatsResponse>("/api/admin/stats", { method: "GET" });
+export async function getStats(signal?: AbortSignal) {
+  return requestJson<StatsResponse>("/api/admin/stats", { method: "GET", signal });
 }
 
 export async function retryHistoryAudio(historyId: string) {
@@ -531,19 +566,7 @@ export async function downloadHistoryAudio(historyId: string, fallbackFilename?:
     credentials: "include",
   });
 
-  if (response.status === 401) {
-    throw new Error("unauthorized");
-  }
-  if (response.status === 403) {
-    const payload = (await response.json().catch(() => ({}))) as { detail?: string };
-    if (payload.detail === "password_change_required") {
-      throw new Error("password_change_required");
-    }
-    throw new Error(payload.detail ?? "Forbidden");
-  }
-  if (!response.ok) {
-    throw new Error(await readErrorDetail(response));
-  }
+  await throwForStatus(response);
 
   const fallback = safeDownloadFilename(fallbackFilename ?? null, `history-audio-${historyId}`);
   return {
@@ -555,8 +578,12 @@ export async function downloadHistoryAudio(historyId: string, fallbackFilename?:
   };
 }
 
-export async function getQueue() {
-  return requestJson<QueueResponse>("/api/admin/queue", { method: "GET" });
+export async function getQueue(signal?: AbortSignal) {
+  return requestJson<QueueResponse>("/api/admin/queue", { method: "GET", signal });
+}
+
+export async function getPerf(signal?: AbortSignal) {
+  return requestJson<PerfSnapshot>("/api/admin/perf", { method: "GET", signal });
 }
 
 export async function runBenchmark(file: File, repeatCount: number) {
@@ -570,13 +597,7 @@ export async function runBenchmark(file: File, repeatCount: number) {
     body: formData,
   });
 
-  if (response.status === 401) {
-    throw new Error("unauthorized");
-  }
-  if (!response.ok) {
-    throw new Error(await readErrorDetail(response));
-  }
-
+  await throwForStatus(response);
   return response.json() as Promise<BenchmarkResponse>;
 }
 
@@ -590,8 +611,9 @@ export async function processAudioV2(file: File, request: AudioProcessRequest, a
   );
 
   const headers = new Headers();
-  if (apiKey?.trim()) {
-    headers.set("X-API-Key", apiKey.trim());
+  const explicitKey = apiKey?.trim() ?? "";
+  if (explicitKey) {
+    headers.set("Authorization", `Bearer ${explicitKey}`);
   }
 
   const response = await fetch("/v2/audio/process", {
@@ -601,6 +623,10 @@ export async function processAudioV2(file: File, request: AudioProcessRequest, a
     body: formData,
   });
 
+  // Without a typed key the admin session is the credential: a 401 then means the session expired.
+  if (response.status === 401 && !explicitKey) {
+    throw new Error("unauthorized");
+  }
   if (!response.ok) {
     const payload = (await response.json().catch(() => ({}))) as {
       error?: { code?: string; message?: string };
