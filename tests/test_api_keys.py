@@ -402,6 +402,19 @@ class PerfMetricTests(unittest.TestCase):
         self.assertEqual([m["key"] for m in body["metrics"]], ["throughput", "queue"])
         self.assertLessEqual(abs(body["sampled_at_ms"] - time.time() * 1000), 5000)
 
+    def test_gpu_option_is_named_like_nvidia_smi_not_by_cuda_index(self) -> None:
+        # CUDA_VISIBLE_DEVICES=<3090 UUID>: the 3090 is cuda:0 in this process but GPU 1 in nvidia-smi.
+        card = {"nvml_index": 1, "cuda_index": 0, "name": "NVIDIA GeForce RTX 3090", "mem_total_mib": 24576}
+        with mock.patch.dict(admin._device_label_cache, clear=True), mock.patch.object(
+            admin, "gpu_for_cuda_index", return_value=card
+        ) as lookup:
+            label = admin._device_label("GPU 0 (NVIDIA GeForce RTX 3090, 24 GB)", "cuda:0")
+            again = admin._device_label("GPU 0 (NVIDIA GeForce RTX 3090, 24 GB)", "cuda:0")
+        self.assertEqual(label, "GPU 1 · GeForce RTX 3090 · 24 GB")
+        self.assertEqual(again, label)
+        lookup.assert_called_once_with(0)  # identity is cached, nvidia-smi runs once
+        self.assertEqual(admin._device_label("Auto (Empfohlen)", "auto"), "Auto (recommended)")
+
     def test_finished_batches_feed_the_window(self) -> None:
         from backend import genesis_whisper_server_batching as batching
 

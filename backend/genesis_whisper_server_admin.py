@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import sys
 import time
 import uuid
@@ -25,6 +26,7 @@ from .genesis_whisper_server_auth import (
     run_password_work,
     set_session_cookie,
 )
+from .g3_gpu import gpu_for_cuda_index
 from .genesis_whisper_server_perf import perf_snapshot
 from .genesis_whisper_server_batching import ModelFailoverError
 from .genesis_whisper_server_chunking import (
@@ -218,6 +220,35 @@ def _apply_token_update(payload_data: Dict[str, Any]) -> None:
         payload_data["huggingface_token"] = token
 
 
+_device_label_cache: Dict[str, str] = {}
+
+
+def _device_label(label: str, value: str) -> str:
+    """UI label of a device option. cuda:N is named like nvidia-smi ("GPU 1 · GeForce RTX 3090 · 24 GB"): inside
+    this process cuda:0 may be nvidia-smi GPU 1 (CUDA_VISIBLE_DEVICES), so the card is looked up by UUID. Card
+    identity does not change while the process runs, so the (blocking) lookup happens once per device."""
+
+    if value == "auto":
+        return "Auto (recommended)"
+    if value == "cpu":
+        return "CPU"
+    if value in _device_label_cache:
+        return _device_label_cache[value]
+    resolved = label
+    try:
+        gpu = gpu_for_cuda_index(int(value.split(":", 1)[1]))
+    except Exception:
+        gpu = None
+    if gpu:
+        name = re.sub(r"^NVIDIA\s+", "", str(gpu.get("name") or "GPU"), flags=re.IGNORECASE)
+        total = gpu.get("mem_total_mib")
+        size = f" · {total / 1024:.0f} GB" if isinstance(total, (int, float)) and total else ""
+        prefix = f"GPU {gpu['nvml_index']} · " if gpu.get("nvml_index") is not None else ""
+        resolved = f"{prefix}{name}{size}"
+    _device_label_cache[value] = resolved
+    return resolved
+
+
 def _settings_options() -> Dict[str, List[Dict[str, Any]]]:
     active_model = _settings_snapshot()["local_model"]
     models = [
@@ -230,7 +261,10 @@ def _settings_options() -> Dict[str, List[Dict[str, Any]]]:
         }
         for label, model_id in LOCAL_ASR_MODEL_MAP.items()
     ]
-    devices = [{"label": label, "value": DEVICE_MAP_UI_TO_INTERNAL[label]} for label in AVAILABLE_DEVICES]
+    devices = [
+        {"label": _device_label(label, DEVICE_MAP_UI_TO_INTERNAL[label]), "value": DEVICE_MAP_UI_TO_INTERNAL[label]}
+        for label in AVAILABLE_DEVICES
+    ]
     languages = [{"label": label, "value": value} for label, value in SUPPORTED_LANGUAGE_OPTIONS.items()]
     precisions = [{"label": label, "value": value} for label, value in SUPPORTED_MODEL_PRECISION_OPTIONS.items()]
     language_detection_models = [
