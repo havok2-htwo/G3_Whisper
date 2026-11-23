@@ -63,7 +63,7 @@ def shared_gpu_lease() -> Iterator[None]:
 
     The ordinary asyncio locks still serialize work inside each service.  This
     lease only adds host/container-wide coordination for deployments where the
-    Whisper and DIA processes share one physical GPU and one filesystem volume.
+    Whisper and another GPU process share one physical GPU and one filesystem volume.
     """
 
     configured_path = str(os.getenv("GENESIS_GPU_LEASE_PATH") or "").strip()

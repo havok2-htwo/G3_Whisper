@@ -22,14 +22,6 @@ from .genesis_whisper_server_globals import (
 
 load_dotenv(os.path.join(PROJECT_ROOT, ".env"), override=False)
 
-# DIA URL when neither the saved setting nor DIA_SERVER_BASE_URL names one: the suite runs on one box, so a native
-# install reaches the local G3_DIA. Compose sets DIA_SERVER_BASE_URL=http://dia:7864, which wins over this.
-DEFAULT_DIA_SERVER_BASE_URL = "http://127.0.0.1:7864"
-
-# Allowed values of diarization_engine: "dia" asks the G3_DIA server (the default, existing installs keep it), "local"
-# runs the seg-3.0 + ReDimNet2 pipeline in this process (genesis_whisper_server_diarization_engine).
-DIARIZATION_ENGINE_VALUES = ("dia", "local")
-
 # Allowed values of redimnet_max_batch_size: the power-of-two CUDA batch buckets ReDimNet is warmed for.
 REDIMNET_MAX_BATCH_SIZE_VALUES = (1, 2, 4, 8)
 
@@ -53,10 +45,9 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "redimnet_max_batch_size": 8,
     "debug_retain_history_audio": False,
     "huggingface_token": "",
-    "dia_server_base_url": "",
-    "dia_api_key": "",
-    "diarization_engine": "dia",
-    # Explicit seg-3.0 checkpoint for the DIA-free diarization; empty = find it in the local HF cache.
+    # Explicit seg-3.0 checkpoint for the diarization; empty = find it in the local HF cache. (The keys of the removed
+    # G3_DIA integration, diarization_engine / dia_server_base_url / dia_api_key, are not settings any more: an old
+    # settings file that still has them loads, normalize_settings drops them and the next save leaves them out.)
     "segmentation_model_path": "",
     # Live speaker turns in transcript mode; offered only while the seg-3.0 checkpoint is usable.
     "speaker_turns_enabled": True,
@@ -64,7 +55,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
 }
 
 # Keys a preset may set: model choice, device, precision, batching, scheduler and VRAM behaviour. Machine-specific
-# values (local_model_cache_path), secrets (huggingface_token, dia_api_key), the DIA URL, the transcription language
+# values (local_model_cache_path), secrets (huggingface_token), the transcription language
 # and the debug audio switch stay out, so loading a preset never touches them. So does language detection
 # (cohere_language_detection, language_detection_model): it decides what "auto" means, not how much VRAM a tier
 # needs (the default detector is about 0.15 GB next to Cohere), and a preset must not switch it off silently.
@@ -116,39 +107,10 @@ MODEL_SETTINGS_FIELDS: Dict[str, Tuple[str, ...]] = {
 SERVICE_SETTINGS_FIELDS: Tuple[str, ...] = (
     "local_model_cache_path",
     "huggingface_token",
-    "dia_server_base_url",
-    "dia_api_key",
-    "diarization_engine",
     "segmentation_model_path",
     "speaker_turns_enabled",
     "debug_retain_history_audio",
 )
-
-
-def resolve_dia_server_config(settings: Optional[Dict[str, Any]] = None) -> Dict[str, str]:
-    """Return the effective DIA connection without mutating or persisting env fallbacks.
-
-    Persisted admin settings take precedence, then DIA_SERVER_BASE_URL / DIA_SERVER_API_KEY,
-    then DEFAULT_DIA_SERVER_BASE_URL (the API key has no default). An empty saved URL means
-    "use the default". Keeping environment fallbacks out of the normalized settings object
-    prevents a legacy/full settings save from accidentally copying a deployment secret from
-    the process environment into the settings file.
-    """
-
-    source = settings or {}
-    configured_base_url = str(source.get("dia_server_base_url", "") or "").strip().rstrip("/")
-    configured_api_key = str(source.get("dia_api_key", "") or "").strip()
-    env_base_url = str(os.getenv("DIA_SERVER_BASE_URL", "") or "").strip().rstrip("/")
-    env_api_key = str(os.getenv("DIA_SERVER_API_KEY", "") or "").strip()
-
-    base_url = configured_base_url or env_base_url or DEFAULT_DIA_SERVER_BASE_URL
-    api_key = configured_api_key or env_api_key
-    return {
-        "base_url": base_url,
-        "api_key": api_key,
-        "base_url_source": "settings" if configured_base_url else ("environment" if env_base_url else "default"),
-        "api_key_source": "settings" if configured_api_key else ("environment" if env_api_key else "none"),
-    }
 
 
 def normalize_redimnet_max_batch_size(value: Any) -> int:
@@ -214,13 +176,7 @@ def normalize_settings(settings: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         configured_language if configured_language in SUPPORTED_LANGUAGE_VALUES else DEFAULT_SETTINGS["transcription_language"]
     )
     normalized["huggingface_token"] = str(source.get("huggingface_token", "")).strip()
-    normalized["dia_server_base_url"] = str(source.get("dia_server_base_url", "") or "").strip().rstrip("/")
-    normalized["dia_api_key"] = str(source.get("dia_api_key", "") or "").strip()
     normalized["segmentation_model_path"] = str(source.get("segmentation_model_path", "") or "").strip()
-    configured_engine = str(source.get("diarization_engine", DEFAULT_SETTINGS["diarization_engine"]) or "").strip().lower()
-    normalized["diarization_engine"] = (
-        configured_engine if configured_engine in DIARIZATION_ENGINE_VALUES else DEFAULT_SETTINGS["diarization_engine"]
-    )
     configured_turns = source.get("speaker_turns_enabled", DEFAULT_SETTINGS["speaker_turns_enabled"])
     normalized["speaker_turns_enabled"] = (
         configured_turns if isinstance(configured_turns, bool) else DEFAULT_SETTINGS["speaker_turns_enabled"]

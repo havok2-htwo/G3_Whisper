@@ -107,13 +107,22 @@ class BuiltinPresetTests(_PresetTestCase):
                 self.assertNotIn("local_gpu_device", values)
 
     def test_tier_descriptions_state_the_measured_vram(self) -> None:
-        expected = {"32GB VRAM": "9.7 GB peak", "24GB VRAM": "8.3 GB peak", "24+8 VRAM": "8.3 GB peak"}
-        for name, peak in expected.items():
+        expected = {
+            "32GB VRAM": ("6.3 GB idle", "9.7 GB peak", "RTX 5090"),
+            "24GB VRAM": ("6.3 GB idle", "8.3 GB peak", "RTX 5090"),
+            "24+8 VRAM": ("6.6 GB idle", "9.9 GB peak", "RTX 3090"),
+        }
+        for name, measured in expected.items():
             with self.subTest(name=name):
                 description = presets.BUILTIN_PRESETS[name]["description"]
-                self.assertIn("6.3 GB idle", description)
-                self.assertIn(peak, description)
-                self.assertIn("RTX 5090", description)
+                for fragment in measured:
+                    self.assertIn(fragment, description)
+
+    def test_two_card_tier_no_longer_describes_an_external_diarization_service(self) -> None:
+        description = presets.BUILTIN_PRESETS["24+8 VRAM"]["description"]
+        self.assertNotIn("DIA", description)
+        self.assertIn("diarization runs in this process", description)
+        self.assertEqual(presets.BUILTIN_PRESETS["24+8 VRAM"]["target_vram_gb"], 24)
 
     def test_redimnet_max_batch_is_a_preset_key(self) -> None:
         self.assertIn("redimnet_max_batch_size", presets.PRESET_KEYS)

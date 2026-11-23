@@ -63,7 +63,7 @@ REDIMNET_MAX_BATCH_SIZE = 8
 REDIMNET_MIN_CUDA_BATCH_SIZE = 2
 # Equal-sample batches: a window of 1/2 (1/4) of the 3 s length runs 2x (4x) as many windows per CUDA batch, so a
 # batch never holds more audio than ``maximum x 3 s`` and the allocator pool stays the one warmed for 3 s. The short
-# DIA-free scales are launch-bound at the 3 s batch size; measured on an RTX 3090 at maximum 4: 1.5 s windows
+# diarization scales are launch-bound at the 3 s batch size; measured on an RTX 3090 at maximum 4: 1.5 s windows
 # 241 -> 341/s, 0.75 s windows 249 -> 688/s, reserved pool 1442 MiB either way, vectors cos >= 0.99998.
 REDIMNET_MAX_LENGTH_BATCH_FACTOR = 4
 _ENERGY_VAD_FRAME_MS = 30
@@ -748,7 +748,7 @@ def embed_voice_windows(
 ) -> list[EmbeddedVoiceWindow]:
     """Embed ``windows`` in power-of-two CUDA batches, every window fitted to ``window_samples``.
 
-    The public voice vectors always use 3 s windows. The DIA-free diarization also embeds 1.5 s and 0.75 s windows
+    The public voice vectors always use 3 s windows. The batch diarization also embeds 1.5 s and 0.75 s windows
     at their native length (``window_samples=24000``/``12000``); call ``prepare_window_length`` once for such a
     length so its batch shapes are warmed like the 3 s ones. Shorter windows run ``length_batch_factor`` times the
     3 s batch size (equal samples per batch, same memory).
@@ -847,7 +847,7 @@ def embed_voice_windows(
     return output
 
 
-# DIA-free diarization windows only: a pure-FP16 copy of the loaded model (weights, activations and head in FP16, the
+# Batch diarization windows only: a pure-FP16 copy of the loaded model (weights, activations and head in FP16, the
 # waveform frontend stays FP32) in fixed batches of twice the prepared 3 s batch times ``length_batch_factor`` (FP16
 # halves the activations, so the reserved pool stays the size the 3 s buckets warmed: measured on an RTX 3090 at
 # maximum 4, 1952 against 1932 MiB). Bench: 3.0 + 1.5 + 0.75 s windows about 25 % faster than the autocast model,
@@ -910,7 +910,7 @@ def _half_forward(model: Any, waveform: torch.Tensor) -> torch.Tensor:
 
 
 def embed_diarization_windows(windows: Sequence[VoiceWindow], *, window_samples: int) -> list[np.ndarray]:
-    """Unit vectors of the DIA-free diarization windows (fitted to ``window_samples``) with the FP16 copy, every
+    """Unit vectors of the batch diarization windows (fitted to ``window_samples``) with the FP16 copy, every
     batch padded to the full FP16 batch (one warmed shape per length). Off CUDA: ``embed_voice_windows``."""
 
     windows = list(windows)

@@ -14,7 +14,8 @@ Beispielantworten gilt ergaenzend die [API-Dokumentation](API_DOCUMENTATION.md).
 - Es gibt clientseitig keine Modellwahl und kein zu sendendes `embedding_space_id`.
 - Vorhandene 512-D-Profile werden nicht konvertiert, aufgefuellt, gekuerzt oder mit
   192-D-Vektoren verglichen. Sie muessen aus Referenzaudio neu erzeugt werden.
-- DIA wird ausschliesslich bei `mode: "diarization"` verwendet. Seine internen
+- Die Sprechertrennung laeuft ausschliesslich bei `mode: "diarization"` (im Whisper-Server
+  selbst; der fruehere G3_DIA-Dienst wird nicht mehr verwendet). Dessen fruehere interne
   256-D-Vektoren sind kein oeffentliches Profilformat.
 
 Der Modellraum von API v2 ist fest gepinnt:
@@ -86,7 +87,7 @@ X-G3-Repetition-Filter: off
 
 ### `embedding`
 
-Der Server erzeugt genau einen Recording-Level-Vektor und fuehrt weder ASR noch DIA aus.
+Der Server erzeugt genau einen Recording-Level-Vektor und fuehrt weder ASR noch Sprechertrennung aus.
 Bei Mehrsprecher-Audio ist das bewusst ein Mischvektor und keine Sprecheridentifikation.
 
 Erfolg:
@@ -108,8 +109,8 @@ Embedding-Modus HTTP 422, weil kein unabhaengiges Teilergebnis existiert.
 
 ### `transcript`
 
-Der Server liefert `result.transcript.text`. Es wird weder ein Embedding erzeugt noch DIA
-aufgerufen.
+Der Server liefert `result.transcript.text`. Es wird weder ein Embedding erzeugt noch eine
+Sprechertrennung gerechnet.
 
 ### `transcript_embedding`
 
@@ -156,7 +157,7 @@ behandeln.
 
 ### `diarization`
 
-Nur dieser Modus ruft G3_DIA auf. Der optionale Requestteil lautet:
+Nur dieser Modus rechnet die Sprechertrennung. Der optionale Requestteil lautet:
 
 ```json
 {
@@ -178,14 +179,14 @@ Nur dieser Modus ruft G3_DIA auf. Der optionale Requestteil lautet:
 }
 ```
 
-Zulaessige DIA-Felder:
+Zulaessige Felder der Sprechertrennung:
 
 - `expected_speakers`: optional, exakte Anzahl `1..64`; darf nicht kleiner als die Zahl
-  der bekannten Profile sein. Ohne Wert ermittelt DIA die Anzahl automatisch.
+  der bekannten Profile sein. Ohne Wert ermittelt die Sprechertrennung die Anzahl automatisch.
 - `known_speakers`: optional, maximal 64 eindeutige IDs; pro ID mindestens ein
   ReDimNet2-192-D-Vektor. Der gesamte JSON-Part ist auf 16 MiB begrenzt.
 - `speaker_refinement`: `off` (Standard), `shadow` oder `conservative`. `off` deaktiviert
-  nur die zusaetzliche ReDimNet-Korrektur von DIA-Labels, nicht die Diarisierung.
+  nur die zusaetzliche ReDimNet-Korrektur der Sprecherlabels, nicht die Diarisierung.
 - `unknown_speaker_audio`: echtes JSON-Boolean, Standard `false`. `true` fordert
   Hoerproben fuer geeignete unbekannte beziehungsweise unresolved Stimmen an.
 
@@ -197,7 +198,7 @@ Der Client liest je Transkriptsegment mindestens:
 
 - `start_ms`, `end_ms`, `text`, `overlap`
 - `speaker_id`: bekannte Anwendungs-ID oder stabile unbekannte ID
-- `diarization_speaker_id`: unveraenderliches urspruengliches DIA-Label
+- `diarization_speaker_id`: unveraenderliches urspruengliches Label der Sprechertrennung
 - `speaker_kind`: `known`, `unknown` oder `unresolved`
 - optional `refined_diarization_speaker_id`, wenn Refinement angefordert wurde
 
@@ -251,9 +252,9 @@ Fehler besitzen `status: "failed"`, `result: null` und ein strukturiertes `error
 - `413`: Request-JSON groesser als 16 MiB
 - `422`: ungueltiger Request, Profilvektor oder unzureichende Sprache im reinen
   `embedding`-Modus
-- `502`: DIA-Authentifizierung, Upstream oder Response-Vertrag fehlerhaft
-- `503`: DIA nicht konfiguriert oder benoetigtes lokales Modell nicht verfuegbar
-- `504`: DIA-Timeout
+- `503`: benoetigtes lokales Modell nicht verfuegbar (`MODEL_UNAVAILABLE`; bei
+  `diarization` auch ohne nutzbaren seg-3.0-Checkpoint). Die frueheren DIA-Fehler
+  (`502`/`504`, Codes `DIA_*`) kommen nicht mehr vor; Clients koennen sie tolerieren.
 - `500`: unerwarteter lokaler Fehler
 
 Client-Logging soll mindestens `request_id`, HTTP-Status, `error.code`, `mode` und
@@ -288,7 +289,7 @@ Falls ein Client waehrend eines Rolling Updates noch alte Serverversionen erreic
 darf er ausschliesslich als Uebergangsschutz bei einem HTTP 422 nach
 `transcript_embedding` genau einmal denselben Audioblob mit `mode: "transcript"` senden.
 Der gerettete Text wird als Ergebnis ohne Embedding markiert. Dieser Fallback gilt nicht
-fuer Dimensionsfehler, Authentifizierungsfehler, DIA-Fehler oder allgemeine automatische
+fuer Dimensionsfehler, Authentifizierungsfehler, Fehler der Sprechertrennung oder allgemeine automatische
 Retries und kann entfernt werden, sobald alle Server den HTTP-200-Teilerfolg beherrschen.
 
 ## Referenztypen fuer TypeScript-Clients
@@ -336,7 +337,7 @@ weglassen. Er darf keine unbekannten Top-Level-Felder durch Objekt-Spreads einsc
 - `embedding` und `transcript_embedding` akzeptieren exakt 192 Werte und keine 512/256.
 - HTTP 200 mit `status: "partial"` und `embedding: null` behaelt das Transkript.
 - Vorhandene 512-D-Profile werden nie still transformiert oder an v2 gesendet.
-- Ein DIA-Test mit fuenf erwarteten und vier bekannten Stimmen kann eine unbekannte Stimme
+- Ein Diarisierungstest mit fuenf erwarteten und vier bekannten Stimmen kann eine unbekannte Stimme
   samt ihren Vektoren darstellen.
 - `unknown_speaker_audio: true` kann vorhandene MP3-Hoerproben abspielen und toleriert ein
   fehlendes `audio`-Feld mit Warnung.
@@ -350,6 +351,6 @@ weglassen. Er darf keine unbekannten Top-Level-Felder durch Objekt-Spreads einsc
 - Keine clientseitige Auswahl zwischen ReDimNet, pyannote oder anderen Embedding-Modellen.
 - Kein `embedding_space_id` im v2-Request.
 - Keine Dimensionskonvertierung zwischen 512, 256 und 192.
-- Kein direkter Client-Aufruf an G3_DIA; der Whisper-Server orchestriert DIA.
+- Kein eigener Diarisierungsdienst auf Clientseite; der Whisper-Server rechnet die Sprechertrennung selbst.
 - Keine clientseitige Diarisierung aus kurzen Embedding-Fenstern.
 - Keine Hotword-, Glossar- oder Prompt-Biasing-Felder fuer Cohere.

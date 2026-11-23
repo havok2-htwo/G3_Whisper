@@ -56,12 +56,12 @@ This is the versioned API for transcription and voice processing. It accepts
 
 The four modes are:
 
-- `embedding`: returns exactly one 192-D recording-level ReDimNet2 embedding; it does not run ASR or DIA
-- `transcript`: returns a cleaned transcript; it does not run DIA
-- `transcript_embedding`: returns a cleaned transcript and normally one 192-D recording-level embedding; it does not run DIA. If no suitable embedding window exists, the transcript is still returned as a partial success with `embedding: null` and a warning
-- `diarization`: runs G3_DIA and, by default, the WXC transcribe-first pipeline
+- `embedding`: returns exactly one 192-D recording-level ReDimNet2 embedding; it does not run ASR or diarization
+- `transcript`: returns a cleaned transcript; it does not run diarization
+- `transcript_embedding`: returns a cleaned transcript and normally one 192-D recording-level embedding; it does not run diarization. If no suitable embedding window exists, the transcript is still returned as a partial success with `embedding: null` and a warning
+- `diarization`: runs the in-process speaker separation (seg-3.0 + ReDimNet2, "V5-fast") and, by default, the WXC transcribe-first pipeline
   (Silero speech regions -> ~25s superchunks -> ASR -> MMS_FA word timestamps ->
-  gated DIA speaker skeleton -> sentence-level 192D speaker verification), matches
+  gated diarization speaker skeleton -> sentence-level 192D speaker verification), matches
   optional known ReDimNet2 profiles, and returns unknown/unresolved speaker vectors.
   The header `X-G3-Pipeline: turns` restores the legacy per-turn ASR path for one
   request. Diarization responses additionally carry `result.chunking`,
@@ -128,14 +128,14 @@ never run it.
   as its own ASR job and the texts are joined in the original order. A language
   change inside one Silero region of up to 30 s (no pause of at least 0.3 s) is
   not seen.
-- `diarization`: the language is decided once per DIA speaker, from up to 30 s
+- `diarization`: the language is decided once per diarization speaker, from up to 30 s
   of that speaker's best clean windows. A speaker with under 1 s of speech or
   below 0.5 confidence takes the majority of the confidently detected speakers,
   else `de`. The speaker's language is the prior for each of its turns: every
   turn ASR sees (gated and merged) of at least 1.5 s is detected on its own in
   the same batched pass (a turn over 30 s in parts, pooled), and takes its own
   language only when that reaches 0.85 confidence and differs from its
-  speaker's. This covers a DIA cluster that mixes one speaker with short
+  speaker's. This covers a diarization cluster that mixes one speaker with short
   interjections of others in another language, and a speaker who switches for a
   sentence. Shorter or less certain turns keep the speaker's language. The 0.85
   is calibrated on 459 German/English clips of 2-8 s: about 1.3 % of turns in
@@ -143,7 +143,7 @@ never run it.
   The legacy turn path decodes each turn in its turn language. The WXC chunks
   are cut at every language change of the turns, so no ASR chunk mixes two
   languages; a language run with under 0.5 s of speech (a short backchannel,
-  DIA jitter) joins its nearer neighbour instead of becoming its own chunk. With
+  diarization jitter) joins its nearer neighbour instead of becoming its own chunk. With
   a single language the chunking is exactly the same as without detection.
 - Less than 1 s of audio, or a detection model that cannot be loaded, gives `de`
   as before. A load or runtime failure adds the warning
@@ -198,7 +198,7 @@ and `ar`/`el` diarization text is lossy even when the language is detected
 correctly (`transcript` modes are not affected). `known_speakers[].language` is
 not accepted yet; a client-side language hint per profile is a possible follow-up.
 
-Only `diarization` contacts the configured DIA server. Recording-level embeddings in
+Only `diarization` runs the speaker separation. Recording-level embeddings in
 the other modes use VAD, fixed three-second windows, batched inference, quality
 weighting, and final L2 normalization. If such a recording contains multiple speakers,
 the returned value is intentionally a mixed vector; these modes do not identify people.
@@ -229,7 +229,7 @@ is permanently bound to this model space. A future checkpoint/model-space change
 use a new API or embedding version rather than silently changing v2.
 
 Existing 512-D profiles are not compatible. They must be regenerated from reference
-audio; neither 512-D legacy vectors nor DIA-internal 256-D vectors are accepted as known
+audio; neither 512-D legacy vectors nor the former diarization-internal 256-D vectors are accepted as known
 profiles.
 
 #### `embedding`
@@ -415,13 +415,13 @@ because that mode has no independent transcript result to preserve.
 
 The optional `diarization` object accepts:
 
-- `expected_speakers`: exact DIA speaker count, integer `1..64`
+- `expected_speakers`: exact speaker count for the diarization, integer `1..64`
 - `known_speakers`: at most 64 profiles; each has a unique non-empty `id` (at most 128 UTF-8 bytes) and one or more `embeddings`; defaults to `[]`
 - `speaker_refinement`: `off`, `shadow`, or `conservative`; defaults to `off`
 - `unknown_speaker_audio`: JSON boolean; defaults to `false`
 
 These last two fields are independent result enhancements. Their defaults do not disable
-DIA: every `mode: "diarization"` request still invokes the configured DIA server.
+the diarization: every `mode: "diarization"` request still runs the speaker separation.
 `speaker_refinement: "off"` disables only the additional ReDimNet label-correction pass,
 while `unknown_speaker_audio: false` disables only the MP3 listening references. Values
 such as `"true"`, `1`, or `null` are not accepted for the boolean field.
@@ -432,7 +432,7 @@ empty embedding lists, NaN/infinity, null vectors, 512-D vectors, and 256-D vect
 HTTP 422 errors. Profile count and vectors are otherwise bounded by the 16 MiB request
 JSON limit.
 
-`expected_speakers` is the exact count passed to DIA. If omitted, DIA chooses the count
+`expected_speakers` is the exact count passed to the diarization. If omitted, it chooses the count
 automatically; the number of known profiles becomes only the minimum speaker count.
 Consequently `expected_speakers`, when supplied, cannot be lower than the number of
 known profiles. A supplied profile is a client assertion that the person occurs in the
@@ -489,10 +489,13 @@ curl -sS http://127.0.0.1:7861/v2/audio/process \
   -F 'request=@diarization-request.json;type=application/json'
 ```
 
-Whisper streams the original spooled upload to `POST <DIA base URL>/v2/diarize`. The
-DIA key is sent as `X-API-Key`. DIA supplies standard turns, exclusive turns, and
-overlap intervals; its internal 256-D `community-1` embeddings are neither serialized
-nor used for identity matching. Exclusive turns drive ASR. ReDimNet speaker vectors are
+The server diarizes the decoded audio in this process (no external service): pyannote
+segmentation-3.0 gives the per-frame speech/overlap count, ReDimNet2-B6 windows are
+clustered and resegmented ("V5-fast", see the admin settings notes below). The diarization
+supplies standard turns, exclusive turns, and overlap intervals in the payload shape of the
+former G3_DIA `/v2/diarize` (`models.diarization` = `{"id": "g3-whisper/seg3-redimnet2-v4",
+"engine": "local", "segmentation": ..., "window_filter": "silero"}`). Without a usable
+segmentation-3.0 checkpoint the request answers `503 MODEL_UNAVAILABLE`. Exclusive turns drive ASR. ReDimNet speaker vectors are
 created only from non-overlapping speech after a 200 ms boundary margin, a minimum two
 seconds of clean speech, three-second target windows, and loudness/clipping/finite-value
 quality checks.
@@ -504,7 +507,7 @@ matching enforces a global one-to-one assignment. Quality is one of `ready`,
 `low_support`, `mixed_cluster`, or `insufficient_clean_speech`.
 
 When refinement is `shadow` or `conservative`, the server evaluates the original,
-unmerged exclusive DIA turns after the ReDimNet clouds have been computed and before
+unmerged exclusive diarization turns after the ReDimNet clouds have been computed and before
 ASR. It reuses those vectors; no second model inference occurs. `shadow` only reports
 high-confidence proposals. `conservative` applies whole-turn proposals synchronously,
 rebuilds the clouds from the same vectors, and accepts the pass only if speaker-count,
@@ -533,13 +536,13 @@ Each transcript segment contains:
 - `text`
 - `overlap`
 
-Known matches use the supplied profile ID. Unknown and unresolved DIA speakers retain a
-stable DIA-derived ID and return their cleaned vector collection for later enrollment.
+Known matches use the supplied profile ID. Unknown and unresolved speakers retain a
+stable diarization-derived ID and return their cleaned vector collection for later enrollment.
 Each such collection contains at most 64 entries: one `prototype`, followed by at most
 63 diverse time-coded `representative` entries. The cap and representative selection
 are deterministic.
 
-`diarization_speaker_id` is immutable provenance from DIA. When refinement is enabled,
+`diarization_speaker_id` is immutable provenance from the diarization. When refinement is enabled,
 `refined_diarization_speaker_id` is the label used for final cloud/profile assignment; it
 equals the original label for unchanged, shadowed, or rolled-back turns. A known match can
 then replace the public `speaker_id` with the client-supplied profile ID without changing
@@ -723,8 +726,8 @@ its wall time is exposed as `timings_ms.unknown_speaker_audio`.
 
 Both request fields are additive and default to the previous behavior. Omitting them
 keeps transcript/embedding response shapes unchanged: no refinement object, no refined
-label, and no embedded MP3. Existing `/transcribe/`, `/v1/audio/transcriptions`, and
-G3_DIA interfaces are unaffected.
+label, and no embedded MP3. Existing `/transcribe/` and `/v1/audio/transcriptions`
+interfaces are unaffected.
 
 #### v2 errors
 
@@ -757,14 +760,12 @@ Relevant status codes:
 - `401`: missing/invalid Whisper client API key after public API protection is enabled
 - `413`: `request` JSON exceeds 16 MiB
 - `422`: invalid schema/mode, IDs, counts, profile vectors, or insufficient usable speech
-- `503`: the effective DIA URL is invalid for a `diarization` request (`DIA_NOT_CONFIGURED`; without a saved URL or `DIA_SERVER_BASE_URL` the default `http://127.0.0.1:7864` is used), or a required local model is unavailable (`MODEL_UNAVAILABLE`; mit `diarization_engine: "local"` auch ohne ladbaren seg-3.0-Checkpoint, `retryable: false`, kein Rueckfall auf DIA)
-- `502`: DIA rejected Whisper authentication, returned an upstream error, or violated the v2 response contract
-- `504`: DIA request timeout
+- `503`: a required local model is unavailable (`MODEL_UNAVAILABLE`, `retryable: false`); for a `diarization` request also when no seg-3.0 checkpoint can be loaded
 - `500`: unexpected local processing failure
 
-The main DIA error codes are `DIA_NOT_CONFIGURED`, `DIA_AUTH_FAILED`,
-`DIA_UPSTREAM_ERROR`, `DIA_INVALID_RESPONSE`, and `DIA_TIMEOUT`. Secrets are never
-included in error bodies or logs.
+The former G3_DIA error codes (`DIA_NOT_CONFIGURED`, `DIA_AUTH_FAILED`,
+`DIA_UPSTREAM_ERROR`, `DIA_INVALID_RESPONSE`, `DIA_TIMEOUT`, HTTP 502/504) no longer occur:
+the diarization runs in this process. Secrets are never included in error bodies or logs.
 
 #### Repetition filtering
 
@@ -787,7 +788,7 @@ X-G3-Repetition-Filter: off
 Purpose:
 
 - tells a client what the service does right now, without sending audio
-- needs no API key, like `GET /v1/models`, and returns no secret and no DIA URL
+- needs no API key, like `GET /v1/models`, and returns no secret
 
 Response shape:
 
@@ -810,7 +811,7 @@ Response shape:
   },
   "modes": ["embedding", "transcript", "transcript_embedding", "diarization"],
   "embedding": { "id": "ReDimNet2-B6" },
-  "diarization": { "configured": true, "engine": "dia" },
+  "diarization": { "configured": true, "engine": "local", "model": "g3-whisper/seg3-redimnet2-v4" },
   "speaker_turns": { "supported": true, "embedding_model": "ReDimNet2-B6", "dimension": 192, "max_known_speakers": 16 }
 }
 ```
@@ -822,8 +823,8 @@ Notes:
 - `language.detection` describes the Cohere language detection: the admin switch, the configured model and whether it is resident (it loads at startup on Cohere, otherwise on first use).
 - `language.applied` is false on Parakeet: that engine detects the language itself and ignores the setting and a v2 `language`.
 - `language.options` is the global list `POST /v2/audio/process` validates against, it does not change with the model.
-- `diarization.configured` means a usable DIA URL exists, the built-in default counts. It does not test that the DIA server is up, `POST /api/admin/dia/test` does.
-- `diarization.engine` ist `dia` (G3_DIA-Server) oder `local` (seg-3.0 + ReDimNet2 im Prozess). Bei `local` heisst `configured`: ein seg-3.0-Checkpoint ist vorhanden und sein letzter Ladeversuch ist nicht gescheitert; dazu `model: "g3-whisper/seg3-redimnet2-v4"`.
+- `diarization.configured`: ein seg-3.0-Checkpoint ist vorhanden und sein letzter Ladeversuch ist nicht gescheitert (sonst antwortet der Modus `diarization` mit `503 MODEL_UNAVAILABLE`).
+- `diarization.engine` ist immer `local` (seg-3.0 + ReDimNet2 im Prozess); das Feld bleibt fuer Clients, die es lesen. Der fruehere Wert `dia` (externer G3_DIA-Server) kommt nicht mehr vor. `model` ist `g3-whisper/seg3-redimnet2-v4`.
 - `speaker_turns` (siehe [`transcript` mit `speaker_turns`](#transcript-mit-speaker_turns-live-sprecher)): `supported: true` nur bei `speaker_turns_enabled`, nutzbarem seg-3.0-Checkpoint und lokal vorhandenem MMS_FA-Checkpoint (`<torch-hub>/checkpoints/model.pt`, fuer die Wortzeiten), sonst `{ "supported": false }`. Die Abfrage prueft nur Dateien, laedt kein Modell und wartet nie auf ein laufendes Laden.
 - Older servers answer this path with the HTML landing page and status 200, not with 404. A client must treat a non-JSON answer as "not available".
 
@@ -855,7 +856,7 @@ Runtime behavior:
 - `voice_ident=true` bypasses batching and runs under the local GPU lock
 - only this native route can return `voice_vector`
 - legacy field names and response shape are unchanged, but `voice_vector` is now always a normalized 192-D ReDimNet2-B6 vector rather than a 512-D legacy vector
-- this route never contacts DIA; multi-speaker audio therefore yields a mixed recording-level vector
+- this route never diarizes; multi-speaker audio therefore yields a mixed recording-level vector
 
 Success response without voice embedding:
 
@@ -1100,13 +1101,8 @@ Response shape:
     "redimnet_max_batch_size": 8,
     "debug_retain_history_audio": false,
     "huggingface_token": "hf_xxx",
-    "dia_server_base_url": "http://dia:7864",
-    "dia_server_base_url_effective": "http://dia:7864",
-    "dia_server_base_url_source": "settings",
-    "dia_api_key": "",
-    "dia_api_key_configured": true,
-    "dia_api_key_source": "settings",
     "segmentation_model_path": "",
+    "speaker_turns_enabled": true,
     "model_profiles": {
       "openai/whisper-large-v3-turbo": { "batch_max_segments": 16, "transcription_language": "de" }
     }
@@ -1167,8 +1163,8 @@ Response shape:
   "service_fields": [
     "local_model_cache_path",
     "huggingface_token",
-    "dia_server_base_url",
-    "dia_api_key",
+    "segmentation_model_path",
+    "speaker_turns_enabled",
     "debug_retain_history_audio"
   ]
 }
@@ -1201,9 +1197,7 @@ Request body:
   "language_detection_model": "openai/whisper-base",
   "redimnet_max_batch_size": 8,
   "debug_retain_history_audio": false,
-  "huggingface_token": "hf_xxx",
-  "dia_server_base_url": "http://dia:7864",
-  "dia_api_key": "dia_xxx"
+  "huggingface_token": "hf_xxx"
 }
 ```
 
@@ -1238,22 +1232,17 @@ Notes:
 - `debug_retain_history_audio` defaults to `false`. When enabled, successful public API requests may retain their byte-identical original upload for the 25-row admin history; disabling it blocks access immediately and purges retained audio after active readers finish.
 - updates are partial merges; omitted fields keep their saved value, so older admin clients cannot remove newer settings
 - `local_gpu_device` `cuda:N` follows nvidia-smi numbering: the server sets `CUDA_DEVICE_ORDER=PCI_BUS_ID` (unless the environment sets it) before torch initialises CUDA; device options show index, name and memory size
-- `dia_server_base_url` configures the DIA service used by diarization requests; empty means "use the default": `DIA_SERVER_BASE_URL` if set, else `http://127.0.0.1:7864` (G3_DIA on the same machine). `dia_server_base_url_effective` shows the URL in use and `dia_server_base_url_source` is `settings`, `environment` or `default`
 - a fresh install (no settings file) starts with the defaults plus the `24GB VRAM` preset and saves them; existing settings files are left alone
-- `dia_api_key` is write-only: a non-empty value replaces the saved key, while an omitted or empty value preserves it
-- settings responses always return `dia_api_key` as an empty string and expose only `dia_api_key_configured` plus its `settings` / `environment` / `none` source
-- saved DIA values take precedence over the `DIA_SERVER_BASE_URL` and `DIA_SERVER_API_KEY` environment fallbacks
-- the key is sent upstream only in `X-API-Key` and is never returned or written to application logs
-- DIA settings affect only v2 requests whose mode is `diarization`
-- `diarization_engine` (`dia` Standard, `local`; anderes faellt auf `dia`): `local` rechnet den Modus `diarization` ohne DIA-Server im Prozess (seg-3.0-Sprecherzahl, ReDimNet2-Fenster 3 s/0,5 s, 1,5 s/0,25 s und 0,75 s/0,25 s mit Silero-Filter, AHC, Viterbi-Nachsegmentierung, Pruefung der lokalen Sprecher, Abstands- und Teilungspruefung der Cluster, Overlap-Fuellung mit der weichen seg-3.0-Overlap-Wahrscheinlichkeit) und liefert danach denselben Ablauf wie mit DIA (Speaker-Clouds, Verfeinerung, WXC, Abgleich bekannter Sprecher). Bestehende Installationen bleiben auf `dia`. Ohne ladbares Modell antwortet `local` mit `503 MODEL_UNAVAILABLE`, ohne Rueckfall auf DIA (der Betreiber hat die Engine gewaehlt; ein stiller Rueckfall wuerde einen kaputten Checkpoint verbergen). Stand "V5-fast": Silero laeuft neben seg-3.0; die 3-s- und 1,5-s-Fenster rechnet eine reine FP16-Kopie von ReDimNet (nur fuer die Diarisierung, rund 25 MB; die oeffentlichen Stimmvektoren bleiben beim bisherigen Modell) in doppelt so grossen Batches wie `redimnet_max_batch_size`; 0,75-s-Fenster werden erst nach dem Clustern gerechnet und nur dort, wo die Zuordnung unsicher ist (Abstand der besten zwei Cluster unter 0,3, seg-3.0-Overlap oder Sprecherwechsel; auf den vier Messdateien 2 bis 23 % der 0,75-s-Fenster); dazu je lokalem seg-3.0-Sprecher ein Mittelwert der ohnehin gerechneten Fenster als Zusatzterm, ohne eigenen GPU-Lauf. Gemessen (Forschungsbench gegen menschliche Referenz-RTTMs, Overlap mitgezaehlt, DER ohne Collar, Dateimittel): auf den 129 Abstimmungsdateien (synthetisch, AMI, VoxConverse dev) 10,17 % (V5 10,23 %, DIA 12,25 %), Sprecherzahl 100 richtig (V5 100, DIA 95); auf 81 gehaltenen, einmal bewerteten Dateien (AMI, AMI-SDM, VoxConverse-Test) 12,37 % (V5 12,39 %, zeitgewichtet 0,10 Punkte besser als V5), VoxConverse-Test 11,17 % (V5 11,13 %, gleichauf; DIA 12,77 %), Sprecherzahl 46 richtig (V5 46, DIA 40). Diarisierung ohne ASR auf einer RTX 3090 etwa 1,16 s je Audiominute (V5 1,88 s), reservierter CUDA-Pool unveraendert rund 1,9 GiB. Der bisherige V5-Ablauf bleibt intern abrufbar (`run_local_diarization(..., params=V5_PARAMS, half_embed=False)`).
-- `segmentation_model_path` (leer = HF-Cache, siehe Laufzeithinweise) und `speaker_turns_enabled` (strikter Boolean, Standard `true`; wirkt nur mit nutzbarem Checkpoint) gehoeren wie `diarization_engine` zu den Dienstfeldern, nicht zu Presets. Speichern laedt kein ASR-Modell neu; ein geladenes seg-3.0 mit anderem Pfad oder Geraet, oder ohne nutzende Funktion, wird freigegeben und beim naechsten Gebrauch neu geladen.
+- the settings of the removed G3_DIA integration (`diarization_engine`, `dia_server_base_url`, `dia_api_key`, also their `*_effective`/`*_source`/`*_configured` response fields) are gone: a `PUT` that still sends them is accepted and ignores them, and a settings file that still contains them loads without error and loses them on the next save; `DIA_SERVER_BASE_URL`/`DIA_SERVER_API_KEY` are no longer read
+- Diarisierung (V5-fast): der Modus `diarization` rechnet die Sprechertrennung immer im Prozess (seg-3.0-Sprecherzahl, ReDimNet2-Fenster 3 s/0,5 s, 1,5 s/0,25 s und 0,75 s/0,25 s mit Silero-Filter, AHC, Viterbi-Nachsegmentierung, Pruefung der lokalen Sprecher, Abstands- und Teilungspruefung der Cluster, Overlap-Fuellung mit der weichen seg-3.0-Overlap-Wahrscheinlichkeit) und liefert danach Speaker-Clouds, Verfeinerung, WXC und den Abgleich bekannter Sprecher. Ohne ladbaren seg-3.0-Checkpoint antwortet er mit `503 MODEL_UNAVAILABLE`. Stand "V5-fast": Silero laeuft neben seg-3.0; die 3-s- und 1,5-s-Fenster rechnet eine reine FP16-Kopie von ReDimNet (nur fuer die Diarisierung, rund 25 MB; die oeffentlichen Stimmvektoren bleiben beim bisherigen Modell) in doppelt so grossen Batches wie `redimnet_max_batch_size`; 0,75-s-Fenster werden erst nach dem Clustern gerechnet und nur dort, wo die Zuordnung unsicher ist (Abstand der besten zwei Cluster unter 0,3, seg-3.0-Overlap oder Sprecherwechsel; auf den vier Messdateien 2 bis 23 % der 0,75-s-Fenster); dazu je lokalem seg-3.0-Sprecher ein Mittelwert der ohnehin gerechneten Fenster als Zusatzterm, ohne eigenen GPU-Lauf. Gemessen (Forschungsbench gegen menschliche Referenz-RTTMs, Overlap mitgezaehlt, DER ohne Collar, Dateimittel): auf den 129 Abstimmungsdateien (synthetisch, AMI, VoxConverse dev) 10,17 % (V5 10,23 %, frueherer G3_DIA 12,25 %), Sprecherzahl 100 richtig (V5 100, der fruehere G3_DIA 95); auf 81 gehaltenen, einmal bewerteten Dateien (AMI, AMI-SDM, VoxConverse-Test) 12,37 % (V5 12,39 %, zeitgewichtet 0,10 Punkte besser als V5), VoxConverse-Test 11,17 % (V5 11,13 %, gleichauf; frueherer G3_DIA 12,77 %), Sprecherzahl 46 richtig (V5 46, frueherer G3_DIA 40). Diarisierung ohne ASR auf einer RTX 3090 etwa 1,16 s je Audiominute (V5 1,88 s), reservierter CUDA-Pool unveraendert rund 1,9 GiB. Der bisherige V5-Ablauf bleibt intern abrufbar (`run_local_diarization(..., params=V5_PARAMS, half_embed=False)`).
+- `segmentation_model_path` (leer = HF-Cache, siehe Laufzeithinweise) und `speaker_turns_enabled` (strikter Boolean, Standard `true`; wirkt nur mit nutzbarem Checkpoint) gehoeren zu den Dienstfeldern, nicht zu Presets. Speichern laedt kein ASR-Modell neu; ein geladenes seg-3.0 mit anderem Pfad oder Geraet wird freigegeben und beim naechsten Gebrauch neu geladen.
 
 ### `GET /api/admin/settings/presets`
 
 Purpose:
 
 - lists the named settings presets: the built-in GPU tiers first, in tier order, then the saved presets by name
-- built-in tiers (identical names across the G3 services): `32GB VRAM` (RTX 5090, every G3 service on one card), `24GB VRAM` (RTX 4090, every G3 service on one card) and `24+8 VRAM` (3090 + 2070S box, Whisper on the 24 GB card). Whisper has no `8+24 VRAM` tier; on the two-GPU box only DIA runs on the 8 GB card.
+- built-in tiers (identical names across the G3 services): `32GB VRAM` (RTX 5090, every G3 service on one card), `24GB VRAM` (RTX 4090, every G3 service on one card) and `24+8 VRAM` (3090 + 2070S box, Whisper on the 24 GB card). Whisper has no `8+24 VRAM` tier (it does not fit the 8 GB card); the diarization runs inside Whisper, so this service leaves the 8 GB card unused.
 - a tier with a `target_vram_gb` gets `local_gpu_device` set to the CUDA card whose total memory matches within 2 GiB (machines number their cards differently); if no card matches, `local_gpu_device` is left out and `note` explains why. Single-card tiers never set the GPU.
 - `model_id` is derived for each item and never part of `values`: `32GB VRAM`, `24GB VRAM` and `24+8 VRAM` belong to Cohere, `Parakeet 8GB VRAM` to Parakeet, a saved preset to its `values.local_model`. `null` means usable for every model.
 
@@ -1311,7 +1300,7 @@ Request body:
 
 Notes:
 
-- only the preset keys are stored: `local_model`, `local_gpu_device`, `local_model_precision`, `batch_wait_time_ms`, `batch_max_segments`, `batch_max_audio_seconds`, `scheduler_long_job_min_chunks`, `scheduler_max_parallel_long_jobs`, `scheduler_first_chunk_fast_path`, `cuda_memory_trim_after_batch`, `cohere_cuda_graphs`, `redimnet_max_batch_size`. Every other key (token, DIA URL/key, model cache path, language, debug audio) is dropped; the kept values are normalised exactly like saved settings.
+- only the preset keys are stored: `local_model`, `local_gpu_device`, `local_model_precision`, `batch_wait_time_ms`, `batch_max_segments`, `batch_max_audio_seconds`, `scheduler_long_job_min_chunks`, `scheduler_max_parallel_long_jobs`, `scheduler_first_chunk_fast_path`, `cuda_memory_trim_after_batch`, `cohere_cuda_graphs`, `redimnet_max_batch_size`. Every other key (token, model cache path, language, debug audio) is dropped; the kept values are normalised exactly like saved settings.
 - names are trimmed, inner whitespace collapsed, at most 64 characters
 - `400` for an empty or too long name, a built-in tier name, or values without any preset key
 - presets are stored in `logs/genesis_whisper_presets.json` next to the settings file (atomic write)
@@ -1323,42 +1312,6 @@ Purpose:
 
 - deletes a saved preset
 - `400` for a built-in tier name, `404` if no saved preset has that name
-
-### `DELETE /api/admin/settings/dia-api-key`
-
-Purpose:
-
-- explicitly deletes only the DIA API key saved in the settings file
-- reports whether a `DIA_SERVER_API_KEY` environment fallback remains active
-- cannot modify or reveal environment secrets
-
-### `POST /api/admin/dia/test`
-
-Purpose:
-
-- tests the saved/environment DIA configuration or unsaved URL/key values from the admin form
-- requests `<DIA base URL>/v2/capabilities` with the key in `X-API-Key`
-- does not follow redirects and never includes the key or the upstream response body in its response
-
-Optional request body:
-
-```json
-{
-  "dia_server_base_url": "http://dia:7864",
-  "dia_api_key": "dia_xxx"
-}
-```
-
-Success response:
-
-```json
-{
-  "ok": true,
-  "base_url": "http://dia:7864",
-  "status_code": 200,
-  "message": "DIA server connection succeeded."
-}
-```
 
 ### `GET /api/admin/models`
 
@@ -1425,7 +1378,7 @@ Behavior:
 - the tuned values of the old model go to its profile in `model_profiles`, the target's profile applies. Tuned are the preset keys without `local_model` and `local_gpu_device`, plus `transcription_language`.
 - a target without a profile starts from the tier it owns (Cohere `24GB VRAM`, Parakeet `Parakeet 8GB VRAM`), a Whisper size keeps the current values
 - the language must not change for clients: a target without a profile takes the old model's effective language. Cohere with `auto` and language detection on hands `auto` to the next model (Whisper then detects by itself); with detection off it hands `de`
-- device, cache path, token, DIA settings and the debug audio switch do not move
+- device, cache path, token, diarization settings and the debug audio switch do not move
 - the settings are saved first, then the model loads under the GPU lock and ReDimNet and MMS_FA are re-prepared when needed, the same path as `PUT /api/admin/settings`
 - the same model while it is loaded is a no-op with `ok: true` and `model_reloaded: false`
 - the same model while it is not loaded loads it: this is the retry after a failed load. No setting changes and `model_reloaded` is `true`; a load that fails again is a `500` and the selection stays.
@@ -1569,7 +1522,7 @@ Purpose:
 Supported retry modes are `transcript` and `transcript_embedding`. Legacy
 `voice_ident=true` maps to `transcript_embedding`; legacy/v1 requests without voice
 identification map to `transcript`; v2 transcript modes remain unchanged. Pure `embedding`
-and `diarization` entries expose `retry_mode: null` because DIA profiles and request metadata
+and `diarization` entries expose `retry_mode: null` because speaker profiles and request metadata
 are not retained.
 
 A successful response identifies the new entry and its source:
@@ -1713,11 +1666,11 @@ Special case:
 - direct `soundfile` decode is preferred; `ffmpeg` is the fallback for unsupported formats
 - the `ffmpeg` fallback uses a seekable temporary input, so MP4/M4A/MOV containers with metadata at the end are supported
 - upload decoding runs outside the async request loop and does not first copy the complete upload into a second in-memory bytes object
-- v2 diarization rewinds and streams the original spooled upload to DIA without creating another full-file RAM copy
+- v2 diarization works on the decoded audio in this process; the upload is not sent to another service
 - Whisper chunking currently uses the energy-based speech detector
 - Cohere uses the active saved language; with `auto` it detects the language per request (see [Language detection on Cohere](#language-detection-on-cohere-auto)) and falls back to `de` when detection is off, impossible or unavailable
 - For gated Cohere models, the runtime loader reuses the saved Hugging Face token and completes incomplete local snapshots before loading from the finished local snapshot.
 - admin benchmark and public transcription log into [`logs`](x:/dev/G3_WHISPER/logs)
 - optional history debug audio lives under `logs/debug-audio`, is never written into JSONL, and is purged on start, shutdown, or setting disable; capture time is reported separately and is excluded from pipeline phase timings
-- the optional `GENESIS_GPU_LEASE_PATH` file lock can serialize CUDA phases with a colocated DIA process; without it only each service's in-process locks apply
-- DIA-freie Diarisierung und `speaker_turns`: `segmentation_model_path` nennt einen pyannote-segmentation-3.0-Checkpoint (`pytorch_model.bin`); leer sucht der Server ihn im HF-Cache von `local_model_cache_path` (`models--pyannote--speaker-diarization-community-1/snapshots/*/segmentation/pytorch_model.bin`, dann `models--pyannote--segmentation-3.0`), danach in `HF_HUB_CACHE` bzw. `~/.cache/huggingface/hub`. Es wird nie etwas heruntergeladen. Das Modell (rund 6 MB Gewichte) folgt `local_gpu_device`. Der Checkpoint wird mit einem eingeschraenkten Unpickler gelesen, der ausser Tensoren nichts aus der Datei ausfuehrt; ein TorchScript-Archiv (`constants.pkl` oder `code/` im Zip, das `torch.load` sonst an `torch.jit.load` weiterreicht) wird vorher abgelehnt. Die Antwortform der lokalen Diarisierung ist die von G3_DIA `/v2/diarize`. Beim Start wird seg-3.0 geladen und einmal gerechnet und ReDimNet fuer 1,5-s-Fenster vorgewaermt, nur wenn `diarization_engine` `local` ist oder `speaker_turns_enabled` an; mit `diarization_engine` `local` zusaetzlich die FP16-Kopie von ReDimNet mit ihren drei Fensterformen und die numba-Viterbi-Schleife (ohne numba die bitgleiche numpy-Schleife); mit `speaker_turns_enabled` zusaetzlich MMS_FA (rund 0,6 GB FP16 dauerhaft) und Silero, beide nur aus lokalen Dateien. Alle GPU-Phasen laufen in Scheiben unter der GPU-Sperre (seg-3.0: 128 Chunks, ReDimNet: 64 Fenster je Halten, die Diarisierungsfenster 48 s Audio je Halten), die CPU-Arbeit in Worker-Threads; das Freigeben des CUDA-Pools nach 5 s Ruhe bleibt unveraendert.
+- the optional `GENESIS_GPU_LEASE_PATH` file lock can serialize CUDA phases with another colocated GPU process that honours the same lease; without it only each service's in-process locks apply
+- Diarisierung und `speaker_turns`: `segmentation_model_path` nennt einen pyannote-segmentation-3.0-Checkpoint (`pytorch_model.bin`); leer sucht der Server ihn im HF-Cache von `local_model_cache_path` (`models--pyannote--speaker-diarization-community-1/snapshots/*/segmentation/pytorch_model.bin`, dann `models--pyannote--segmentation-3.0`), danach in `HF_HUB_CACHE` bzw. `~/.cache/huggingface/hub`. Es wird nie etwas heruntergeladen. Das Modell (rund 6 MB Gewichte) folgt `local_gpu_device`. Der Checkpoint wird mit einem eingeschraenkten Unpickler gelesen, der ausser Tensoren nichts aus der Datei ausfuehrt; ein TorchScript-Archiv (`constants.pkl` oder `code/` im Zip, das `torch.load` sonst an `torch.jit.load` weiterreicht) wird vorher abgelehnt. Die Antwortform der Diarisierung ist die des frueheren G3_DIA `/v2/diarize`. Beim Start wird seg-3.0 geladen und einmal gerechnet und ReDimNet fuer 1,5-s-Fenster vorgewaermt, dazu immer die FP16-Kopie von ReDimNet mit ihren drei Fensterformen und die numba-Viterbi-Schleife (ohne numba die bitgleiche numpy-Schleife); mit `speaker_turns_enabled` zusaetzlich MMS_FA (rund 0,6 GB FP16 dauerhaft) und Silero, beide nur aus lokalen Dateien. Alle GPU-Phasen laufen in Scheiben unter der GPU-Sperre (seg-3.0: 128 Chunks, ReDimNet: 64 Fenster je Halten, die Diarisierungsfenster 48 s Audio je Halten), die CPU-Arbeit in Worker-Threads; das Freigeben des CUDA-Pools nach 5 s Ruhe bleibt unveraendert.

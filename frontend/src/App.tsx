@@ -22,7 +22,6 @@ import {
   changePassword,
   createApiKey,
   deleteApiKey,
-  deleteDiaApiKey,
   deleteModel,
   deletePreset,
   downloadHistoryAudio,
@@ -41,7 +40,6 @@ import {
   savePreset,
   saveSettings,
   selectModel,
-  testDiaConnection,
   whoami,
 } from "./api";
 import { KeepEdits, mergeServerSettings } from "./settingsForm";
@@ -92,7 +90,7 @@ const PIPELINE_MODES: Array<{ value: AudioProcessMode; label: string; descriptio
   {
     value: "diarization",
     label: "Full diarization",
-    description: "DIA speaker separation, ASR, speaker profile matching, and unknown voices.",
+    description: "Speaker separation (seg-3.0 + ReDimNet2), ASR, speaker profile matching, and unknown voices.",
   },
 ];
 
@@ -121,15 +119,8 @@ const emptySettings: AdminSettings = {
   redimnet_max_batch_size: 8,
   debug_retain_history_audio: false,
   huggingface_token: "",
-  dia_server_base_url: "",
-  dia_api_key: "",
-  diarization_engine: "dia",
   segmentation_model_path: "",
   speaker_turns_enabled: true,
-  dia_api_key_configured: false,
-  dia_api_key_source: "none",
-  dia_server_base_url_effective: "",
-  dia_server_base_url_source: "default",
 };
 
 function formatValue(value: number | null | undefined, suffix = "") {
@@ -661,9 +652,6 @@ export default function App() {
   const [presetBusy, setPresetBusy] = useState(false);
   const [presetMessage, setPresetMessage] = useState("");
   const [presetFailed, setPresetFailed] = useState(false);
-  const [diaActionBusy, setDiaActionBusy] = useState<"test" | "clear" | null>(null);
-  const [diaActionMessage, setDiaActionMessage] = useState("");
-  const [diaActionSucceeded, setDiaActionSucceeded] = useState<boolean | null>(null);
   const [benchmarkFile, setBenchmarkFile] = useState<File | null>(null);
   const [benchmarkRepeatCount, setBenchmarkRepeatCount] = useState(1);
   const [benchmarkBusy, setBenchmarkBusy] = useState(false);
@@ -717,9 +705,6 @@ export default function App() {
       setCreatedKey(null);
       setSaveMessage("");
       setSaveFailed(false);
-      setDiaActionBusy(null);
-      setDiaActionMessage("");
-      setDiaActionSucceeded(null);
       setBenchmarkMessage("");
       setBenchmarkResult(null);
       setBenchmarkFile(null);
@@ -884,7 +869,7 @@ export default function App() {
   }
 
   function applySettings(payload: SettingsResponse, keepEdits?: KeepEdits) {
-    const next = { ...emptySettings, ...payload.settings, dia_api_key: "" };
+    const next = { ...emptySettings, ...payload.settings };
     const baseline = settingsBaseline.current;
     settingsBaseline.current = next;
     setSettingsForm((current) => mergeServerSettings(current, baseline, next, keepEdits, payload.service_fields));
@@ -1195,67 +1180,6 @@ export default function App() {
       }
       setSaveMessage(error instanceof Error ? error.message : "The settings could not be reloaded.");
       setSaveFailed(true);
-    }
-  }
-
-  async function handleTestDiaConnection() {
-    setDiaActionBusy("test");
-    setDiaActionMessage("");
-    setDiaActionSucceeded(null);
-    setGlobalError("");
-
-    try {
-      const response = await testDiaConnection(settingsForm.dia_server_base_url, settingsForm.dia_api_key);
-      setDiaActionMessage(`${response.message} (${response.base_url})`);
-      setDiaActionSucceeded(true);
-    } catch (error) {
-      if (handleApiError(error, "DIA connection test failed.")) {
-        return;
-      }
-      setDiaActionMessage(error instanceof Error ? error.message : "DIA connection test failed.");
-      setDiaActionSucceeded(false);
-    } finally {
-      setDiaActionBusy(null);
-    }
-  }
-
-  async function handleClearDiaApiKey() {
-    if (settingsForm.dia_api_key) {
-      updateSetting("dia_api_key", "");
-      setDiaActionMessage("The unsaved DIA API key was discarded.");
-      setDiaActionSucceeded(true);
-      return;
-    }
-    if (settingsForm.dia_api_key_source !== "settings") {
-      return;
-    }
-    if (!window.confirm("Delete the saved DIA API key? This does not remove an environment variable.")) {
-      return;
-    }
-
-    setDiaActionBusy("clear");
-    setDiaActionMessage("");
-    setDiaActionSucceeded(null);
-    setGlobalError("");
-    try {
-      const response = await deleteDiaApiKey();
-      applySettings(response);
-      setDiaActionMessage(
-        response.environment_fallback_active
-          ? "Saved DIA API key deleted. DIA_SERVER_API_KEY remains active as the environment fallback."
-          : response.removed
-            ? "Saved DIA API key deleted."
-            : "No saved DIA API key was present.",
-      );
-      setDiaActionSucceeded(true);
-    } catch (error) {
-      if (handleApiError(error, "The DIA API key could not be deleted.")) {
-        return;
-      }
-      setDiaActionMessage(error instanceof Error ? error.message : "The DIA API key could not be deleted.");
-      setDiaActionSucceeded(false);
-    } finally {
-      setDiaActionBusy(null);
     }
   }
 
@@ -2025,7 +1949,7 @@ export default function App() {
               </label>
 
               <p className="field-note pipeline-json-note">
-                Shadow reports proposed DIA-label corrections without changing the transcript. Conservative applies
+                Shadow reports proposed label corrections without changing the transcript. Conservative applies
                 only changes that pass all safety checks and otherwise rolls back the full refinement pass.
               </p>
 
@@ -2152,7 +2076,7 @@ export default function App() {
                         <div>
                           <span>{speaker.speaker_kind}</span>
                           <strong>{speaker.speaker_id}</strong>
-                          <small>Original DIA: {speaker.diarization_speaker_id}</small>
+                          <small>Original label: {speaker.diarization_speaker_id}</small>
                         </div>
                         <div className="pipeline-speaker-audio-meta">
                           <strong>{formatFixed((speaker.audio?.duration_ms ?? 0) / 1000, 2, " s")}</strong>
@@ -2218,7 +2142,7 @@ export default function App() {
                       <thead>
                         <tr>
                           <th>Time</th>
-                          <th>DIA Label</th>
+                          <th>Speaker Label</th>
                           <th>Support</th>
                           <th>Similarity Evidence</th>
                           <th>Outcome</th>
@@ -2293,7 +2217,7 @@ export default function App() {
                           <td className="mono">{formatTimecode(segment.start_ms)}–{formatTimecode(segment.end_ms)}</td>
                           <td>
                             <strong>{segment.speaker_id}</strong>
-                            <small>Original DIA: {segment.diarization_speaker_id}</small>
+                            <small>Original label: {segment.diarization_speaker_id}</small>
                             {segment.refined_diarization_speaker_id && (
                               <small
                                 className={
@@ -2302,7 +2226,7 @@ export default function App() {
                                     : ""
                                 }
                               >
-                                Refined DIA: {segment.refined_diarization_speaker_id}
+                                Refined label: {segment.refined_diarization_speaker_id}
                               </small>
                             )}
                           </td>
@@ -2458,7 +2382,7 @@ export default function App() {
               <p className="field-note full-width">
                 Built-in names cannot be overwritten. A saved preset belongs to the active model. It stores only model,
                 device, precision, batching and VRAM settings; the model cache path, the language, the Hugging Face
-                token and the DIA connection are never stored in a preset.
+                token are never stored in a preset.
               </p>
               <div className="button-row full-width">
                 <button
@@ -2768,138 +2692,17 @@ export default function App() {
                   </>
                 )}
 
-                {(serviceFields.includes("dia_server_base_url") || serviceFields.includes("dia_api_key")) && (
-                  <div className="dia-settings full-width">
-                    <div className="settings-subheading">
-                      <div>
-                        <span className="eyebrow">DIA Integration</span>
-                        <h3>Diarization Server</h3>
-                      </div>
-                      <span className={`connection-status ${settingsForm.dia_api_key_configured ? "configured" : ""}`}>
-                        {settingsForm.dia_api_key_configured
-                          ? `API key: ${settingsForm.dia_api_key_source}`
-                          : "No API key configured"}
-                      </span>
-                    </div>
-
-                    <div className="dia-settings-grid">
-                      {serviceFields.includes("dia_server_base_url") && (
-                        <label className="full-width">
-                          <span>DIA Server URL</span>
-                          <input
-                            type="url"
-                            placeholder={settingsForm.dia_server_base_url_effective || "http://127.0.0.1:7864"}
-                            value={settingsForm.dia_server_base_url}
-                            onChange={(event) => updateSetting("dia_server_base_url", event.target.value)}
-                          />
-                        </label>
-                      )}
-                      {settingsForm.dia_server_base_url_source === "environment" && !settingsForm.dia_server_base_url && (
-                        <p className="field-note full-width">
-                          Using <code>{settingsForm.dia_server_base_url_effective}</code> from <code>DIA_SERVER_BASE_URL</code>.
-                        </p>
-                      )}
-                      {settingsForm.dia_server_base_url_source === "default" && !settingsForm.dia_server_base_url && (
-                        <p className="field-note full-width">
-                          Empty: using the default <code>{settingsForm.dia_server_base_url_effective || "http://127.0.0.1:7864"}</code>{" "}
-                          (G3_DIA on this machine). <code>DIA_SERVER_BASE_URL</code> overrides the default, a URL entered
-                          here overrides both.
-                        </p>
-                      )}
-
-                      {serviceFields.includes("dia_api_key") && (
-                        <>
-                          <label className="full-width">
-                            <span>DIA API Key</span>
-                            <input
-                              type="password"
-                              autoComplete="new-password"
-                              placeholder={settingsForm.dia_api_key_configured ? "Enter a new key to replace the configured key" : "Optional"}
-                              value={settingsForm.dia_api_key}
-                              onChange={(event) => updateSetting("dia_api_key", event.target.value)}
-                            />
-                          </label>
-                          <p className="field-note full-width">
-                            Write-only: the server never returns the saved key. Leaving this field empty preserves the current
-                            key. Environment keys remain managed through <code>DIA_SERVER_API_KEY</code>.
-                          </p>
-                        </>
-                      )}
-
-                      <div className="dia-actions full-width">
-                        <button
-                          type="button"
-                          className="secondary-button"
-                          disabled={diaActionBusy !== null}
-                          onClick={() => void handleTestDiaConnection()}
-                        >
-                          {diaActionBusy === "test" ? "Testing..." : "Test DIA Connection"}
-                        </button>
-                        <button
-                          type="button"
-                          className="ghost-button danger-button"
-                          disabled={
-                            diaActionBusy !== null
-                            || (!settingsForm.dia_api_key && settingsForm.dia_api_key_source !== "settings")
-                          }
-                          onClick={() => void handleClearDiaApiKey()}
-                        >
-                          {diaActionBusy === "clear"
-                            ? "Deleting..."
-                            : settingsForm.dia_api_key
-                              ? "Discard Entered Key"
-                              : "Delete Saved Key"}
-                        </button>
-                        {diaActionMessage && (
-                          <p className={`message dia-message ${diaActionSucceeded === false ? "error" : ""}`}>
-                            {diaActionMessage}
-                          </p>
-                        )}
-                      </div>
-                    </div>
-                  </div>
-                )}
-
-                {(serviceFields.includes("diarization_engine")
-                  || serviceFields.includes("segmentation_model_path")
+                {(serviceFields.includes("segmentation_model_path")
                   || serviceFields.includes("speaker_turns_enabled")) && (
-                  <div className="dia-settings full-width">
+                  <div className="diarization-settings full-width">
                     <div className="settings-subheading">
                       <div>
                         <span className="eyebrow">Diarization</span>
-                        <h3>Engine and Live Speaker Turns</h3>
+                        <h3>Diarization and Live Speaker Turns</h3>
                       </div>
                     </div>
 
-                    <div className="dia-settings-grid">
-                      {serviceFields.includes("diarization_engine") && (
-                        <>
-                          <label className="full-width">
-                            <span>Diarization engine</span>
-                            <select
-                              value={settingsForm.diarization_engine}
-                              onChange={(event) =>
-                                updateSetting("diarization_engine", event.target.value === "local" ? "local" : "dia")
-                              }
-                            >
-                              {(settingsOptions.diarization_engines ?? [
-                                { label: "G3_DIA server", value: "dia" },
-                                { label: "Local (seg-3.0 + ReDimNet2)", value: "local" },
-                              ]).map((option) => (
-                                <option key={option.value} value={option.value}>
-                                  {option.label}
-                                </option>
-                              ))}
-                            </select>
-                          </label>
-                          <p className="field-note full-width">
-                            G3_DIA server: diarization mode asks the DIA server above. Local: this server runs the
-                            pyannote segmentation-3.0 network and ReDimNet2 itself, no DIA server needed; without a
-                            segmentation checkpoint diarization answers 503 MODEL_UNAVAILABLE (no fallback to DIA).
-                          </p>
-                        </>
-                      )}
-
+                    <div className="diarization-settings-grid">
                       {serviceFields.includes("segmentation_model_path") && (
                         <>
                           <label className="full-width">
@@ -2913,7 +2716,9 @@ export default function App() {
                           </label>
                           <p className="field-note full-width">
                             Path to a <code>pytorch_model.bin</code> of pyannote segmentation-3.0 (about 6 MB). Empty
-                            searches the model cache; nothing is ever downloaded.
+                            searches the model cache; nothing is ever downloaded. The diarization runs in this server
+                            (seg-3.0 + ReDimNet2); without a usable checkpoint diarization requests answer 503
+                            MODEL_UNAVAILABLE.
                           </p>
                         </>
                       )}

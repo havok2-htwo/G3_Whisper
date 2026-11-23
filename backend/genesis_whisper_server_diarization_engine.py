@@ -1,4 +1,4 @@
-"""Request-side driver of the DIA-free diarization and the live ``speaker_turns``.
+"""Request-side driver of the diarization and the live ``speaker_turns``.
 
 The building blocks are pure: ``genesis_whisper_server_segmentation`` (seg-3.0 port), ``..._local_diarization``
 (the V4 batch pipeline on features) and ``..._speaker_turns`` (one live section). This module runs them inside a
@@ -13,9 +13,9 @@ Batch diarization ("V5-fast"): Silero runs next to seg-3.0, the 3 s and 1.5 s wi
 copy of ReDimNet (``embed_diarization_windows``), and the 0.75 s windows only when the CPU pipeline asks for them
 in its final pass (``Features.embed075``: the worker thread schedules the sliced GPU phase on the loop and waits).
 
-Settings: ``diarization_engine`` ("dia" = the G3_DIA server, default; "local" = this pipeline),
-``speaker_turns_enabled`` (default on, effective only while the seg-3.0 checkpoint is usable) and
-``segmentation_model_path``.
+The diarization always runs in this process (the external G3_DIA server and the ``diarization_engine`` setting are
+gone; old settings files that still carry it load and drop it). Settings: ``speaker_turns_enabled`` (default on,
+effective only while the seg-3.0 checkpoint is usable) and ``segmentation_model_path``.
 """
 
 from __future__ import annotations
@@ -40,7 +40,7 @@ from .genesis_whisper_server_local_diarization import (
     assemble_windows,
     diarize_features,
     plan_scale_starts,
-    result_to_dia_payload,
+    result_to_diarization_payload,
     speech_frames_from_seg,
 )
 from .genesis_whisper_server_segmentation import (
@@ -67,9 +67,8 @@ from .genesis_whisper_server_vid import (
 )
 
 
-DIARIZATION_ENGINE_DIA = "dia"
+# Engine name in ``models.diarization`` and in the capabilities (fixed: the only engine; kept for clients).
 DIARIZATION_ENGINE_LOCAL = "local"
-DIARIZATION_ENGINES = (DIARIZATION_ENGINE_DIA, DIARIZATION_ENGINE_LOCAL)
 
 # One GPU-lock hold: 128 seg-3.0 chunks are four batches of 32 (~0.1 s on an RTX 2070S); 64 ReDimNet windows are
 # eight batches of 8 at 3 s, the same slice the speaker clouds use (1.5 s / 0.75 s windows run 2x / 4x larger
@@ -96,15 +95,6 @@ SILERO_SPEECH_PROB = 0.5
 # Settings and capabilities
 # ---------------------------------------------------------------------------
 
-def configured_diarization_engine(settings: Optional[Mapping[str, Any]] = None) -> str:
-    if settings is None:
-        with settings_lock:
-            value = current_settings.get("diarization_engine", DIARIZATION_ENGINE_DIA)
-    else:
-        value = settings.get("diarization_engine", DIARIZATION_ENGINE_DIA)
-    return value if value in DIARIZATION_ENGINES else DIARIZATION_ENGINE_DIA
-
-
 def speaker_turns_switch(settings: Optional[Mapping[str, Any]] = None) -> bool:
     """The admin switch ``speaker_turns_enabled``; a settings dict without the key counts as on."""
 
@@ -121,19 +111,12 @@ def speaker_turns_available() -> bool:
     return speaker_turns_switch() and segmentation_available() and _wxc.mms_available_locally()
 
 
-def segmentation_needed(settings: Optional[Mapping[str, Any]] = None) -> bool:
-    """Some feature uses the seg-3.0 model: the local engine or the speaker_turns switch."""
+def diarization_capability() -> Dict[str, Any]:
+    """The ``diarization`` block of ``GET /v2/capabilities``: whether it can run (a usable seg-3.0 checkpoint), the
+    engine (always "local") and the model id."""
 
-    return configured_diarization_engine(settings) == DIARIZATION_ENGINE_LOCAL or speaker_turns_switch(settings)
-
-
-def diarization_capability(dia_configured: bool) -> Dict[str, Any]:
-    """The ``diarization`` block of ``GET /v2/capabilities``: the engine and whether it can run."""
-
-    engine = configured_diarization_engine()
-    if engine == DIARIZATION_ENGINE_LOCAL:
-        return {"configured": segmentation_available(), "engine": engine, "model": LOCAL_DIARIZATION_MODEL_ID}
-    return {"configured": dia_configured, "engine": engine}
+    return {"configured": segmentation_available(), "engine": DIARIZATION_ENGINE_LOCAL,
+            "model": LOCAL_DIARIZATION_MODEL_ID}
 
 
 # ---------------------------------------------------------------------------
@@ -221,7 +204,7 @@ async def embed_diarization_scales(
 
 
 # ---------------------------------------------------------------------------
-# Batch diarization (diarization_engine = "local")
+# Batch diarization
 # ---------------------------------------------------------------------------
 
 async def run_local_diarization(
@@ -235,7 +218,7 @@ async def run_local_diarization(
     params: Optional[Mapping[str, Any]] = None,
     half_embed: bool = True,
 ) -> Dict[str, Any]:
-    """The G3_DIA ``/v2/diarize`` payload of ``audio`` computed in this process.
+    """The diarization payload of ``audio`` (``diarization``/``exclusive_diarization``/``overlaps``).
 
     ``speech_probs``: Silero probabilities per 512 samples when the caller already has them (the WXC path reuses
     the same array); computed here otherwise, next to seg-3.0. ``params`` go to ``diarize_features``;
@@ -281,8 +264,9 @@ async def run_local_diarization(
         result = diarize_features(Features(segmentation, windows, duration_s, embed075=embed075),
                                   num_speakers=num_speakers, min_speakers=min_speakers, max_speakers=max_speakers,
                                   params=params)
-        return result_to_dia_payload(result, round(duration_s * 1000), num_speakers=num_speakers,
-                                     min_speakers=min_speakers, max_speakers=max_speakers, started=started)
+        return result_to_diarization_payload(result, round(duration_s * 1000), num_speakers=num_speakers,
+                                              min_speakers=min_speakers, max_speakers=max_speakers,
+                                              started=started)
 
     payload = await asyncio.to_thread(_cpu)
     payload["model"] = {
@@ -371,19 +355,16 @@ def section_words(text: str, aligned: Sequence[Mapping[str, Any]]) -> List[Dict[
 
 
 def warmup_segmentation() -> bool:
-    """Startup (GPU thread): load seg-3.0, run it once on 10 s of quiet noise and warm ReDimNet's 1.5 s shapes,
-    only where a feature uses them. With speaker_turns on, also load MMS_FA (word times of the turns, ~0.6 GB fp16
+    """Startup (GPU thread): load seg-3.0, run it once on 10 s of quiet noise, warm ReDimNet's 1.5 s shapes and the
+    batch diarization (FP16 windows, numba Viterbi). With speaker_turns on, also load MMS_FA (word times of the turns, ~0.6 GB fp16
     resident from then on) and Silero (window choice) when their files are local, so the first live section pays no
-    load under the GPU lock; nothing is downloaded. False when skipped or unavailable."""
+    load under the GPU lock; nothing is downloaded. False when no seg-3.0 checkpoint is usable."""
 
     from .genesis_whisper_server_segmentation import load_segmentation_model
 
-    if not segmentation_needed():
-        print("[WARMUP-SEG] Lokale Diarisierung und speaker_turns aus -> uebersprungen.", file=sys.stderr)
-        return False
     model = load_segmentation_model()
     if model is None:
-        print("[WARMUP-SEG] Kein Segmentierungsmodell; speaker_turns bleibt aus, engine local antwortet 503.",
+        print("[WARMUP-SEG] Kein Segmentierungsmodell; speaker_turns bleibt aus, Diarisierung antwortet 503.",
               file=sys.stderr)
         return False
     from .genesis_whisper_server_gpu import shared_gpu_lease
@@ -393,8 +374,7 @@ def warmup_segmentation() -> bool:
         model.segment((rng.standard_normal(10 * SAMPLE_RATE) * 1e-3).astype(np.float32))
     prepare_window_length(int(SECTION_WINDOW_SCALES["w15"][0] * SAMPLE_RATE))
     print("[WARMUP-SEG] Segmentierung (seg-3.0) und ReDimNet 1,5 s sind bereit.", file=sys.stderr)
-    if configured_diarization_engine() == DIARIZATION_ENGINE_LOCAL:
-        _warmup_local_diarization()
+    _warmup_local_diarization()
     if speaker_turns_switch():
         _warmup_speaker_turns_helpers()
     return True
@@ -437,19 +417,15 @@ def _warmup_speaker_turns_helpers() -> None:
 
 
 __all__ = [
-    "DIARIZATION_ENGINES",
-    "DIARIZATION_ENGINE_DIA",
     "DIARIZATION_ENGINE_LOCAL",
     "SPEAKER_TURNS_MAX_AUDIO_S",
     "compute_section_turns",
-    "configured_diarization_engine",
     "diarization_capability",
     "embed_diarization_scales",
     "embed_scales",
     "run_local_diarization",
     "section_words",
     "segment_sliced",
-    "segmentation_needed",
     "speaker_turns_available",
     "speaker_turns_switch",
     "warmup_segmentation",

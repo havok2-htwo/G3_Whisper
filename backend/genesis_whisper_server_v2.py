@@ -25,13 +25,10 @@ from .genesis_whisper_server_audio import get_audio_duration_seconds, load_audio
 from .genesis_whisper_server_auth import authorize_api_key, get_auth_store, require_admin
 from .genesis_whisper_server_batching import served_model_id
 from .genesis_whisper_server_chunking import combine_transcription_chunks, split_audio_for_whisper
-from .genesis_whisper_server_dia_client import DiaClientError, dia_is_configured, diarize_v2
 from .genesis_whisper_server_diarization_engine import (
-    DIARIZATION_ENGINE_LOCAL,
     LOCAL_WINDOW_FILTER,
     SPEAKER_TURNS_MAX_AUDIO_S,
     compute_section_turns,
-    configured_diarization_engine,
     diarization_capability,
     run_local_diarization,
     section_words,
@@ -606,7 +603,7 @@ def _apply_language_to_models(models: dict[str, Any], decision: LanguageDecision
         asr["language_detection"] = block
 
 
-def _normalize_dia_segments(items: Sequence[Mapping[str, Any]], duration_ms: int) -> list[dict[str, Any]]:
+def _normalize_diarization_segments(items: Sequence[Mapping[str, Any]], duration_ms: int) -> list[dict[str, Any]]:
     normalized: list[dict[str, Any]] = []
     for item in items:
         speaker_id = str(item.get("speaker_id") or "").strip()
@@ -1183,7 +1180,7 @@ def _record_log(
 
 async def _process_diarization(
     http_request: Request,
-    file: UploadFile,
+    file: UploadFile,  # unused since the diarization runs in-process (the decoded ``audio`` is used); kept for callers
     audio: np.ndarray,
     configuration: Mapping[str, Any],
     apply_repetition_filter: bool,
@@ -1195,48 +1192,39 @@ async def _process_diarization(
     known_speakers = list(configuration.get("known_speakers") or [])
     speaker_refinement_mode = str(configuration.get("speaker_refinement") or "off")
     include_unknown_speaker_audio = bool(configuration.get("unknown_speaker_audio", False))
-    dia_started = time.monotonic()
+    diarization_started = time.monotonic()
     min_speakers = len(known_speakers) if expected_speakers is None and known_speakers else None
     speech_probs: np.ndarray | None = None
-    if configured_diarization_engine() == DIARIZATION_ENGINE_LOCAL:
-        # No DIA server call and no silent fallback to it: the operator chose the engine, a missing seg-3.0
-        # checkpoint is reported like an unreachable model (503 MODEL_UNAVAILABLE, not retryable).
-        try:
-            if LOCAL_WINDOW_FILTER == "silero":
-                speech_probs = await asyncio.to_thread(silero_frame_probs, audio)
-            dia_response = await run_local_diarization(
-                http_request.app.state.local_gpu_lock,
-                audio,
-                num_speakers=expected_speakers,
-                min_speakers=min_speakers,
-                speech_probs=speech_probs,
-            )
-        except RuntimeError as exc:
-            raise V2ApiError(
-                503,
-                "MODEL_UNAVAILABLE",
-                f"Lokale Diarisierung nicht verfuegbar: {exc}",
-                False,
-            ) from exc
-    else:
-        dia_response = await diarize_v2(
-            file.file,
-            file.filename or "upload",
-            file.content_type,
+    # The diarization runs in this process; a missing seg-3.0 checkpoint is reported like an unreachable model
+    # (503 MODEL_UNAVAILABLE, not retryable).
+    try:
+        if LOCAL_WINDOW_FILTER == "silero":
+            speech_probs = await asyncio.to_thread(silero_frame_probs, audio)
+        diarization_payload = await run_local_diarization(
+            http_request.app.state.local_gpu_lock,
+            audio,
             num_speakers=expected_speakers,
             min_speakers=min_speakers,
+            speech_probs=speech_probs,
         )
-    dia_duration_ms = round((time.monotonic() - dia_started) * 1000)
+    except RuntimeError as exc:
+        raise V2ApiError(
+            503,
+            "MODEL_UNAVAILABLE",
+            f"Lokale Diarisierung nicht verfuegbar: {exc}",
+            False,
+        ) from exc
+    diarization_ms = round((time.monotonic() - diarization_started) * 1000)
     duration_ms = round(get_audio_duration_seconds(audio) * 1000)
-    standard = _normalize_dia_segments(dia_response.get("diarization", []), duration_ms)
-    exclusive = _normalize_dia_segments(dia_response.get("exclusive_diarization", []), duration_ms)
+    standard = _normalize_diarization_segments(diarization_payload.get("diarization", []), duration_ms)
+    exclusive = _normalize_diarization_segments(diarization_payload.get("exclusive_diarization", []), duration_ms)
     overlaps = [
         {
             "start_ms": max(0, int(item.get("start_ms", 0))),
             "end_ms": min(duration_ms, int(item.get("end_ms", 0))),
             "speaker_ids": [str(value) for value in item.get("speaker_ids", [])],
         }
-        for item in dia_response.get("overlaps", [])
+        for item in diarization_payload.get("overlaps", [])
         if int(item.get("end_ms", 0)) > int(item.get("start_ms", 0))
     ]
 
@@ -1344,36 +1332,36 @@ async def _process_diarization(
             for segment in transcript_segments
         }
     )
-    for dia_speaker_id in all_unmatched_labels:
-        if dia_speaker_id in assignments:
+    for diarization_label in all_unmatched_labels:
+        if diarization_label in assignments:
             continue
-        candidate = dia_speaker_id
+        candidate = diarization_label
         if candidate in reserved_public_ids:
-            base = f"unknown-{dia_speaker_id}"
+            base = f"unknown-{diarization_label}"
             candidate = base
             suffix = 1
             while candidate in reserved_public_ids:
                 candidate = f"{base}-{suffix}"
                 suffix += 1
-        unmatched_public_ids[dia_speaker_id] = candidate
+        unmatched_public_ids[diarization_label] = candidate
         reserved_public_ids.add(candidate)
 
     for segment in transcript_segments:
-        dia_speaker_id = str(
+        diarization_label = str(
             segment.get(
                 "refined_diarization_speaker_id",
                 segment["diarization_speaker_id"],
             )
         )
-        assignment = assignments.get(dia_speaker_id)
+        assignment = assignments.get(diarization_label)
         if assignment:
             segment["speaker_id"] = assignment["speaker_id"]
             segment["speaker_kind"] = "known"
-        elif dia_speaker_id in unresolved_clusters:
-            segment["speaker_id"] = unmatched_public_ids[dia_speaker_id]
+        elif diarization_label in unresolved_clusters:
+            segment["speaker_id"] = unmatched_public_ids[diarization_label]
             segment["speaker_kind"] = "unresolved"
         else:
-            segment["speaker_id"] = unmatched_public_ids[dia_speaker_id]
+            segment["speaker_id"] = unmatched_public_ids[diarization_label]
             segment["speaker_kind"] = "unknown"
         # The ASR paths set the language each segment was decoded with; anything else (no detection, a WXC
         # chunk list without languages) runs in the speaker's or the request's one language.
@@ -1381,15 +1369,15 @@ async def _process_diarization(
             segment["language"] = language_decision.language
             segment["language_source"] = language_decision.source
         elif "language" not in segment:
-            segment["language"] = speaker_languages.for_speaker(dia_speaker_id)
+            segment["language"] = speaker_languages.for_speaker(diarization_label)
             segment["language_source"] = LANGUAGE_SOURCE_SPEAKER
 
-    def _speaker_language_fields(dia_speaker_id: str) -> dict[str, str]:
+    def _speaker_language_fields(diarization_label: str) -> dict[str, str]:
         if speaker_languages is None:
             return {"language": language_decision.language, "language_source": language_decision.source}
         return {
-            "language": speaker_languages.for_speaker(dia_speaker_id),
-            "language_source": speaker_languages.source_for(dia_speaker_id),
+            "language": speaker_languages.for_speaker(diarization_label),
+            "language_source": speaker_languages.source_for(diarization_label),
         }
 
     transcript_text = " ".join(segment["text"] for segment in transcript_segments).strip()
@@ -1402,35 +1390,35 @@ async def _process_diarization(
     warnings.extend(language_decision.warnings)
     unknown_audio_assets: dict[str, dict[str, Any]] = {}
     unknown_audio_ms: int | None = None
-    unidentified_dia_ids = sorted(
+    unidentified_labels = sorted(
         speaker_id for speaker_id in detected_speakers if speaker_id not in assignments
     )
-    if include_unknown_speaker_audio and unidentified_dia_ids:
+    if include_unknown_speaker_audio and unidentified_labels:
         unknown_audio_started = time.monotonic()
         try:
             unknown_audio_assets = await asyncio.to_thread(
                 build_unknown_speaker_audio_assets,
                 audio,
                 speaker_clouds,
-                unidentified_dia_ids,
+                unidentified_labels,
                 effective_exclusive,
             )
         except (RuntimeError, ValueError):
             warnings.append({"code": "UNKNOWN_SPEAKER_AUDIO_ENCODING_FAILED"})
         unknown_audio_ms = round((time.monotonic() - unknown_audio_started) * 1000)
 
-    for dia_speaker_id in detected_speakers:
-        cloud = speaker_clouds[dia_speaker_id]
-        assignment = assignments.get(dia_speaker_id)
+    for diarization_label in detected_speakers:
+        cloud = speaker_clouds[diarization_label]
+        assignment = assignments.get(diarization_label)
         if assignment:
             speaker_assignments.append(
                 {
-                    "diarization_speaker_id": dia_speaker_id,
+                    "diarization_speaker_id": diarization_label,
                     "speaker_id": assignment["speaker_id"],
                     "kind": "known",
                     "embedding_status": cloud.status,
                     **{key: value for key, value in assignment.items() if key != "speaker_id"},
-                    **_speaker_language_fields(dia_speaker_id),
+                    **_speaker_language_fields(diarization_label),
                 }
             )
             if cloud.status != "ready":
@@ -1441,28 +1429,28 @@ async def _process_diarization(
                     {
                         "code": "KNOWN_SPEAKER_IMPERFECT_CLUSTER",
                         "speaker_id": assignment["speaker_id"],
-                        "diarization_speaker_id": dia_speaker_id,
+                        "diarization_speaker_id": diarization_label,
                         "status": cloud.status,
                     }
                 )
             continue
-        unresolved_match = unresolved_clusters.get(dia_speaker_id)
+        unresolved_match = unresolved_clusters.get(diarization_label)
         speaker_kind = "unresolved" if unresolved_match else "unknown"
         speaker_assignments.append(
             {
-                "diarization_speaker_id": dia_speaker_id,
-                "speaker_id": unmatched_public_ids[dia_speaker_id],
+                "diarization_speaker_id": diarization_label,
+                "speaker_id": unmatched_public_ids[diarization_label],
                 "kind": speaker_kind,
                 "embedding_status": cloud.status,
                 "cosine_similarity": None,
                 **(unresolved_match or {}),
-                **_speaker_language_fields(dia_speaker_id),
+                **_speaker_language_fields(diarization_label),
             }
         )
         public_embeddings = cloud.public_embeddings()
         public_speaker = {
-            "speaker_id": unmatched_public_ids[dia_speaker_id],
-            "diarization_speaker_id": dia_speaker_id,
+            "speaker_id": unmatched_public_ids[diarization_label],
+            "diarization_speaker_id": diarization_label,
             "speaker_kind": speaker_kind,
             "embedding_status": cloud.status,
             "embeddings": public_embeddings,
@@ -1473,8 +1461,8 @@ async def _process_diarization(
             "purity": round(cloud.purity, 6) if cloud.purity is not None else None,
             **(unresolved_match or {}),
         }
-        if dia_speaker_id in unknown_audio_assets:
-            public_speaker["audio"] = unknown_audio_assets[dia_speaker_id]
+        if diarization_label in unknown_audio_assets:
+            public_speaker["audio"] = unknown_audio_assets[diarization_label]
         if unresolved_match:
             unresolved_speakers.append(public_speaker)
         else:
@@ -1483,17 +1471,17 @@ async def _process_diarization(
             warnings.append(
                 {
                     "code": "SPEAKER_EMBEDDING_QUALITY",
-                    "speaker_id": dia_speaker_id,
+                    "speaker_id": diarization_label,
                     "status": cloud.status,
                 }
             )
 
-    if include_unknown_speaker_audio and unidentified_dia_ids and not any(
+    if include_unknown_speaker_audio and unidentified_labels and not any(
         warning.get("code") == "UNKNOWN_SPEAKER_AUDIO_ENCODING_FAILED" for warning in warnings
     ):
         unavailable_audio_ids = [
             unmatched_public_ids[speaker_id]
-            for speaker_id in unidentified_dia_ids
+            for speaker_id in unidentified_labels
             if speaker_id not in unknown_audio_assets
         ]
         if unavailable_audio_ids:
@@ -1542,7 +1530,7 @@ async def _process_diarization(
         result["speaker_verification"] = wxc_diagnostics.pop("verification", None)
         result["chunking"] = wxc_diagnostics
     timings = {
-        "diarization": dia_duration_ms,
+        "diarization": diarization_ms,
         "transcription": transcription_ms,
         "embedding": embedding_ms,
         **extra_timings,
@@ -1555,7 +1543,7 @@ async def _process_diarization(
         timings["language_detection"] = lid_ms
     models = {
         "asr": {"id": asr_model_id},
-        "diarization": dia_response.get("model") or {},
+        "diarization": diarization_payload.get("model") or {},
         "embedding": embedding_model_metadata(),
     }
     _apply_language_to_models(models, language_decision)
@@ -1600,7 +1588,8 @@ def create_v2_capabilities_api(app: FastAPI) -> FastAPI:
             },
             "modes": list(V2_MODES),
             "embedding": {"id": embedding_model_metadata()["id"]},
-            "diarization": diarization_capability(dia_is_configured()),
+            # engine is always "local" (kept for clients that read it); configured = seg-3.0 checkpoint usable.
+            "diarization": diarization_capability(),
             # Genesis3 docs/243 8.8: offered only while the switch is on and the seg-3.0 checkpoint is usable.
             "speaker_turns": speaker_turns_capability(speaker_turns_available()),
         }
@@ -1816,13 +1805,6 @@ def create_v2_api(app: FastAPI) -> FastAPI:
             )
         except V2ApiError as exc:
             return _error_response(request_id, exc, mode=mode, request_started=request_started)
-        except DiaClientError as exc:
-            return _error_response(
-                request_id,
-                V2ApiError(exc.status_code, exc.code, exc.message, exc.retryable),
-                mode=mode,
-                request_started=request_started,
-            )
         except SpeakerProfileValidationError as exc:
             return _error_response(
                 request_id,

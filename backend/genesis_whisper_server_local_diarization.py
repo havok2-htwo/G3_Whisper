@@ -1,4 +1,4 @@
-"""DIA-free batch diarization: seg-3.0 speech/overlap + ReDimNet2 windows + AHC + Viterbi resegmentation.
+"""In-process batch diarization: seg-3.0 speech/overlap + ReDimNet2 windows + AHC + Viterbi resegmentation.
 
 Production version "V5-fast" of the "V5" research pipeline. Its per-local-speaker term costs no GPU pass (the mean
 of windows that are embedded anyway), and the 0.75 s windows are embedded only where the pre-final path is unsure.
@@ -31,8 +31,9 @@ The frozen values are ``DEFAULT_PARAMS``; ``V5_PARAMS`` restores V5 (the V4 valu
 8. Overlap: frames with count 2 and an aggregated soft seg-3.0 overlap probability >= 0.5 get a second speaker: the
    best of mapped local activity plus 1.5 x the score difference to the primary, else the score runner-up.
 
-The output has the shape of the G3_DIA ``/v2/diarize`` answer (``diarization``, ``exclusive_diarization``,
-``overlaps`` in integer milliseconds), so ``_process_diarization`` and the WXC pipeline work unchanged.
+The output is the diarization payload (``diarization``, ``exclusive_diarization``, ``overlaps`` in integer
+milliseconds; formerly the shape of the G3_DIA ``/v2/diarize`` answer, checked by ``validate_diarization_payload``),
+which ``_process_diarization`` and the WXC pipeline consume.
 CPU part is numpy/scipy (numba for the Viterbi loop when it is installed, bit-identical numpy fallback); the GPU
 parts (segmentation, embeddings) are passed in or use the shared models.
 """
@@ -1081,7 +1082,7 @@ def diarize_features(features: Features, *, num_speakers: Optional[int] = None, 
 
 
 # ---------------------------------------------------------------------------
-# DIA v2 payload
+# Diarization payload
 # ---------------------------------------------------------------------------
 
 def _runs(mask: np.ndarray) -> list[tuple[int, int]]:
@@ -1090,10 +1091,10 @@ def _runs(mask: np.ndarray) -> list[tuple[int, int]]:
     return list(zip(edges[0::2].tolist(), edges[1::2].tolist()))
 
 
-def result_to_dia_payload(result: DiarizationResult, duration_ms: int, *, num_speakers: Optional[int] = None,
-                          min_speakers: Optional[int] = None, max_speakers: Optional[int] = None,
-                          started: Optional[float] = None) -> Dict[str, Any]:
-    """The G3_DIA ``/v2/diarize`` answer shape (validated by ``dia_client._validate_dia_payload``)."""
+def result_to_diarization_payload(result: DiarizationResult, duration_ms: int, *, num_speakers: Optional[int] = None,
+                                   min_speakers: Optional[int] = None, max_speakers: Optional[int] = None,
+                                   started: Optional[float] = None) -> Dict[str, Any]:
+    """The diarization payload of ``result`` (the contract ``validate_diarization_payload`` checks)."""
 
     active = result.active
     n, K = active.shape
@@ -1156,6 +1157,55 @@ def result_to_dia_payload(result: DiarizationResult, duration_ms: int, *, num_sp
     }
 
 
+def _valid_milliseconds(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _valid_span(item: Any) -> bool:
+    return (isinstance(item, dict) and _valid_milliseconds(item.get("start_ms"))
+            and _valid_milliseconds(item.get("end_ms")) and item["end_ms"] > item["start_ms"])
+
+
+def validate_diarization_payload(payload: Any) -> Dict[str, Any]:
+    """The diarization payload contract (schema 2.0, the former G3_DIA ``/v2/diarize`` answer): returns ``payload``
+    unchanged, raises ``ValueError`` when a field is missing or malformed."""
+
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema_version") != "2.0"
+        or payload.get("status") != "completed"
+        or not isinstance(payload.get("request_id"), str)
+        or not payload.get("request_id")
+        or not isinstance(payload.get("model"), dict)
+        or not isinstance(payload.get("input"), dict)
+        or not isinstance(payload.get("counts"), dict)
+        or not _valid_milliseconds(payload.get("total_duration_ms"))
+    ):
+        raise ValueError("diarization payload: header fields missing or invalid")
+    for key in ("diarization", "exclusive_diarization"):
+        items = payload.get(key)
+        if not isinstance(items, list):
+            raise ValueError(f"diarization payload: {key} is not a list")
+        for item in items:
+            speaker_id = item.get("speaker_id") if isinstance(item, dict) else None
+            if not _valid_span(item) or not isinstance(speaker_id, str) or not speaker_id.strip():
+                raise ValueError(f"diarization payload: invalid {key} segment {item!r}")
+    overlaps = payload.get("overlaps")
+    if not isinstance(overlaps, list):
+        raise ValueError("diarization payload: overlaps is not a list")
+    for item in overlaps:
+        speaker_ids = item.get("speaker_ids") if isinstance(item, dict) else None
+        if (
+            not _valid_span(item)
+            or not isinstance(speaker_ids, list)
+            or len(speaker_ids) < 2
+            or any(not isinstance(value, str) or not value.strip() for value in speaker_ids)
+            or len(set(speaker_ids)) != len(speaker_ids)
+        ):
+            raise ValueError(f"diarization payload: invalid overlap {item!r}")
+    return payload
+
+
 def speech_frames_from_seg(seg: Mapping[str, Any], duration_s: float,
                            params: Optional[Mapping[str, Any]] = None) -> np.ndarray:
     """The seg-3.0 speech mask on the 20 ms grid (count >= 1, aggregated like the pipeline), usable as the window
@@ -1169,7 +1219,7 @@ def diarize_audio(audio: np.ndarray, *, num_speakers: Optional[int] = None, min_
                   max_speakers: Optional[int] = None, segmentation: Optional[Mapping[str, Any]] = None,
                   speech_probs: Optional[np.ndarray] = None, embed: Optional[EmbedFn] = None,
                   params: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
-    """Whole pipeline on a 16 kHz mono signal; returns the DIA v2 payload.
+    """Whole pipeline on a 16 kHz mono signal; returns the diarization payload.
 
     ``segmentation``: precomputed seg-3.0 arrays (else the shared model runs). ``speech_probs``: Silero probabilities
     per 512 samples for the window speech filter (as in the bench); without them the seg-3.0 speech mask is used.
@@ -1202,8 +1252,8 @@ def diarize_audio(audio: np.ndarray, *, num_speakers: Optional[int] = None, min_
     features = Features(segmentation, assemble_windows(starts, vectors), duration_s, embed075=embed075)
     result = diarize_features(features, num_speakers=num_speakers, min_speakers=min_speakers,
                               max_speakers=max_speakers, params=params)
-    return result_to_dia_payload(result, round(duration_s * 1000), num_speakers=num_speakers,
-                                 min_speakers=min_speakers, max_speakers=max_speakers, started=started)
+    return result_to_diarization_payload(result, round(duration_s * 1000), num_speakers=num_speakers,
+                                          min_speakers=min_speakers, max_speakers=max_speakers, started=started)
 
 
 __all__ = [
@@ -1222,10 +1272,11 @@ __all__ = [
     "embed_window_starts",
     "plan_scale_starts",
     "plan_window_starts",
-    "result_to_dia_payload",
+    "result_to_diarization_payload",
     "seg_count",
     "seg_info",
     "speech_frames_from_seg",
+    "validate_diarization_payload",
     "viterbi",
     "viterbi_nb",
 ]

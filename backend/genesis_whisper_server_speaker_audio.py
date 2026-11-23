@@ -26,7 +26,7 @@ UNKNOWN_SPEAKER_AUDIO_FFMPEG_TIMEOUT_SECONDS = 60
 # A listening reference must always exist ("no unknown speaker without audio").
 # When the strict clean-inlier selection finds nothing (typically mixed_cluster
 # speakers), the relaxed tier lowers the bars, and as a last resort the sample
-# is cut straight from the speaker's exclusive DIA turns.
+# is cut straight from the speaker's exclusive diarization turns.
 UNKNOWN_SPEAKER_AUDIO_RELAXED_MIN_QUALITY = 0.35
 UNKNOWN_SPEAKER_AUDIO_RELAXED_MIN_SNIPPET_MS = 2_000
 UNKNOWN_SPEAKER_AUDIO_TURN_MIN_PIECE_MS = 700
@@ -324,7 +324,7 @@ def _turn_fallback_snippets(
     speaker_id: str,
     audio_duration_ms: int,
 ) -> list[_SelectedSnippet]:
-    """Last-resort sample straight from the speaker's exclusive DIA turns.
+    """Last-resort sample straight from the speaker's exclusive diarization turns.
 
     A mixed_cluster speaker has no clean embedding windows, but the human on the
     other end still needs SOMETHING to listen to.  Longest turns first, small

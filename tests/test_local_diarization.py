@@ -3,7 +3,6 @@ import unittest
 import numpy as np
 
 from backend import genesis_whisper_server_local_diarization as ld
-from backend.genesis_whisper_server_dia_client import _validate_dia_payload
 from backend.genesis_whisper_server_vid import VoiceWindow, _prepare_waveform_batch
 
 FSTEP = 0.016875
@@ -112,7 +111,7 @@ class PipelineTests(unittest.TestCase):
         res = ld.diarize_features(feats)
         t = int(21 / ld.GRID_S)
         self.assertEqual(int(res.active[t].sum()), 2)
-        payload = ld.result_to_dia_payload(res, 52000)
+        payload = ld.result_to_diarization_payload(res, 52000)
         self.assertTrue(any(o["start_ms"] <= 21000 < o["end_ms"] for o in payload["overlaps"]))
 
     def test_speaker_bounds(self) -> None:
@@ -125,10 +124,10 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(ld.diarize_features(three).active.shape[1], 3)
         self.assertLessEqual(ld.diarize_features(three, max_speakers=2).active.shape[1], 2)
 
-    def test_payload_is_a_valid_dia_v2_answer(self) -> None:
+    def test_payload_is_a_valid_diarization_payload(self) -> None:
         feats = _synthetic(self.SCHEDULE, 52.0, overlap=[(20.0, 22.0, 0)])
-        payload = ld.result_to_dia_payload(ld.diarize_features(feats), 52000, num_speakers=None)
-        self.assertIs(_validate_dia_payload(payload), payload)
+        payload = ld.result_to_diarization_payload(ld.diarize_features(feats), 52000, num_speakers=None)
+        self.assertIs(ld.validate_diarization_payload(payload), payload)
         self.assertEqual(payload["counts"]["speakers"], 2)
         self.assertEqual(payload["exclusive_diarization"][0]["speaker_id"], "SPEAKER_00")
         for seg in payload["exclusive_diarization"]:
@@ -138,13 +137,28 @@ class PipelineTests(unittest.TestCase):
         for a, b in zip(ex, ex[1:]):
             self.assertLessEqual(a["end_ms"], b["start_ms"])
 
+    def test_validator_rejects_a_broken_payload(self) -> None:
+        # Counter-check for the payload tests: the validator is not a pass-through.
+        feats = _synthetic(self.SCHEDULE, 52.0)
+        good = ld.result_to_diarization_payload(ld.diarize_features(feats), 52000)
+        broken = [
+            {**good, "schema_version": "1.0"},
+            {**good, "overlaps": None},
+            {**good, "exclusive_diarization": [{"start_ms": 500, "end_ms": 400, "speaker_id": "SPEAKER_00"}]},
+            {**good, "overlaps": [{"start_ms": 0, "end_ms": 20, "speaker_ids": ["SPEAKER_00"]}]},
+        ]
+        for payload in broken:
+            with self.subTest(payload=payload.get("schema_version")):
+                with self.assertRaises(ValueError):
+                    ld.validate_diarization_payload(payload)
+
     def test_silence_and_tiny_inputs(self) -> None:
         silent = ld.Features({"data": np.zeros((1, NF, 3), np.float32), "chunk_step": 1.0, "frame_step": FSTEP},
                              {k: (np.zeros(0), np.zeros(0), np.zeros((0, 192), np.float32)) for k in ("s3.0", "s1.5")},
                              4.0)
         res = ld.diarize_features(silent)
-        payload = ld.result_to_dia_payload(res, 4000)
-        _validate_dia_payload(payload)
+        payload = ld.result_to_diarization_payload(res, 4000)
+        ld.validate_diarization_payload(payload)
         self.assertEqual(payload["diarization"], [])
         short = _synthetic([(0.2, 1.2, 0)], 1.4)
         res = ld.diarize_features(short)

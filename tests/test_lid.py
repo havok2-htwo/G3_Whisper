@@ -465,7 +465,7 @@ class WxcLanguageChunkTests(unittest.TestCase):
         self.assertEqual(chunks, wxc.build_superchunks(regions))
         self.assertTrue(all(end - start <= wxc.SUPERCHUNK_TARGET_S for start, end in chunks))
 
-    def test_dia_slivers_and_uncovered_speech_join_a_neighbour(self) -> None:
+    def test_diarization_slivers_and_uncovered_speech_join_a_neighbour(self) -> None:
         # A 0.2 s "en" sliver inside a German region and speech after the last turn.
         regions = [(0.0, 10.0)]
         spans = [(0.0, 5.0, "de"), (5.0, 5.2, "en"), (5.2, 8.0, "de")]

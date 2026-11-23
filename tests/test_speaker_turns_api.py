@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import os
 import types
 import unittest
 from unittest import mock
@@ -24,7 +25,6 @@ from backend import genesis_whisper_server_diarization_engine as engine
 from backend import genesis_whisper_server_local_diarization as ld
 from backend import genesis_whisper_server_storage as storage
 from backend import genesis_whisper_server_v2 as v2
-from backend.genesis_whisper_server_dia_client import _validate_dia_payload
 from backend.genesis_whisper_server_lid import LanguageDecision
 from backend.genesis_whisper_server_speaker_turns import section_features, speaker_turns
 
@@ -420,7 +420,7 @@ class LocalDiarizationDriverTests(unittest.TestCase):
             self.assertEqual(payload[key], reference[key], key)
         self.assertEqual(payload["counts"]["speakers"], 2)
         self.assertEqual(payload["model"]["engine"], "local")
-        _validate_dia_payload(payload)
+        ld.validate_diarization_payload(payload)
         # 51 chunks in slices of 16 -> 4 seg-3.0 lock holds; the slices are consecutive and cover every chunk
         self.assertEqual([c[0] for c in meeting.seg_calls], [0, 16, 32, 48])
         self.assertEqual(sum(len(c) for c in meeting.seg_calls), 51)
@@ -531,11 +531,11 @@ class LocalDiarizationDriverTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# _process_diarization engine switch
+# _process_diarization: always the in-process diarization
 # ---------------------------------------------------------------------------
 
 class DiarizationEngineSwitchTests(unittest.TestCase):
-    def _run(self, *, local_result=None, local_error=None):
+    def _run(self, *, local_result=None, local_error=None, settings=None):
         turns = [
             {"start_ms": 0, "end_ms": 6000, "speaker_id": "SPEAKER_00"},
             {"start_ms": 6000, "end_ms": 12000, "speaker_id": "SPEAKER_01"},
@@ -547,7 +547,6 @@ class DiarizationEngineSwitchTests(unittest.TestCase):
             "overlaps": [],
         }
         local = mock.AsyncMock(return_value=dia_payload, side_effect=local_error)
-        dia = mock.AsyncMock(side_effect=AssertionError("the DIA server must not be called"))
 
         async def transcribe(_request, _audio, gated, *_rest):
             return [
@@ -557,11 +556,13 @@ class DiarizationEngineSwitchTests(unittest.TestCase):
             ], 9, "asr-model"
 
         app = _CapturingApp()
+        original = admin.current_settings.copy()
+        self.addCleanup(lambda: (admin.current_settings.clear(), admin.current_settings.update(original)))
+        if settings is not None:
+            admin.current_settings.update(settings)
         with (
-            mock.patch.object(v2, "configured_diarization_engine", return_value="local"),
             mock.patch.object(v2, "run_local_diarization", new=local),
             mock.patch.object(v2, "silero_frame_probs", return_value=np.zeros(375, np.float32)),
-            mock.patch.object(v2, "diarize_v2", new=dia),
             mock.patch.object(v2, "_extract_speaker_clouds", new=mock.AsyncMock(return_value={})),
             mock.patch.object(v2, "_transcribe_turns", new=mock.AsyncMock(side_effect=transcribe)),
             mock.patch.object(v2, "language_detection_applies", return_value=False),
@@ -574,11 +575,10 @@ class DiarizationEngineSwitchTests(unittest.TestCase):
                     False, False, "turns",
                 )
             )
-        return result, local, dia
+        return result, local
 
-    def test_local_engine_replaces_the_dia_call_with_the_same_downstream(self) -> None:
-        (result, timings, models, _warnings, text), local, dia = self._run()
-        dia.assert_not_awaited()
+    def test_diarization_runs_the_local_pipeline(self) -> None:
+        (result, timings, models, _warnings, text), local = self._run()
         local.assert_awaited_once()
         self.assertEqual(local.await_args.kwargs["num_speakers"], None)
         self.assertIsNotNone(local.await_args.kwargs["speech_probs"])
@@ -588,7 +588,24 @@ class DiarizationEngineSwitchTests(unittest.TestCase):
         self.assertEqual([s["diarization_speaker_id"] for s in result["transcript"]["segments"]],
                          ["SPEAKER_00", "SPEAKER_01"])
 
-    def test_unloadable_local_engine_is_503_model_unavailable_without_dia_fallback(self) -> None:
+    def test_legacy_engine_value_dia_still_runs_the_local_pipeline(self) -> None:
+        # An old settings snapshot that still says diarization_engine "dia" (or any stale value) changes nothing.
+        for legacy in ({"diarization_engine": "dia", "dia_server_base_url": "http://dia:7864"},
+                       {"diarization_engine": "pyannote"}):
+            with self.subTest(legacy=legacy):
+                (result, _timings, models, _warnings, text), local = self._run(settings=legacy)
+                local.assert_awaited_once()
+                self.assertEqual(models["diarization"]["engine"], "local")
+                self.assertEqual(text, "Satz 0 Satz 1")
+
+    def test_v2_has_no_external_diarization_client(self) -> None:
+        # Counter-check for the two tests above: nothing in v2 could still dispatch to the removed server.
+        for name in ("diarize_v2", "dia_is_configured", "DiaClientError", "configured_diarization_engine"):
+            self.assertFalse(hasattr(v2, name), name)
+        with self.assertRaises(ImportError):
+            __import__("backend.genesis_whisper_server_dia_client")
+
+    def test_unloadable_local_engine_is_503_model_unavailable(self) -> None:
         with self.assertRaises(v2.V2ApiError) as raised:
             self._run(local_error=RuntimeError("Kein Segmentierungsmodell (segmentation-3.0) gefunden."))
         self.assertEqual((raised.exception.status_code, raised.exception.code), (503, "MODEL_UNAVAILABLE"))
@@ -600,29 +617,36 @@ class DiarizationEngineSwitchTests(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class SettingsTests(unittest.TestCase):
-    def test_defaults_keep_existing_installs_on_dia(self) -> None:
+    def test_defaults_have_no_engine_choice(self) -> None:
         settings = storage.normalize_settings({})
-        self.assertEqual(settings["diarization_engine"], "dia")
         self.assertIs(settings["speaker_turns_enabled"], True)
         self.assertEqual(settings["segmentation_model_path"], "")
-        for key in ("diarization_engine", "speaker_turns_enabled", "segmentation_model_path"):
+        for key in ("speaker_turns_enabled", "segmentation_model_path"):
             self.assertIn(key, storage.SERVICE_SETTINGS_FIELDS)
             self.assertNotIn(key, storage.PRESET_KEYS)
+        for key in ("diarization_engine", "dia_server_base_url", "dia_api_key"):
+            self.assertNotIn(key, storage.DEFAULT_SETTINGS)
+            self.assertNotIn(key, storage.SERVICE_SETTINGS_FIELDS)
+            self.assertNotIn(key, settings)
+
+    def test_legacy_engine_keys_are_dropped_by_normalize(self) -> None:
+        normalized = storage.normalize_settings(
+            {"diarization_engine": "dia", "dia_server_base_url": "http://x:7864", "dia_api_key": "s",
+             "segmentation_model_path": "/m/seg.bin"}
+        )
+        # Counter-check: a key that stays is carried over from the same dict.
+        self.assertEqual(normalized["segmentation_model_path"], "/m/seg.bin")
+        for key in ("diarization_engine", "dia_server_base_url", "dia_api_key"):
+            self.assertNotIn(key, normalized)
 
     def test_values_are_normalised(self) -> None:
-        self.assertEqual(storage.normalize_settings({"diarization_engine": " LOCAL "})["diarization_engine"], "local")
-        self.assertEqual(storage.normalize_settings({"diarization_engine": "pyannote"})["diarization_engine"], "dia")
         self.assertIs(storage.normalize_settings({"speaker_turns_enabled": "no"})["speaker_turns_enabled"], True)
         self.assertIs(storage.normalize_settings({"speaker_turns_enabled": False})["speaker_turns_enabled"], False)
 
-    def test_segmentation_is_needed_by_either_feature(self) -> None:
-        self.assertTrue(engine.segmentation_needed({"diarization_engine": "dia", "speaker_turns_enabled": True}))
-        self.assertTrue(engine.segmentation_needed({"diarization_engine": "local", "speaker_turns_enabled": False}))
-        self.assertFalse(engine.segmentation_needed({"diarization_engine": "dia", "speaker_turns_enabled": False}))
-
-    def test_admin_lists_the_engine_options(self) -> None:
-        values = [option["value"] for option in admin._settings_options()["diarization_engines"]]
-        self.assertEqual(values, ["dia", "local"])
+    def test_admin_offers_no_engine_choice(self) -> None:
+        options = admin._settings_options()
+        self.assertNotIn("diarization_engines", options)
+        self.assertIn("models", options)
 
 
 class CapabilitiesTests(unittest.TestCase):
@@ -662,10 +686,19 @@ class CapabilitiesTests(unittest.TestCase):
         self.assertEqual(self._caps(True, mms_local=False)["speaker_turns"], {"supported": False})
 
     def test_diarization_reports_the_engine(self) -> None:
-        self.assertEqual(self._caps(True)["diarization"]["engine"], "dia")
-        local = self._caps(True, diarization_engine="local")["diarization"]
-        self.assertEqual(local, {"configured": True, "engine": "local", "model": ld.LOCAL_DIARIZATION_MODEL_ID})
-        self.assertFalse(self._caps(False, diarization_engine="local")["diarization"]["configured"])
+        expected = {"configured": True, "engine": "local", "model": ld.LOCAL_DIARIZATION_MODEL_ID}
+        self.assertEqual(self._caps(True)["diarization"], expected)
+        # configured follows the seg-3.0 checkpoint (the counter-check: the block is not a constant).
+        self.assertEqual(self._caps(False)["diarization"], {**expected, "configured": False})
+
+    def test_legacy_settings_and_dia_environment_do_not_change_the_capabilities(self) -> None:
+        baseline = self._caps(True)
+        with mock.patch.dict(os.environ, {"DIA_SERVER_BASE_URL": "http://dia:7864", "DIA_SERVER_API_KEY": "k"}):
+            with_env = self._caps(True)
+        legacy = self._caps(True, diarization_engine="dia", dia_server_base_url="http://dia:7864")
+        self.assertEqual(with_env, baseline)
+        self.assertEqual(legacy, baseline)
+        self.assertEqual(legacy["diarization"]["engine"], "local")
 
 
 class SegmentationAvailabilityTests(unittest.TestCase):

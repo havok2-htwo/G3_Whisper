@@ -305,7 +305,7 @@ def build_robust_cloud(
             prototype = None
     elif not dominant:
         # Preserve the cleaned dominant component for future resolution while
-        # refusing to claim that it represents the DIA cluster unambiguously.
+        # refusing to claim that it represents the diarization cluster unambiguously.
         status = "mixed_cluster"
     else:
         status = "ready" if has_safe_support else "low_support"
@@ -526,7 +526,7 @@ def plan_speaker_windows(
     exclusive_segments: Sequence[Mapping[str, Any]],
     overlaps: Sequence[Mapping[str, Any]],
 ) -> SpeakerWindowPlan:
-    """Select the overlap-free enrollment windows of every DIA speaker.
+    """Select the overlap-free enrollment windows of every diarization speaker.
 
     Materialising the windows (views into the recording plus small stitched
     copies) lets the request path embed them in lock-released slices instead
@@ -657,7 +657,7 @@ def match_known_speakers(
 
     A tentative cluster is the globally selected profile/cluster pair whose
     evidence failed one of the acceptance gates.  Exposing it separately lets
-    the API retain the DIA label and vectors while marking turns as
+    the API retain the diarization label and vectors while marking turns as
     ``unresolved`` instead of pretending the cluster is certainly unknown.
     """
 

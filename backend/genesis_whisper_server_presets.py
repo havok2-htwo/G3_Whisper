@@ -9,7 +9,8 @@ Built-in tiers (one name per target machine, identical across the G3 services):
 - "24GB VRAM"  RTX 4090, every G3 service on one card, whole-card peak <= 23 GB.
 - "24+8 VRAM"  3090 (24 GB) + 2070S (8 GB) box, this service on the 24 GB card.
 The number in front names the card the service runs on. Whisper always runs on the 24 GB card of the two-GPU box
-(DIA alone takes the 8 GB card), so there is no "8+24 VRAM" tier here. Presets with a target card size pick
+(it does not fit the 8 GB card), so there is no "8+24 VRAM" tier here; the diarization runs inside this process, so
+the 2070S is not used by this service at all. Presets with a target card size pick
 local_gpu_device when the list is built: the CUDA device whose memory matches (machines number their cards
 differently), see resolve_presets.
 
@@ -57,6 +58,9 @@ CARD_MATCH_TOLERANCE_MIB = 2048
 # batch_wait_time_ms stays out: the 500 ms default adds up to 0.5 s to every fresh live request, a lower value was not
 # measured yet (see CHANGELOG).
 # local_gpu_device is never listed here: single-card tiers leave it alone, the two-card tier gets it from card matching.
+# The V5-fast batch diarization (FP16 ReDimNet windows) adds its own pool on top of the 5090 numbers above: measured on
+# the RTX 3090 (2026-11, ReDimNet batch 4) about 6.6 GB idle and 9.9 GB peak for this process, the whole card with
+# EMBED, RERANK and OmniVoice about 20.7 GB peak, so the 24 GB tiers keep their headroom.
 # Whisper does not fit the 8 GB 2070S (weights 4.4 + graphs 1.0 + ReDimNet + MMS_FA + context > 9 GB, no bf16), so
 # there is no "8+24 VRAM" tier.
 # =====================================================================================================================
@@ -82,9 +86,10 @@ BUILTIN_PRESETS: Dict[str, Dict[str, Any]] = {
         "values": {**_TIER_COMMON, "redimnet_max_batch_size": 4},
     },
     "24+8 VRAM": {
-        "description": "3090 + 2070S box, Whisper on the 3090 (24 GB) with OmniVoice, EMBED and RERANK; DIA runs alone "
-        "on the 2070S. Same values as 24GB VRAM (ReDimNet batch 4): about 6.3 GB idle, 8.3 GB peak for this process "
-        "(measured on the RTX 5090).",
+        "description": "3090 + 2070S box, Whisper on the 3090 (24 GB) with OmniVoice, EMBED and RERANK; the diarization "
+        "runs in this process, the 2070S stays free. Same values as 24GB VRAM (ReDimNet batch 4): about 6.6 GB idle, "
+        "9.9 GB peak for this process with the V5-fast diarization, whole card about 20.7 GB peak (measured on the "
+        "RTX 3090).",
         "target_vram_gb": 24,
         "values": {**_TIER_COMMON, "redimnet_max_batch_size": 4},
     },

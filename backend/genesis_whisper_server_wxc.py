@@ -1,13 +1,13 @@
 """WXC processing path for v2 diarization: transcribe-first with word alignment.
 
-Measured motivation (see .tmp/optimize benchmarks): DIA's exclusive partition cuts
+Measured motivation (see .tmp/optimize benchmarks): the diarization's exclusive partition cuts
 audio into sub-word slivers that Cohere fills with subtitle hallucinations, while
 ~25s speech chunks transcribe clean (0 hallucination markers).  This module keeps
 ASR on large Silero-derived chunks and re-attaches speakers afterwards:
 
   Silero VAD (batched streams) -> speech regions -> ~25s superchunks (+-250ms pad)
   -> [caller runs ASR per chunk] -> MMS_FA word timestamps -> seam dedup by word
-  midpoint ownership -> word->speaker against the PR1-gated DIA skeleton ->
+  midpoint ownership -> word->speaker against the PR1-gated diarization skeleton ->
   sentence regroup at ASR punctuation -> iterative ReDimNet 192D verification
   (purified per-speaker cores, conservative reassignment, flags for the rest).
 
@@ -213,7 +213,7 @@ def _language_at(moment: float, language_spans: Sequence[tuple[float, float, str
 def _absorb_language_slivers(pieces: list[list[Any]]) -> list[list[Any]]:
     """Fold sub-WXC_LANGUAGE_MIN_PIECE_S pieces into a neighbour of the same region.
 
-    A turn boundary a few hundred ms inside a Silero region is DIA jitter, not a
+    A turn boundary a few hundred ms inside a Silero region is diarization jitter, not a
     language change; as its own chunk it would reach Cohere as a sliver it fills
     with hallucinated text.
     """
@@ -519,7 +519,7 @@ def _load_mms(*, allow_download: bool = True):
             from torchaudio.pipelines import MMS_FA as bundle
 
             # Same card as the ASR engine (local_gpu_device). torch.device("cuda")
-            # would be cuda:0, which on the 3090 + 2070S box can be the DIA card.
+            # would be cuda:0, which on the 3090 + 2070S box can be the other card.
             device = resolve_local_device()
             dtype = _mms_dtype(device)
             model = bundle.get_model().to(device=device, dtype=dtype)
@@ -594,7 +594,7 @@ def align_chunk_slice(
     Seam ownership only needs the neighbouring chunk boundaries, so any subset
     of chunks can be aligned independently and the per-slice word lists simply
     concatenate in chunk order. Holds the cross-container GPU lease like every
-    other CUDA phase, so a colocated DIA never runs pyannote next to MMS_FA.
+    other CUDA phase, so another colocated GPU process never runs next to MMS_FA.
     """
 
     total_s = len(audio) / SAMPLE_RATE

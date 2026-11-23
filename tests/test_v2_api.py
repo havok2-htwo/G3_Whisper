@@ -464,7 +464,7 @@ class V2EndpointTests(unittest.TestCase):
         self.assertEqual(response.status_code, 401)
         self.assertEqual(payload["error"]["code"], "INVALID_API_KEY")
 
-    def test_transcript_mode_has_no_embedding_or_dia_model(self) -> None:
+    def test_transcript_mode_has_no_embedding_or_diarization_model(self) -> None:
         patches = self._base_patches()
         with patches[0], patches[1], patches[2], mock.patch.object(
             v2,
@@ -559,8 +559,8 @@ class V2EndpointTests(unittest.TestCase):
         self.assertIn("embedding", payload["timings_ms"])
         self.assertEqual(payload["models"]["embedding"]["dimension"], 192)
 
-    def test_dia_orchestration_runs_only_for_diarization_mode(self) -> None:
-        process_dia = mock.AsyncMock(
+    def test_diarization_orchestration_runs_only_for_diarization_mode(self) -> None:
+        process_diarization_mock = mock.AsyncMock(
             return_value=(
                 {
                     "transcript": {"text": "Diarisiert", "segments": []},
@@ -586,14 +586,14 @@ class V2EndpointTests(unittest.TestCase):
             patches[0],
             patches[1],
             patches[2],
-            mock.patch.object(v2, "_process_diarization", new=process_dia),
+            mock.patch.object(v2, "_process_diarization", new=process_diarization_mock),
             mock.patch.object(v2, "_transcribe_audio", new=transcribe),
             mock.patch.object(v2, "_generate_embedding", new=embedding),
         ):
             for mode in ("embedding", "transcript", "transcript_embedding"):
                 response = self._call({"schema_version": "2.0", "mode": mode})
                 self.assertEqual(response.status_code, 200)
-            self.assertEqual(process_dia.await_count, 0)
+            self.assertEqual(process_diarization_mock.await_count, 0)
 
             response = self._call(
                 {
@@ -604,8 +604,8 @@ class V2EndpointTests(unittest.TestCase):
             )
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(process_dia.await_count, 1)
-        configuration = process_dia.await_args.args[3]
+        self.assertEqual(process_diarization_mock.await_count, 1)
+        configuration = process_diarization_mock.await_args.args[3]
         self.assertEqual(configuration["expected_speakers"], 5)
 
     def test_default_diarization_passes_refinement_off_without_changing_result_shape(self) -> None:
@@ -617,7 +617,7 @@ class V2EndpointTests(unittest.TestCase):
             "unresolved_speakers": [],
             "unresolved_known_speakers": [],
         }
-        process_dia = mock.AsyncMock(
+        process_diarization_mock = mock.AsyncMock(
             return_value=(
                 legacy_result,
                 {"diarization": 4, "transcription": 5, "embedding": 6},
@@ -635,13 +635,13 @@ class V2EndpointTests(unittest.TestCase):
             patches[0],
             patches[1],
             patches[2],
-            mock.patch.object(v2, "_process_diarization", new=process_dia),
+            mock.patch.object(v2, "_process_diarization", new=process_diarization_mock),
         ):
             response = self._call({"schema_version": "2.0", "mode": "diarization"})
 
         payload = _payload(response)
         self.assertEqual(response.status_code, 200, payload)
-        configuration = process_dia.await_args.args[3]
+        configuration = process_diarization_mock.await_args.args[3]
         self.assertEqual(configuration["speaker_refinement"], "off")
         self.assertEqual(payload["result"], legacy_result)
         self.assertNotIn("speaker_refinement", payload["result"])
@@ -653,7 +653,7 @@ class V2EndpointTests(unittest.TestCase):
             "shadow",
             proposed_turns=2,
         )
-        process_dia = mock.AsyncMock(
+        process_diarization_mock = mock.AsyncMock(
             return_value=(
                 {
                     "transcript": {"text": "Diarisiert", "segments": []},
@@ -684,7 +684,7 @@ class V2EndpointTests(unittest.TestCase):
             patches[0],
             patches[1],
             patches[2],
-            mock.patch.object(v2, "_process_diarization", new=process_dia),
+            mock.patch.object(v2, "_process_diarization", new=process_diarization_mock),
         ):
             response = self._call(
                 {
@@ -699,7 +699,7 @@ class V2EndpointTests(unittest.TestCase):
 
         payload = _payload(response)
         self.assertEqual(response.status_code, 200, payload)
-        configuration = process_dia.await_args.args[3]
+        configuration = process_diarization_mock.await_args.args[3]
         self.assertEqual(configuration["speaker_refinement"], "shadow")
         self.assertIs(configuration["unknown_speaker_audio"], True)
         self.assertEqual(payload["result"]["speaker_refinement"], diagnostics)
@@ -770,6 +770,12 @@ class V2EndpointTests(unittest.TestCase):
                 decode.assert_not_called()
 
 
+def _silent_frame_probs(audio):
+    """Silero stand-in for the diarization fixtures: no speech, so the WXC path falls back to the turn path."""
+
+    return np.zeros(len(audio) // 512, np.float32)
+
+
 class V2DiarizationAssemblyTests(unittest.TestCase):
     def _run_refinement_fixture(
         self,
@@ -787,7 +793,7 @@ class V2DiarizationAssemblyTests(unittest.TestCase):
             "SPEAKER_A": _ready_cloud("SPEAKER_A", _vector(0)),
             "SPEAKER_B": _ready_cloud("SPEAKER_B", _vector(1)),
         }
-        dia_response = {
+        diarization_payload = {
             "model": {"id": "community-1"},
             "diarization": original_turns,
             "exclusive_diarization": original_turns,
@@ -824,7 +830,8 @@ class V2DiarizationAssemblyTests(unittest.TestCase):
         request = _request(app)
         audio = np.full(16000 * 18, 0.1, dtype=np.float32)
         with (
-            mock.patch.object(v2, "diarize_v2", new=mock.AsyncMock(return_value=dia_response)),
+            mock.patch.object(v2, "run_local_diarization", new=mock.AsyncMock(return_value=diarization_payload)),
+            mock.patch.object(v2, "silero_frame_probs", side_effect=_silent_frame_probs),
             mock.patch.object(v2, "_extract_speaker_clouds", new=extract_mock),
             mock.patch.object(
                 v2,
@@ -979,7 +986,7 @@ class V2DiarizationAssemblyTests(unittest.TestCase):
                 segment["diarization_speaker_id"],
             )
 
-    def test_refined_turns_preserve_original_dia_provenance(self) -> None:
+    def test_refined_turns_preserve_original_diarization_provenance(self) -> None:
         turns = [
             {
                 "start_ms": 0,
@@ -1058,7 +1065,7 @@ class V2DiarizationAssemblyTests(unittest.TestCase):
             }
             for index, item in enumerate(exclusive)
         ]
-        dia_response = {
+        diarization_payload = {
             "model": {"id": "community-1"},
             "diarization": exclusive,
             "exclusive_diarization": exclusive,
@@ -1067,12 +1074,13 @@ class V2DiarizationAssemblyTests(unittest.TestCase):
         app = _CapturingApp()
         request = _request(app)
         audio = np.full(16000 * 10, 0.1, dtype=np.float32)
-        dia_mock = mock.AsyncMock(return_value=dia_response)
+        diarization_mock = mock.AsyncMock(return_value=diarization_payload)
         transcribe_mock = mock.AsyncMock(return_value=(segments, 20, "asr-model"))
         build_audio_mock = mock.Mock()
 
         with (
-            mock.patch.object(v2, "diarize_v2", new=dia_mock),
+            mock.patch.object(v2, "run_local_diarization", new=diarization_mock),
+            mock.patch.object(v2, "silero_frame_probs", side_effect=_silent_frame_probs),
             mock.patch.object(v2, "_transcribe_turns", new=transcribe_mock),
             mock.patch.object(v2, "_extract_speaker_clouds", new=mock.AsyncMock(return_value=clouds)),
             mock.patch.object(v2, "build_unknown_speaker_audio_assets", new=build_audio_mock),
@@ -1087,10 +1095,10 @@ class V2DiarizationAssemblyTests(unittest.TestCase):
                 )
             )
 
-        dia_mock.assert_awaited_once()
+        diarization_mock.assert_awaited_once()
         build_audio_mock.assert_not_called()
-        self.assertEqual(dia_mock.await_args.kwargs["num_speakers"], 5)
-        self.assertIsNone(dia_mock.await_args.kwargs["min_speakers"])
+        self.assertEqual(diarization_mock.await_args.kwargs["num_speakers"], 5)
+        self.assertIsNone(diarization_mock.await_args.kwargs["min_speakers"])
         self.assertEqual(result["speaker_counts"]["detected"], 5)
         self.assertEqual(result["speaker_counts"]["known_assigned"], 4)
         self.assertEqual(result["speaker_counts"]["unknown"], 1)
@@ -1105,13 +1113,13 @@ class V2DiarizationAssemblyTests(unittest.TestCase):
         self.assertEqual(timings["transcription"], 20)
         self.assertEqual(warnings, [])
         self.assertIn("Text 4", transcript)
-        by_dia_id = {
+        by_label = {
             item["diarization_speaker_id"]: item for item in result["transcript"]["segments"]
         }
-        self.assertEqual(by_dia_id["SPEAKER_00"]["speaker_id"], "person-0")
-        self.assertEqual(by_dia_id["SPEAKER_00"]["speaker_kind"], "known")
-        self.assertEqual(by_dia_id["SPEAKER_04"]["speaker_id"], "SPEAKER_04")
-        self.assertEqual(by_dia_id["SPEAKER_04"]["speaker_kind"], "unknown")
+        self.assertEqual(by_label["SPEAKER_00"]["speaker_id"], "person-0")
+        self.assertEqual(by_label["SPEAKER_00"]["speaker_kind"], "known")
+        self.assertEqual(by_label["SPEAKER_04"]["speaker_id"], "SPEAKER_04")
+        self.assertEqual(by_label["SPEAKER_04"]["speaker_kind"], "unknown")
 
     def test_requested_audio_assets_are_added_only_to_unknown_and_unresolved_speakers(self) -> None:
         speaker_ids = ("SPEAKER_KNOWN", "SPEAKER_UNKNOWN", "SPEAKER_UNRESOLVED")
@@ -1134,7 +1142,7 @@ class V2DiarizationAssemblyTests(unittest.TestCase):
             }
             for index, turn in enumerate(turns)
         ]
-        dia_response = {
+        diarization_payload = {
             "model": {"id": "community-1"},
             "diarization": turns,
             "exclusive_diarization": turns,
@@ -1171,7 +1179,8 @@ class V2DiarizationAssemblyTests(unittest.TestCase):
         audio = np.full(16000 * 18, 0.1, dtype=np.float32)
 
         with (
-            mock.patch.object(v2, "diarize_v2", new=mock.AsyncMock(return_value=dia_response)),
+            mock.patch.object(v2, "run_local_diarization", new=mock.AsyncMock(return_value=diarization_payload)),
+            mock.patch.object(v2, "silero_frame_probs", side_effect=_silent_frame_probs),
             mock.patch.object(
                 v2,
                 "_transcribe_turns",
@@ -1220,7 +1229,7 @@ class V2DiarizationAssemblyTests(unittest.TestCase):
         speaker_id = "SPEAKER_UNKNOWN"
         turns = [{"start_ms": 0, "end_ms": 6000, "speaker_id": speaker_id}]
         cloud = _ready_cloud(speaker_id, _vector(0))
-        dia_response = {
+        diarization_payload = {
             "model": {"id": "community-1"},
             "diarization": turns,
             "exclusive_diarization": turns,
@@ -1240,7 +1249,8 @@ class V2DiarizationAssemblyTests(unittest.TestCase):
         request = _request(app)
         audio = np.full(16000 * 6, 0.1, dtype=np.float32)
         with (
-            mock.patch.object(v2, "diarize_v2", new=mock.AsyncMock(return_value=dia_response)),
+            mock.patch.object(v2, "run_local_diarization", new=mock.AsyncMock(return_value=diarization_payload)),
+            mock.patch.object(v2, "silero_frame_probs", side_effect=_silent_frame_probs),
             mock.patch.object(
                 v2,
                 "_transcribe_turns",
@@ -1432,7 +1442,7 @@ class DiarizationLanguageDetectionTests(unittest.TestCase):
             "SPEAKER_A": _ready_cloud("SPEAKER_A", _vector(0)),
             "SPEAKER_B": _ready_cloud("SPEAKER_B", _vector(1)),
         }
-        dia_response = {
+        diarization_payload = {
             "model": {"id": "community-1"},
             "diarization": self.TURNS,
             "exclusive_diarization": self.TURNS,
@@ -1444,7 +1454,8 @@ class DiarizationLanguageDetectionTests(unittest.TestCase):
         audio = np.full(16000 * 18, 0.1, dtype=np.float32)
         with (
             mock.patch.dict(v2.current_settings, _lid_settings(**(settings or {})), clear=True),
-            mock.patch.object(v2, "diarize_v2", new=mock.AsyncMock(return_value=dia_response)),
+            mock.patch.object(v2, "run_local_diarization", new=mock.AsyncMock(return_value=diarization_payload)),
+            mock.patch.object(v2, "silero_frame_probs", side_effect=_silent_frame_probs),
             mock.patch.object(v2, "_extract_speaker_clouds", new=mock.AsyncMock(return_value=clouds)),
             mock.patch.object(lid, "detect_languages", return_value=detected) as detect,
         ):
@@ -1613,7 +1624,7 @@ class TurnLanguageRefinementTests(unittest.TestCase):
             "SPEAKER_A": _ready_cloud("SPEAKER_A", _vector(0)),
             "SPEAKER_B": _ready_cloud("SPEAKER_B", _vector(1)),
         }
-        dia_response = {"model": {"id": "community-1"}, "diarization": turns, "exclusive_diarization": turns, "overlaps": []}
+        diarization_payload = {"model": {"id": "community-1"}, "diarization": turns, "exclusive_diarization": turns, "overlaps": []}
         manager = _TextPerChunkManager()
         app = _CapturingApp()
         app.state.whisper_batch_manager = manager
@@ -1621,7 +1632,7 @@ class TurnLanguageRefinementTests(unittest.TestCase):
         align = mock.AsyncMock(return_value=[])
         with (
             mock.patch.dict(v2.current_settings, _lid_settings(), clear=True),
-            mock.patch.object(v2, "diarize_v2", new=mock.AsyncMock(return_value=dia_response)),
+            mock.patch.object(v2, "run_local_diarization", new=mock.AsyncMock(return_value=diarization_payload)),
             mock.patch.object(v2, "_extract_speaker_clouds", new=mock.AsyncMock(return_value=clouds)),
             # The fixture clouds all sit on 0-9 s; pool each speaker from its own turns instead.
             mock.patch.object(v2, "_speaker_lid_spans", side_effect=lambda cloud, items, *a, **k: original_spans(None, items, *a, **k)),

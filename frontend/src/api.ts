@@ -28,15 +28,8 @@ export type AdminSettings = {
   redimnet_max_batch_size: number;
   debug_retain_history_audio: boolean;
   huggingface_token: string;
-  dia_server_base_url: string;
-  dia_api_key: string;
-  diarization_engine: "dia" | "local";
   segmentation_model_path: string;
   speaker_turns_enabled: boolean;
-  dia_api_key_configured: boolean;
-  dia_api_key_source: "settings" | "environment" | "none";
-  dia_server_base_url_effective: string;
-  dia_server_base_url_source: "settings" | "environment" | "default";
   model_profiles?: Record<string, Partial<AdminSettings>>;
 };
 
@@ -81,13 +74,6 @@ export type HistoryRetryResponse = {
   warnings: Array<{ code: string; message: string }>;
 };
 
-export type DiaConnectionTestResponse = {
-  ok: boolean;
-  base_url: string;
-  status_code: number;
-  message: string;
-};
-
 export type ManagedModel = {
   id: string;
   label: string;
@@ -112,7 +98,6 @@ export type SettingsResponse = {
     precisions: AdminOption[];
     languages: AdminOption[];
     language_detection_models: AdminOption[];
-    diarization_engines?: AdminOption[];
   };
   models: ManagedModel[];
   loaded_model_identifier: string[] | null;
@@ -430,16 +415,9 @@ export async function saveSettings(settings: AdminSettings) {
   const {
     local_model: _localModel,
     model_profiles: _modelProfiles,
-    dia_api_key_configured: _diaApiKeyConfigured,
-    dia_api_key_source: _diaApiKeySource,
-    dia_server_base_url_effective: _diaServerBaseUrlEffective,
-    dia_server_base_url_source: _diaServerBaseUrlSource,
     ...editableSettings
   } = settings;
   const payload: Record<string, unknown> = { ...editableSettings, expected_local_model: settings.local_model };
-  if (!settings.dia_api_key.trim()) {
-    delete payload.dia_api_key;
-  }
 
   return requestJson<SettingsSaveResponse>("/api/admin/settings", {
     method: "PUT",
@@ -481,23 +459,6 @@ export async function savePreset(name: string, values: AdminSettings) {
 
 export async function deletePreset(name: string) {
   return requestJson<{ ok: boolean }>(`/api/admin/settings/presets/${encodeURIComponent(name)}`, { method: "DELETE" });
-}
-
-export async function deleteDiaApiKey() {
-  return requestJson<SettingsResponse & { ok: boolean; removed: boolean; environment_fallback_active: boolean }>(
-    "/api/admin/settings/dia-api-key",
-    { method: "DELETE" },
-  );
-}
-
-export async function testDiaConnection(diaServerBaseUrl?: string, diaApiKey?: string) {
-  return requestJson<DiaConnectionTestResponse>("/api/admin/dia/test", {
-    method: "POST",
-    body: JSON.stringify({
-      dia_server_base_url: diaServerBaseUrl?.trim() || undefined,
-      dia_api_key: diaApiKey?.trim() || undefined,
-    }),
-  });
 }
 
 export async function getModels(storagePath?: string) {

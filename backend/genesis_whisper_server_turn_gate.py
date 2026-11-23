@@ -1,6 +1,6 @@
 """Turn gating and ASR-output hygiene for the v2 diarization path.
 
-Measured on real meeting audio, DIA's exclusive partition emits many sub-word
+Measured on real meeting audio, the diarization's exclusive partition emits many sub-word
 "ghost" turns (17-150 ms) that Cohere fills with subtitle-style hallucinations
 ("...", "Vielen Dank", "Musik", stray CJK). This module removes that noise with
 signals that are safe (duration + non-speech text token), NOT with a raw VAD

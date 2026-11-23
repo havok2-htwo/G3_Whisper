@@ -150,15 +150,16 @@ class LanguageDetectionWarmupTests(unittest.TestCase):
 
 
 class SegmentationWarmupTests(unittest.TestCase):
-    def test_runs_only_when_a_feature_uses_the_model_and_never_raises(self) -> None:
+    def test_always_loads_the_model_turn_helpers_follow_the_switch_and_never_raises(self) -> None:
         from backend import genesis_whisper_server_diarization_engine as diarization_engine
         from backend import genesis_whisper_server_segmentation as seg
 
         model = mock.Mock()
         cases = (
-            ({"diarization_engine": "dia", "speaker_turns_enabled": False}, 0, 0),
-            ({"diarization_engine": "dia", "speaker_turns_enabled": True}, 1, 1),
-            ({"diarization_engine": "local", "speaker_turns_enabled": False}, 1, 0),
+            ({"speaker_turns_enabled": False}, 1, 0),
+            ({"speaker_turns_enabled": True}, 1, 1),
+            # a stale engine value of an old settings snapshot changes nothing (the diarization is always local)
+            ({"diarization_engine": "dia", "speaker_turns_enabled": False}, 1, 0),
         )
         for values, loads, helpers in cases:
             with self.subTest(values=values):

@@ -1,4 +1,4 @@
-"""Conservative, vector-only correction of DIA speaker turns.
+"""Conservative, vector-only correction of diarization speaker turns.
 
 The refinement pass deliberately reuses the time-coded ReDimNet windows that
 were already extracted for speaker matching.  It never embeds audio and it
@@ -103,7 +103,7 @@ def _copy_original_turns(
         turn["start_ms"] = start_ms
         turn["end_ms"] = end_ms
         turn["speaker_id"] = speaker_id
-        # Provenance is intentionally reset from the current raw DIA label.
+        # Provenance is intentionally reset from the current raw diarization label.
         # Callers must pass the original, unmerged exclusive timeline.
         turn["original_speaker_id"] = speaker_id
         turns.append(turn)
@@ -314,7 +314,7 @@ def _build_proposals(
             for target_speaker_id, target_prototype in seed_prototypes.items():
                 if target_speaker_id == source_speaker_id:
                     continue
-                # A label that DIA says is active anywhere in this original
+                # A label the diarization marks active anywhere in this original
                 # exclusive turn cannot safely replace the turn's owner.
                 if _overlaps_any(
                     int(turn["start_ms"]),
@@ -593,9 +593,9 @@ def refine_speaker_turns(
     overlaps: Sequence[Mapping[str, Any]],
     speaker_clouds: Mapping[str, SpeakerCloud],
 ) -> SpeakerRefinementResult:
-    """Return a deterministic one-pass DIA label refinement.
+    """Return a deterministic one-pass diarization label refinement.
 
-    ``exclusive_segments`` must be DIA's original, unmerged exclusive turns.
+    ``exclusive_segments`` must be the diarization's original, unmerged exclusive turns.
     ``speaker_clouds`` must contain the already-computed ReDimNet windows from
     the standard diarization.  No model call occurs in this function.
     """

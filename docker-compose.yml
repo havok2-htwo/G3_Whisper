@@ -1,24 +1,26 @@
-# G3 Voice stack — Whisper (ASR, :7861) + OmniVoice (TTS, :8091) + DIA (diarization,
-# :7864): three GPU containers on one host.
+# G3 Voice stack — Whisper (ASR + diarization, :7861) + OmniVoice (TTS, :8091): two GPU
+# containers on one host. The diarization runs inside the Whisper container (seg-3.0 +
+# ReDimNet2); there is no separate diarization service any more.
 #
 # This compose lives in the g3_whisper repo and builds ALL services, so it expects the
-# g3_omnivoice and g3_dia repos checked out as SIBLING directories next to it:
+# g3_omnivoice repo checked out as a SIBLING directory next to it:
 #
 #   <parent>/
 #   ├─ g3_whisper/      <- this repo; run `docker compose` from here
 #   │  └─ docker-compose.yml
-#   ├─ g3_omnivoice/    <- clone of the g3_omnivoice repo
-#   └─ g3_dia/          <- clone of the g3_dia repo
+#   └─ g3_omnivoice/    <- clone of the g3_omnivoice repo
 #
 #   git clone -b main https://dev.it-breitenstein.de/ai-jointventure/g3_whisper.git
 #   git clone -b main https://dev.it-breitenstein.de/ai-jointventure/g3_omnivoice.git
-#   git clone -b main https://dev.it-breitenstein.de/ai-jointventure/g3_dia.git
-#   (always -b main: Whisper's diarization needs DIA's /v2/diarize, which only main has)
 #   cp g3_whisper/.env.example g3_whisper/.env   # set HUGGINGFACE_TOKEN
 #   cd g3_whisper && docker compose up -d --build
 #
+# Diarization needs the pyannote segmentation-3.0 checkpoint in the whisper_models volume
+# (it is never downloaded automatically); see docs/README.docker.md. Without it diarization
+# requests answer 503 MODEL_UNAVAILABLE, everything else works.
+#
 # Host needs: Docker Engine + Compose v2 (>= 2.24.0) and the NVIDIA Container Toolkit.
-# The three GPU services share the single GPU by design. The first start is slow —
+# The two GPU services share the single GPU by design. The first start is slow —
 # models are downloaded into the named volumes on first boot. Admin UIs use
 # username/password (default admin/admin, forced change on first login).
 
@@ -37,17 +39,9 @@ services:
     env_file:
       - path: .env
         required: false
-    environment:
-      DIA_SERVER_BASE_URL: ${DIA_SERVER_BASE_URL:-http://dia:7864}
-      GENESIS_GPU_LEASE_PATH: /app/gpu-coordination/gpu.lock
-    # Lets Whisper reach a DIA that was started outside this stack via
-    # http://host.docker.internal:7864 (inside the container "localhost" is Whisper itself).
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
     volumes:
       - whisper_models:/app/models
       - whisper_logs:/app/logs
-      - gpu_coordination:/app/gpu-coordination
     deploy:
       resources:
         reservations:
@@ -97,44 +91,8 @@ services:
       start_period: 1800s
       retries: 5
 
-  dia:
-    build:
-      # sibling checkout of the g3_dia repo (see header)
-      context: ../g3_dia
-      dockerfile: Dockerfile
-    image: g3-dia:latest
-    container_name: g3-dia
-    restart: unless-stopped
-    ports:
-      - "7864:7864"
-    env_file:
-      - path: .env
-        required: false
-    environment:
-      GENESIS_GPU_LEASE_PATH: /app/gpu-coordination/gpu.lock
-    volumes:
-      - dia_models:/app/models
-      - dia_logs:/app/logs
-      - gpu_coordination:/app/gpu-coordination
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
-    healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost:7864/openapi.json"]
-      interval: 30s
-      timeout: 5s
-      start_period: 1200s
-      retries: 5
-
 volumes:
   whisper_models:
   whisper_logs:
   omnivoice_models:
   omnivoice_data:
-  dia_models:
-  dia_logs:
-  gpu_coordination:

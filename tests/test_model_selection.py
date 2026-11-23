@@ -115,7 +115,7 @@ class ModelProfileStorageTests(unittest.TestCase):
                 self.assertEqual(storage.load_settings()["model_profiles"], {WHISPER_TURBO: {"batch_max_segments": 4}})
             with open(settings_file, "r", encoding="utf-8") as file_obj:
                 raw = json.load(file_obj)
-        for key in ("local_model", "local_model_cache_path", "local_gpu_device", "dia_server_base_url"):
+        for key in ("local_model", "local_model_cache_path", "local_gpu_device", "segmentation_model_path"):
             self.assertIn(key, raw)
 
     def test_with_model_profiles_later_sources_win_and_input_stays_untouched(self) -> None:
@@ -249,7 +249,7 @@ class ProfileOnPutTests(_AdminCase):
         self.assertEqual((profile["redimnet_max_batch_size"], profile["batch_max_segments"]), (4, 1))
 
     def test_a_rejected_put_stores_nothing(self) -> None:
-        response = self.client.put("/api/admin/settings", json={"batch_max_segments": 9, "dia_server_base_url": "dia:7864"})
+        response = self.client.put("/api/admin/settings", json={"batch_max_segments": 9, "debug_retain_history_audio": "yes"})
         self.assertEqual(response.status_code, 422)
         self.assertFalse(os.path.exists(self.settings_file))
 
@@ -436,12 +436,12 @@ class SelectModelTests(_AdminCase):
         self.assertEqual(self.saved()["transcription_language"], "fr")
 
     def test_service_wide_values_and_the_device_never_move(self) -> None:
-        self.use_settings(local_gpu_device="cuda:1", huggingface_token="hf_x", dia_server_base_url="http://dia:7864")
+        self.use_settings(local_gpu_device="cuda:1", huggingface_token="hf_x", segmentation_model_path="/m/seg.bin")
         self.select(PARAKEET_MODEL_ID)
         saved = self.saved()
         self.assertEqual(
-            (saved["local_gpu_device"], saved["huggingface_token"], saved["dia_server_base_url"], saved["local_model_cache_path"]),
-            ("cuda:1", "hf_x", "http://dia:7864", "cache"),
+            (saved["local_gpu_device"], saved["huggingface_token"], saved["segmentation_model_path"], saved["local_model_cache_path"]),
+            ("cuda:1", "hf_x", "/m/seg.bin", "cache"),
         )
 
     def test_voice_models_are_prepared_when_the_redimnet_batch_changes(self) -> None:
@@ -1212,7 +1212,9 @@ class ClientDiscoveryTests(unittest.TestCase):
         self.assertEqual(language["options"][:2], ["auto", "de"])
         self.assertEqual(body["modes"], ["embedding", "transcript", "transcript_embedding", "diarization"])
         self.assertEqual(body["embedding"], {"id": "ReDimNet2-B6"})
-        self.assertTrue(body["diarization"]["configured"])
+        # configured follows the seg-3.0 checkpoint of the machine (see the test below); engine is always "local".
+        self.assertEqual(set(body["diarization"]), {"configured", "engine", "model"})
+        self.assertEqual(body["diarization"]["engine"], "local")
 
     def test_cohere_auto_is_german_when_detection_is_off_or_its_model_broken(self) -> None:
         self.use_settings(cohere_language_detection=False)
@@ -1240,16 +1242,22 @@ class ClientDiscoveryTests(unittest.TestCase):
         self.assertTrue(body["language"]["applied"])
         self.assertFalse(body["model"]["loaded"])
 
-    def test_diarization_reports_a_broken_url_as_not_configured(self) -> None:
-        self.use_settings(dia_server_base_url="not a url")
-        self.assertFalse(self.capabilities()["diarization"]["configured"])
+    def test_diarization_configured_follows_the_segmentation_checkpoint(self) -> None:
+        from backend import genesis_whisper_server_diarization_engine as engine
+
+        for available in (True, False):
+            with self.subTest(available=available):
+                with mock.patch.object(engine, "segmentation_available", return_value=available):
+                    diarization = self.capabilities()["diarization"]
+                self.assertIs(diarization["configured"], available)
+                self.assertEqual(diarization["engine"], "local")
 
     def test_needs_no_key_and_leaks_no_secret(self) -> None:
-        self.use_settings(huggingface_token="hf_secret", dia_api_key="dia_secret", dia_server_base_url="http://dia.internal:7864")
+        self.use_settings(huggingface_token="hf_secret", segmentation_model_path="/srv/internal/seg.bin")
         with mock.patch.object(api, "authorize_api_key", side_effect=AssertionError("must stay open")):
             with mock.patch.object(v2, "authorize_api_key", side_effect=AssertionError("must stay open")):
                 text = self.client.get("/v2/capabilities").text
-        for secret in ("hf_secret", "dia_secret", "dia.internal"):
+        for secret in ("hf_secret", "/srv/internal"):
             self.assertNotIn(secret, text)
 
     def test_is_registered_before_the_catch_all(self) -> None:

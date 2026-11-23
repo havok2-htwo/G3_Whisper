@@ -6,9 +6,7 @@ import time
 import uuid
 from statistics import mean
 from typing import Any, Dict, List
-from urllib.parse import urlsplit
 
-import requests
 import torch
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, Response, UploadFile
 from fastapi.responses import FileResponse
@@ -70,7 +68,6 @@ from .genesis_whisper_server_repetition import (
     filter_repeated_patterns,
     repetition_filter_enabled,
 )
-from .genesis_whisper_server_dia_client import dia_unreachable_hint
 from .genesis_whisper_server_presets import (
     delete_user_preset,
     model_selection_values,
@@ -82,11 +79,9 @@ from .genesis_whisper_server_storage import (
     MODEL_TUNED_KEYS,
     SERVICE_SETTINGS_FIELDS,
     normalize_settings,
-    resolve_dia_server_config,
     save_settings,
     with_model_profiles,
 )
-from .genesis_whisper_server_diarization_engine import segmentation_needed
 from .genesis_whisper_server_lid import apply_lid_device_setting, configured_lid_model, lid_status
 from .genesis_whisper_server_segmentation import apply_segmentation_settings
 from .genesis_whisper_server_vid import apply_vid_settings
@@ -117,9 +112,8 @@ class AdminSettingsPayload(BaseModel):
     redimnet_max_batch_size: int | None = None
     debug_retain_history_audio: StrictBool | None = None
     huggingface_token: str | None = None
-    dia_server_base_url: str | None = None
-    dia_api_key: str | None = None
-    diarization_engine: str | None = None
+    # No extra="forbid": keys of older clients (e.g. the removed diarization_engine / dia_server_base_url /
+    # dia_api_key) are accepted and ignored.
     segmentation_model_path: str | None = None
     speaker_turns_enabled: StrictBool | None = None
 
@@ -141,11 +135,6 @@ class _HistoryAudioFileResponse(FileResponse):
             await super().__call__(scope, receive, send)
         finally:
             self._history_audio_lease.release()
-
-
-class DiaConnectionTestPayload(BaseModel):
-    dia_server_base_url: str | None = None
-    dia_api_key: str | None = None
 
 
 class AdminModelActionPayload(BaseModel):
@@ -179,37 +168,9 @@ def _settings_snapshot() -> Dict[str, Any]:
 
 
 def _serialize_settings() -> Dict[str, Any]:
-    """Build the admin representation without ever returning the DIA API key."""
+    """The admin representation of the saved settings (normalised)."""
 
-    settings_snapshot = _settings_snapshot()
-    effective_dia = resolve_dia_server_config(settings_snapshot)
-    try:
-        public_effective_base_url = _validate_dia_server_base_url(effective_dia["base_url"])
-    except ValueError:
-        # A malformed environment URL may itself contain credentials or a query
-        # secret. Report its source, but do not reflect the raw value to the UI.
-        public_effective_base_url = ""
-    settings_snapshot["dia_api_key"] = ""
-    settings_snapshot["dia_api_key_configured"] = bool(effective_dia["api_key"])
-    settings_snapshot["dia_api_key_source"] = effective_dia["api_key_source"]
-    settings_snapshot["dia_server_base_url_effective"] = public_effective_base_url
-    settings_snapshot["dia_server_base_url_source"] = effective_dia["base_url_source"]
-    return settings_snapshot
-
-
-def _validate_dia_server_base_url(value: str) -> str:
-    normalized = str(value or "").strip().rstrip("/")
-    if not normalized:
-        return ""
-
-    parsed = urlsplit(normalized)
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-        raise ValueError("DIA server URL must be an absolute http:// or https:// URL.")
-    if parsed.username or parsed.password:
-        raise ValueError("DIA server URL must not contain credentials.")
-    if parsed.query or parsed.fragment:
-        raise ValueError("DIA server URL must not contain a query string or fragment.")
-    return normalized
+    return _settings_snapshot()
 
 
 def _settings_options() -> Dict[str, List[Dict[str, Any]]]:
@@ -236,10 +197,6 @@ def _settings_options() -> Dict[str, List[Dict[str, Any]]]:
         "languages": languages,
         "precisions": precisions,
         "language_detection_models": language_detection_models,
-        "diarization_engines": [
-            {"label": "G3_DIA server", "value": "dia"},
-            {"label": "Local (seg-3.0 + ReDimNet2)", "value": "local"},
-        ],
     }
 
 
@@ -343,7 +300,7 @@ def _apply_voice_model_settings() -> Dict[str, bool]:
         "redimnet": apply_vid_settings(),
         "mms_fa": apply_mms_device_setting(),
         "language_detection": apply_lid_device_setting(),
-        "segmentation": apply_segmentation_settings(segmentation_needed()),
+        "segmentation": apply_segmentation_settings(True),
     }
 
 
@@ -365,7 +322,6 @@ async def _reprepare_voice_models(
             "language_detection_model",
             "cohere_language_detection",
             "segmentation_model_path",
-            "diarization_engine",
             "speaker_turns_enabled",
         )
     )
@@ -639,19 +595,6 @@ def create_admin_api(app: FastAPI) -> FastAPI:
         else:
             payload_data = payload.dict(exclude_unset=True, exclude_none=True)
 
-        if "dia_server_base_url" in payload_data:
-            try:
-                payload_data["dia_server_base_url"] = _validate_dia_server_base_url(
-                    payload_data["dia_server_base_url"]
-                )
-            except ValueError as exc:
-                raise HTTPException(status_code=422, detail=str(exc)) from exc
-
-        # The DIA key is write-only: an omitted or blank field preserves the current
-        # value. Deletion is intentionally a separate, explicit DELETE operation.
-        if not str(payload_data.get("dia_api_key", "") or "").strip():
-            payload_data.pop("dia_api_key", None)
-
         expected_local_model = payload_data.pop("expected_local_model", None)
 
         with settings_lock:
@@ -707,96 +650,6 @@ def create_admin_api(app: FastAPI) -> FastAPI:
         if not deleted:
             raise HTTPException(status_code=404, detail=f"No saved preset '{name[:100]}'.")
         return {"ok": True}
-
-    @app.delete("/api/admin/settings/dia-api-key")
-    async def admin_delete_dia_api_key(_: dict[str, str] = Depends(require_admin)):
-        with settings_lock:
-            merged_settings = current_settings.copy()
-            removed = bool(str(merged_settings.get("dia_api_key", "") or "").strip())
-            merged_settings["dia_api_key"] = ""
-            saved_settings = _store_settings(merged_settings)
-
-        effective_dia = resolve_dia_server_config(saved_settings)
-        return {
-            "ok": True,
-            "removed": removed,
-            "environment_fallback_active": effective_dia["api_key_source"] == "environment",
-            **_settings_response(),
-        }
-
-    @app.post("/api/admin/dia/test")
-    async def admin_test_dia_connection(
-        payload: DiaConnectionTestPayload,
-        _: dict[str, str] = Depends(require_admin),
-    ):
-        configured_dia = resolve_dia_server_config(_settings_snapshot())
-        requested_base_url = str(payload.dia_server_base_url or "").strip()
-        requested_api_key = str(payload.dia_api_key or "").strip()
-        try:
-            base_url = _validate_dia_server_base_url(requested_base_url or configured_dia["base_url"])
-        except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
-        if not base_url:
-            raise HTTPException(
-                status_code=422,
-                detail="No DIA server URL is configured. Enter a URL or set DIA_SERVER_BASE_URL.",
-            )
-
-        api_key = requested_api_key or configured_dia["api_key"]
-        headers = {"Accept": "application/json"}
-        if api_key:
-            headers["X-API-Key"] = api_key
-
-        try:
-            response = await asyncio.to_thread(
-                requests.get,
-                f"{base_url}/v2/capabilities",
-                headers=headers,
-                timeout=(3.05, 10.0),
-                allow_redirects=False,
-            )
-        except requests.Timeout:
-            raise HTTPException(
-                status_code=504,
-                detail=f"DIA server connection test timed out ({base_url}).{dia_unreachable_hint(base_url)}",
-            ) from None
-        except requests.RequestException:
-            # Do not retain/chain the requests exception: it owns the prepared request,
-            # including its headers, and therefore may contain the write-only key.
-            raise HTTPException(
-                status_code=502,
-                detail=f"DIA server could not be reached at {base_url}.{dia_unreachable_hint(base_url)}",
-            ) from None
-
-        try:
-            if response.status_code in {401, 403}:
-                raise HTTPException(status_code=502, detail="DIA server rejected the configured API key.")
-            if not 200 <= response.status_code < 300:
-                raise HTTPException(
-                    status_code=502,
-                    detail=f"DIA capabilities endpoint returned HTTP {response.status_code}.",
-                )
-            try:
-                capabilities = response.json()
-            except ValueError as exc:
-                raise HTTPException(
-                    status_code=502,
-                    detail="DIA capabilities endpoint did not return valid JSON.",
-                ) from exc
-            if not isinstance(capabilities, dict):
-                raise HTTPException(
-                    status_code=502,
-                    detail="DIA capabilities endpoint returned an unexpected response.",
-                )
-        finally:
-            response.close()
-
-        return {
-            "ok": True,
-            "base_url": base_url,
-            "status_code": response.status_code,
-            "message": "DIA server connection succeeded.",
-        }
 
     @app.get("/api/admin/models")
     async def admin_get_models(storage_path: str | None = None, _: dict[str, str] = Depends(require_admin)):

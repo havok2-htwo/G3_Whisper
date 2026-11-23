@@ -3,7 +3,7 @@
 The model is the frame-level part of ``pyannote/speaker-diarization-community-1`` (its ``segmentation`` folder, the
 same weights as ``pyannote/segmentation-3.0``): SincNet front end, 4-layer BiLSTM, two linear layers and a powerset
 classifier over 3 local speakers with at most 2 active at once. It answers, per ~17 ms frame of a 10 s chunk, which of
-up to three local speakers talks. The server uses it for the speech/overlap count of the DIA-free diarization and for
+up to three local speakers talks. The server uses it for the speech/overlap count of the diarization and for
 the live ``speaker_turns`` speech mask; speaker identity comes from ReDimNet (``genesis_whisper_server_vid``).
 
 Neither the pyannote library nor asteroid is a dependency: the network is rebuilt here with the same parameter names, and

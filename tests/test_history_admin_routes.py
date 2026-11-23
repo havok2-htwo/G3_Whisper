@@ -460,7 +460,7 @@ class AdminHistoryRouteTests(unittest.TestCase):
                         new=mock.AsyncMock(
                             return_value=(
                                 {"segments": [], "unknown_speakers": []},
-                                {"dia": 3, "transcription": 9, "embedding": 7},
+                                {"diarization": 3, "transcription": 9, "embedding": 7},
                                 {"asr": {"id": "mock-asr"}},
                                 [],
                                 "Transcript",

@@ -13,7 +13,7 @@ the device of ``local_gpu_device``, FP16 on CUDA and FP32 on CPU, load and infer
 GPU lease, OOM back-off. Request handlers run it through the sliced GPU phase so a long file never holds the
 GPU lock for all its windows at once. The download is a separate step (``prepare_lid_model``) on a worker
 thread before any GPU lock is taken: a 1.6 GB first download must never stall the ASR queue, live embeddings
-or a colocated DIA service, so the GPU phase itself only ever loads a complete local snapshot.
+or another colocated GPU service, so the GPU phase itself only ever loads a complete local snapshot.
 
 Detection is advisory: when the model cannot be loaded or a clip has too little speech, the request runs with
 COHERE_FALLBACK_LANGUAGE exactly as before and reports why in its warnings. It never fails a request.
@@ -301,7 +301,7 @@ def _token_ids(tokenizer: Any) -> tuple[list[int], int]:
 def _move_model(target_device: torch.device) -> bool:
     """Move the loaded model to ``target_device`` (caller holds ``_lid_lock``, not the lease).
 
-    Inside the lease like every other allocation, so a colocated DIA at its VRAM peak is not hit by it. A failed
+    Inside the lease like every other allocation, so another colocated GPU process at its VRAM peak is not hit by it. A failed
     move (OOM on the new card) would leave the weights split over two devices or dtypes, so the model is
     dropped instead and the next detection loads it cleanly. Returns whether the model is still loaded.
     """
@@ -674,7 +674,7 @@ def turn_language(result: Optional[LidResult], seconds: float, prior: str) -> tu
 
     The speaker's language stays the prior: only a turn of at least LID_TURN_MIN_SECONDS whose own detection
     reaches LID_TURN_OVERRIDE_CONFIDENCE for another language takes that language (a German interjection in a
-    cluster DIA labelled with an English speaker, a speaker who switches for a sentence).
+    diarization cluster labelled with an English speaker, a speaker who switches for a sentence).
     """
 
     if (

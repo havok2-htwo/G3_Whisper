@@ -11,8 +11,8 @@ import unittest
 from pathlib import Path
 
 SETTINGS_FORM = Path(__file__).resolve().parent.parent / "frontend" / "src" / "settingsForm.ts"
-SERVICE_FIELDS = ["dia_server_base_url", "huggingface_token"]
-BASELINE = {"local_model": "cohere", "batch_max_segments": 16, "batch_wait_time_ms": 500, "dia_server_base_url": ""}
+SERVICE_FIELDS = ["segmentation_model_path", "huggingface_token"]
+BASELINE = {"local_model": "cohere", "batch_max_segments": 16, "batch_wait_time_ms": 500, "segmentation_model_path": ""}
 
 
 def node_strips_types() -> bool:
@@ -46,21 +46,21 @@ def merge(form: dict, next_values: dict, keep_edits: str | None) -> dict:
 
 @unittest.skipUnless(node_strips_types(), "needs node 22.18 or newer")
 class MergeServerSettingsTests(unittest.TestCase):
-    typed = {**BASELINE, "batch_max_segments": 3, "dia_server_base_url": "http://typed:1"}
+    typed = {**BASELINE, "batch_max_segments": 3, "segmentation_model_path": "/typed/seg.bin"}
 
     def test_refresh_keeps_typed_values_and_follows_the_server_elsewhere(self) -> None:
         merged = merge(self.typed, {**BASELINE, "batch_wait_time_ms": 777}, "all")
         self.assertEqual(
             merged,
-            {**BASELINE, "batch_wait_time_ms": 777, "batch_max_segments": 3, "dia_server_base_url": "http://typed:1"},
+            {**BASELINE, "batch_wait_time_ms": 777, "batch_max_segments": 3, "segmentation_model_path": "/typed/seg.bin"},
         )
 
     def test_a_model_switched_elsewhere_keeps_only_service_wide_edits(self) -> None:
         parakeet = {**BASELINE, "local_model": "parakeet", "batch_max_segments": 4}
-        self.assertEqual(merge(self.typed, parakeet, "all"), {**parakeet, "dia_server_base_url": "http://typed:1"})
+        self.assertEqual(merge(self.typed, parakeet, "all"), {**parakeet, "segmentation_model_path": "/typed/seg.bin"})
 
     def test_service_mode_drops_model_edits_of_the_same_model(self) -> None:
-        self.assertEqual(merge(self.typed, BASELINE, "service"), {**BASELINE, "dia_server_base_url": "http://typed:1"})
+        self.assertEqual(merge(self.typed, BASELINE, "service"), {**BASELINE, "segmentation_model_path": "/typed/seg.bin"})
 
     def test_without_keep_edits_the_server_replaces_the_form(self) -> None:
         self.assertEqual(merge(self.typed, BASELINE, None), BASELINE)

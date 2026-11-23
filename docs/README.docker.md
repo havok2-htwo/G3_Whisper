@@ -1,22 +1,21 @@
 # G3 Voice — Docker deployment
 
-`docker-compose.yml` in this repo runs **three** GPU services:
+`docker-compose.yml` in this repo runs **two** GPU services:
 
 | Service     | Description                                | URL                  | Port |
 |-------------|--------------------------------------------|----------------------|------|
-| `whisper`   | GENESIS ASR + ReDimNet2 embedding/orchestration | `http://<host>:7861` | 7861 |
+| `whisper`   | GENESIS ASR + speaker diarization + ReDimNet2 embeddings | `http://<host>:7861` | 7861 |
 | `omnivoice` | G3 OmniVoice TTS + voice cloning            | `http://<host>:8091` | 8091 |
-| `dia`       | GENESIS DIA speaker diarization             | `http://<host>:7864` | 7864 |
 
-Whisper + DIA use **CUDA 12.8** wheels, OmniVoice the pinned **CUDA 13.0** stack — each
-container is self-contained, so the differing CUDA versions do not conflict. The three
-GPU services share the single NVIDIA GPU (verified on an RTX 5090 / `sm_120`).
+Whisper uses **CUDA 12.8** wheels, OmniVoice the pinned **CUDA 13.0** stack — each
+container is self-contained, so the differing CUDA versions do not conflict. Both GPU
+services share the single NVIDIA GPU (verified on an RTX 5090 / `sm_120`).
 
-Whisper calls DIA only for `POST /v2/audio/process` requests whose mode is
-`diarization`. The `embedding`, `transcript`, and `transcript_embedding` modes do not
-contact DIA. Whisper and DIA mount the same `gpu_coordination` volume and use
-`GENESIS_GPU_LEASE_PATH=/app/gpu-coordination/gpu.lock`, so their CUDA-heavy phases are
-serialized across the two containers.
+The speaker diarization (`POST /v2/audio/process` with mode `diarization`) runs inside the
+Whisper container (pyannote segmentation-3.0 network + ReDimNet2 windows + clustering).
+The former separate `dia` service (G3_DIA) is no longer part of the stack; an old `.env`
+that still sets `DIA_SERVER_BASE_URL` / `DIA_SERVER_API_KEY` is ignored. Diarization needs
+the segmentation-3.0 checkpoint, see [Diarization checkpoint](#diarization-checkpoint).
 
 Each admin dashboard (`/admin`) is behind a **username/password login** — default
 `admin` / `admin`, with a forced password change on first login. The public processing
@@ -25,16 +24,14 @@ must send a valid `X-API-Key` header (usage is tracked per key).
 
 ## Layout — two sibling repos
 
-This compose builds all services and expects the `g3_omnivoice` and `g3_dia`
-repos **next to** this one:
+This compose builds all services and expects the `g3_omnivoice` repo **next to** this one:
 
 ```
 <parent>/
 ├─ g3_whisper/      <- this repo; run docker compose from here
 │  ├─ docker-compose.yml
 │  └─ .env
-├─ g3_omnivoice/    <- clone of the g3_omnivoice repo
-└─ g3_dia/          <- clone of the g3_dia repo
+└─ g3_omnivoice/    <- clone of the g3_omnivoice repo
 ```
 
 ## Host prerequisites (Ubuntu)
@@ -55,23 +52,18 @@ repos **next to** this one:
 ```bash
 git clone -b main https://dev.it-breitenstein.de/ai-jointventure/g3_whisper.git
 git clone -b main https://dev.it-breitenstein.de/ai-jointventure/g3_omnivoice.git
-git clone -b main https://dev.it-breitenstein.de/ai-jointventure/g3_dia.git
-cp g3_whisper/.env.example g3_whisper/.env      # set HUGGINGFACE_TOKEN and optional DIA_SERVER_API_KEY
+cp g3_whisper/.env.example g3_whisper/.env      # set HUGGINGFACE_TOKEN
 cd g3_whisper
 docker compose up -d --build
 docker compose logs -f
 ```
 
-> **Always check out `main`.** Whisper's `diarization` mode calls DIA's
-> `POST /v2/diarize`, which only exists on the `main` branch of `g3_dia`. An older
-> branch builds and starts fine, but every diarization request then fails.
-
 ## Updating
 
 ```bash
-for r in g3_whisper g3_omnivoice g3_dia; do git -C "$r" checkout main && git -C "$r" pull --ff-only; done
+for r in g3_whisper g3_omnivoice; do git -C "$r" checkout main && git -C "$r" pull --ff-only; done
 cd g3_whisper
-docker compose up -d --build
+docker compose up -d --build --remove-orphans   # --remove-orphans stops the old g3-dia container once
 ```
 
 Saved admin settings live in the `*_logs` / `*_data` volumes and survive the rebuild.
@@ -88,23 +80,32 @@ Saved admin settings live in the `*_logs` / `*_data` volumes and survive the reb
 > with that account. Without it the warmup only logs a hint and the server still starts;
 > transcription works once the token is saved.
 
-## Whisper to DIA configuration
+## Diarization checkpoint
 
-Compose defaults `DIA_SERVER_BASE_URL` to `http://dia:7864` (without it Whisper would use its native
-default `http://127.0.0.1:7864`, which inside the container is Whisper itself). Create a client API key in
-the G3_DIA admin UI and either enter the DIA URL/key in the Whisper admin settings or set
-these environment values in `.env`:
+The diarization reads the pyannote **segmentation-3.0** checkpoint (about 6 MB) from the
+Whisper model cache. It is **never downloaded automatically**, and the `whisper_models`
+volume does not contain it after a fresh deploy: until it is provided, diarization requests
+answer `503 MODEL_UNAVAILABLE`, `GET /v2/capabilities` reports
+`"diarization": {"configured": false, ...}` and live `speaker_turns` are not offered. All
+other modes work.
 
-```dotenv
-DIA_SERVER_BASE_URL=http://dia:7864
-DIA_SERVER_API_KEY=dia_xxx
+Accept the license of the gated `pyannote/speaker-diarization-community-1` (or
+`pyannote/segmentation-3.0`) on Hugging Face with the account of `HUGGINGFACE_TOKEN`, then
+fetch the file once into the volume (the container's model cache is `/app/models`):
+
+```bash
+docker compose exec whisper python -c "from huggingface_hub import hf_hub_download; \
+print(hf_hub_download('pyannote/speaker-diarization-community-1', 'segmentation/pytorch_model.bin', cache_dir='/app/models'))"
+docker compose restart whisper   # optional: the next request finds the file anyway, a restart also warms it up
 ```
 
-Saved Whisper settings take precedence over environment fallbacks. The DIA key is
-write-only: it is sent upstream as `X-API-Key`, is never returned or logged, and has a
-separate delete action. The admin connection test calls `GET /v2/capabilities` on DIA.
-Settings updates use partial-merge semantics so older admin clients cannot accidentally
-erase the DIA fields.
+`HF_TOKEN` from `.env` is used for the download. Alternatively copy a
+`pytorch_model.bin` into the volume and set its path as **Segmentation checkpoint**
+(`segmentation_model_path`) in the admin settings.
+
+Settings files from the time with the separate DIA service still contain
+`diarization_engine` / `dia_server_base_url` / `dia_api_key`; they load normally, the keys are
+ignored and the next save drops them.
 
 The public embedding model is fixed; there is no model selector and no
 `embedding_space_id`. All new and legacy public voice vectors are 192-D L2-normalized
@@ -119,9 +120,10 @@ audio. Old model files are not deleted automatically from an existing volume.
 | `whisper_logs`     | `/app/logs`   | Settings JSON + transcription log        |
 | `omnivoice_models` | `/app/models` | OmniVoice HF model cache                  |
 | `omnivoice_data`   | `/app/data`   | Runtime settings, voice profiles, secrets|
-| `dia_models`       | `/app/models` | DIA / pyannote HF model cache            |
-| `dia_logs`         | `/app/logs`   | Settings JSON + diarization log + secrets|
-| `gpu_coordination` | `/app/gpu-coordination` | Shared Whisper/DIA GPU lock file |
+
+The volumes `dia_models`, `dia_logs` and `gpu_coordination` of the former DIA service are no
+longer used; after the update `docker volume rm g3-voice_dia_models g3-voice_dia_logs
+g3-voice_gpu_coordination` frees them (optional).
 
 Pre-seeding a volume from an existing local cache (skips the first download):
 
@@ -134,7 +136,7 @@ docker run --rm -v g3-voice_whisper_models:/dest -v /path/to/models:/src \
 > The `chown -R 1000:1000` is required — a pre-populated volume keeps the host files'
 > ownership, and the containers run as the non-root uid 1000, which must write the HF
 > cache/locks. Apply the same chown to any pre-seeded volume (`omnivoice_models`,
-> `omnivoice_data`, `dia_models`, …).
+> `omnivoice_data`, …).
 
 ## Common commands
 
@@ -151,8 +153,8 @@ docker compose down -v           # stop + delete volumes (re-download next start
 - **torch.compile**: both images ship `build-essential`, so the Cohere transcribe path and
   OmniVoice's `compile_model` (on by default) can JIT their CUDA kernels. Expect a one-time
   compile delay on the first request after a cold start.
-- **GPU sharing**: all services share the same GPU. Whisper serializes DIA, ASR, and
-  ReDim phases, and Whisper/DIA additionally share the Compose file lease. OmniVoice
+- **GPU sharing**: both services share the same GPU. Whisper serializes its diarization,
+  ASR, and ReDim phases under one GPU lock. OmniVoice
   enforces a VRAM budget (`OMNIVOICE_TTS_VRAM_BUDGET_MB`, default 10000); lower it if
   you run other GPU workloads.
 - **`could not select device driver "nvidia"`** → NVIDIA Container Toolkit not installed or
