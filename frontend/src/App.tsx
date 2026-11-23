@@ -1465,7 +1465,7 @@ export default function App() {
         <main className="panel login-panel">
           <div className="titles">
             <p className="eyebrow">G3 GPU service · Admin</p>
-            <h1>Change password</h1>
+            <h1>Set a new password</h1>
             <p className="dim">
               You are logged in as <strong>{currentUser || "admin"}</strong>. Choose a new password to continue.
             </p>

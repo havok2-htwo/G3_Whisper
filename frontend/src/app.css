@@ -47,9 +47,6 @@ label .hint, label .field-error { font-weight: var(--fw-regular); }
 .save-bar-status { padding-left: var(--sp-2); color: var(--text-dim); font-size: var(--fs-sm); font-weight: var(--fw-medium); }
 .save-bar.dirty .save-bar-status { color: var(--text-strong); }
 
-/* header API chip is a button */
-.chip-button { min-height: 0; padding: 4px 6px 4px 14px; box-shadow: none; color: var(--text-strong); font-weight: var(--fw-regular); letter-spacing: 0; }
-.chip-button:hover:not(:disabled) { transform: none; background: var(--surface-hover); }
 .status-strip > .badge { align-self: center; }
 
 /* ---------- key/value lists ---------- */
