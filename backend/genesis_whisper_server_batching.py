@@ -19,6 +19,7 @@ from .genesis_whisper_server_globals import (
     job_history,
     settings_lock,
 )
+from .genesis_whisper_server_perf import asr_audio_rate
 from .genesis_whisper_server_gpu import (
     add_gpu_activity_listener,
     gpu_activity_count,
@@ -760,6 +761,8 @@ class WhisperBatchManager:
                 batch_runtime_state["last_batch_duration_ms"] = duration_ms
                 batch_runtime_state["total_batches_processed"] += 1
                 batch_runtime_state["total_segments_processed"] += len(batch_items)
+            # Realtime factor of the performance graph: audio seconds finished, sliding 30 s window.
+            asr_audio_rate.add(total_audio_seconds)
         except Exception as exc:
             print(f"[BATCH-FEHLER] Batch {batch_id} fehlgeschlagen: {exc}", file=sys.stderr)
             self._fail_batch_jobs(batch_items, exc)
@@ -780,6 +783,7 @@ class WhisperBatchManager:
             )
             with batch_state_lock:
                 batch_runtime_state["last_error"] = str(exc)
+                batch_runtime_state["total_batches_failed"] = int(batch_runtime_state.get("total_batches_failed", 0)) + 1
         finally:
             self._update_queue_state()
             with batch_state_lock:

@@ -1,14 +1,14 @@
 # genesis_whisper_server.py
-# Haupt-Startdatei fuer den GENESIS Whisper Server.
+# Entry point of the G3 Whisper server.
 
 import asyncio
 import sys
 from contextlib import asynccontextmanager
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Union
 
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse
 
 from .genesis_whisper_server_admin import create_admin_api
@@ -238,6 +238,10 @@ async def shutdown_server(app: FastAPI):
     if batch_manager is not None:
         await batch_manager.stop()
     shutdown_history_audio_store()
+    # Pending per-key usage counters (debounced writes).
+    from .genesis_whisper_server_auth import get_auth_store
+
+    get_auth_store().flush()
 
 
 @asynccontextmanager
@@ -249,7 +253,7 @@ async def lifespan(app: FastAPI):
         await shutdown_server(app)
 
 
-app = FastAPI(title="GENESIS Transcription Server API", lifespan=lifespan)
+app = FastAPI(title="G3 Whisper API", lifespan=lifespan)
 app = create_api(app)
 app = create_v2_api(app)
 app = create_v2_capabilities_api(app)
@@ -262,161 +266,158 @@ def _frontend_index_response() -> Union[HTMLResponse, FileResponse]:
         return FileResponse(index_path)
 
     return HTMLResponse(
-        """
-        <html>
-          <head><title>GENESIS Transcription Server</title></head>
-          <body style="font-family: sans-serif; padding: 32px;">
-            <h1>Frontend-Build fehlt</h1>
-            <p>Bitte im Ordner <code>frontend</code> erst <code>npm install</code> und danach <code>npm run build</code> ausfuehren.</p>
-          </body>
-        </html>
-        """,
+        """<!doctype html>
+<html lang="en">
+  <head><meta charset="utf-8" /><title>G3 Whisper · Admin</title></head>
+  <body style="font-family: system-ui, sans-serif; padding: 32px;">
+    <h1>The admin UI is not built</h1>
+    <p>Run <code>npm install</code> and then <code>npm run build</code> in the <code>frontend</code> folder.</p>
+  </body>
+</html>
+""",
         status_code=503,
     )
 
 
+_LANDING_HTML = """<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>G3 Whisper</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --text: #ebf0df; --text-strong: #faf7ef; --text-dim: #a9b2b8; --accent: #ffc16c; --accent-strong: #ff8b47;
+        --panel: rgba(15, 23, 29, .82); --panel-border: rgba(255, 248, 224, .12); --line-strong: rgba(255, 255, 255, .16);
+        --surface-hover: rgba(255, 255, 255, .08); --on-accent: #1b1510;
+        --bg: #10161c;
+        --bg-image: radial-gradient(circle at top left, rgba(255, 194, 117, .20), transparent 28%),
+          radial-gradient(circle at top right, rgba(139, 230, 192, .16), transparent 24%),
+          linear-gradient(145deg, #182028, #10161c 45%, #17131c);
+      }
+      @media (prefers-color-scheme: light) {
+        :root {
+          color-scheme: light;
+          --text: #1f272d; --text-strong: #11171b; --text-dim: #56626b; --accent: #ffb24d; --accent-strong: #e8661f;
+          --panel: rgba(255, 255, 255, .86); --panel-border: rgba(31, 39, 45, .12); --line-strong: rgba(31, 39, 45, .20);
+          --surface-hover: rgba(31, 39, 45, .07);
+          --bg: #f5f1e8;
+          --bg-image: radial-gradient(circle at top left, rgba(255, 170, 90, .22), transparent 30%),
+            radial-gradient(circle at top right, rgba(90, 200, 160, .18), transparent 26%),
+            linear-gradient(145deg, #faf6ee, #f2eee5 45%, #f4eff3);
+        }
+      }
+      html { background: var(--bg); }
+      body {
+        margin: 0; min-height: 100vh; color: var(--text); background: var(--bg-image); background-attachment: fixed;
+        font: 1rem/1.5 Bahnschrift, "Segoe UI Variable", "Segoe UI", system-ui, -apple-system, Roboto, Arial, sans-serif;
+      }
+      main { width: min(960px, calc(100vw - 32px)); margin: 0 auto; padding: 56px 0; }
+      .panel {
+        display: grid; gap: 16px; padding: 24px; border-radius: 24px;
+        background: var(--panel); border: 1px solid var(--panel-border); box-shadow: 0 28px 60px rgba(0, 0, 0, .28);
+        backdrop-filter: blur(18px);
+      }
+      .eyebrow { margin: 0; color: var(--accent); font-size: .75rem; font-weight: 700; letter-spacing: .16em; text-transform: uppercase; }
+      h1 {
+        margin: 0; color: var(--text-strong); line-height: 1.2;
+        font: 700 clamp(1.75rem, 1.25rem + 1.5vw, 2.25rem) Rockwell, "Roboto Slab", Bahnschrift, system-ui, sans-serif;
+      }
+      p { margin: 0; color: var(--text-dim); }
+      code { color: var(--text-strong); font-family: "Cascadia Code", Consolas, "DejaVu Sans Mono", monospace; font-size: .9em; }
+      .actions { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 8px; }
+      a {
+        display: inline-flex; align-items: center; justify-content: center; min-height: 40px; padding: 0 20px;
+        border-radius: 999px; border: 1px solid transparent; text-decoration: none; font-size: .875rem; font-weight: 700;
+      }
+      a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+      .primary { background: linear-gradient(135deg, var(--accent), var(--accent-strong)); color: var(--on-accent); }
+      .secondary { background: var(--surface-hover); color: var(--text-strong); border-color: var(--line-strong); }
+    </style>
+  </head>
+  <body>
+    <main>
+      <section class="panel">
+        <p class="eyebrow">G3 GPU service</p>
+        <h1>G3 Whisper</h1>
+        <p>
+          Local speech recognition, voice embeddings and diarization. The transcription API
+          (<code>POST /transcribe/</code>, <code>POST /v1/audio/transcriptions</code>, <code>GET /v1/models</code>,
+          <code>POST /v2/audio/process</code>) is open while no API key exists. Once an administrator creates a key,
+          every request needs <code>Authorization: Bearer &lt;key&gt;</code> or <code>X-API-Key: &lt;key&gt;</code>.
+        </p>
+        <p>The admin pages under <code>/admin</code> require a username and password.</p>
+        <div class="actions">
+          <a class="primary" href="/admin">Open admin</a>
+          <a class="secondary" href="/docs">API docs</a>
+        </div>
+      </section>
+    </main>
+  </body>
+</html>
+"""
+
+
 def _landing_response() -> HTMLResponse:
-    return HTMLResponse(
-        """
-        <html lang="de">
-          <head>
-            <meta charset="utf-8" />
-            <meta name="viewport" content="width=device-width, initial-scale=1" />
-            <title>GENESIS Whisper Server</title>
-            <style>
-              :root {
-                color-scheme: light;
-                font-family: "Bahnschrift", "Segoe UI Variable", "Trebuchet MS", sans-serif;
-              }
-              body {
-                margin: 0;
-                min-height: 100vh;
-                color: #ebf0df;
-                background:
-                  radial-gradient(circle at top left, rgba(255, 194, 117, 0.24), transparent 28%),
-                  radial-gradient(circle at top right, rgba(139, 230, 192, 0.22), transparent 24%),
-                  linear-gradient(145deg, #182028 0%, #10161c 45%, #17131c 100%);
-              }
-              main {
-                width: min(980px, calc(100vw - 40px));
-                margin: 0 auto;
-                padding: 56px 0;
-              }
-              .panel {
-                background: rgba(15, 23, 29, 0.82);
-                border: 1px solid rgba(255, 248, 224, 0.12);
-                border-radius: 28px;
-                padding: 28px;
-                box-shadow: 0 28px 60px rgba(0, 0, 0, 0.28);
-                backdrop-filter: blur(18px);
-              }
-              .eyebrow {
-                display: inline-block;
-                margin-bottom: 0.8rem;
-                color: #95f2c7;
-                font-size: 0.75rem;
-                font-weight: 800;
-                letter-spacing: 0.18em;
-                text-transform: uppercase;
-              }
-              h1 {
-                margin: 0 0 1rem;
-                font-family: "Rockwell", "Bahnschrift", serif;
-                font-size: clamp(2rem, 4vw, 3.4rem);
-                line-height: 1.02;
-              }
-              p {
-                color: #a9b2b8;
-                line-height: 1.6;
-              }
-              code {
-                color: #f8e7c3;
-              }
-              .button-row {
-                display: flex;
-                gap: 12px;
-                flex-wrap: wrap;
-                margin-top: 24px;
-              }
-              a {
-                display: inline-flex;
-                align-items: center;
-                justify-content: center;
-                min-width: 220px;
-                border-radius: 999px;
-                text-decoration: none;
-                padding: 0.9rem 1.25rem;
-                font-weight: 700;
-                letter-spacing: 0.02em;
-              }
-              .primary {
-                background: linear-gradient(135deg, #ffc16c, #ff8b47);
-                color: #1b1510;
-                box-shadow: 0 12px 28px rgba(255, 139, 71, 0.25);
-              }
-              .secondary {
-                color: #f4f6ee;
-                border: 1px solid rgba(255, 255, 255, 0.12);
-                background: rgba(255, 255, 255, 0.06);
-              }
-            </style>
-          </head>
-          <body>
-            <main>
-              <section class="panel">
-                <span class="eyebrow">GENESIS Transcription Server</span>
-                <h1>Lokale Transkription offen, Admin-Dashboard geschuetzt.</h1>
-                <p>
-                  Die oeffentliche Upload-API unter <code>POST /transcribe/</code> ist ohne Key erreichbar,
-                  solange keine API-Keys angelegt sind. Sobald im Admin-Dashboard mindestens ein API-Key
-                  existiert, wird ein <code>X-API-Key</code>-Header verlangt.
-                </p>
-                <p>
-                  Das Admin-Dashboard unter <code>/admin</code> ist per Login (Benutzername/Passwort) geschuetzt.
-                  Standardzugang <code>admin</code> / <code>admin</code> &ndash; das Passwort muss beim ersten
-                  Login geaendert werden.
-                </p>
-                <div class="button-row">
-                  <a class="primary" href="/admin">Admin-Dashboard oeffnen</a>
-                  <a class="secondary" href="/docs">OpenAPI / Docs</a>
-                </div>
-              </section>
-            </main>
-          </body>
-        </html>
-        """,
-        status_code=200,
-    )
+    return HTMLResponse(_LANDING_HTML, status_code=200)
 
 
-@app.get("/")
+def _resolve_frontend_asset(full_path: str) -> Path | None:
+    """File under frontend/dist for full_path, or None (same rules as G3_RERANK).
+
+    The path is checked lexically before the filesystem is touched: on Windows, dist / "//host/share/x" is a UNC
+    path, and resolving it would open an SMB connection. Backslashes, drive letters / colons, absolute paths and
+    '..' never reach the filesystem; symlinks pointing outside dist are never served.
+    """
+    if not full_path or "\x00" in full_path or "\\" in full_path or ":" in full_path:
+        return None
+    relative = PurePosixPath(full_path)
+    if relative.is_absolute() or full_path.startswith("/") or ".." in relative.parts:
+        return None
+    parts = [part for part in relative.parts if part not in {"", "."}]
+    if not parts:
+        return None
+    try:
+        dist_root = FRONTEND_DIST_DIR.resolve(strict=True)
+        candidate = dist_root.joinpath(*parts).resolve(strict=True)
+    except (OSError, RuntimeError, ValueError):
+        return None
+    if not candidate.is_relative_to(dist_root) or not candidate.is_file():
+        return None
+    return candidate
+
+
+@app.get("/", include_in_schema=False)
 async def serve_landing():
     return _landing_response()
 
 
-@app.get("/admin")
-@app.get("/admin/")
+@app.get("/admin", include_in_schema=False)
+@app.get("/admin/", include_in_schema=False)
 async def serve_frontend_index():
     return _frontend_index_response()
 
 
-@app.get("/{full_path:path}")
+@app.get("/{full_path:path}", include_in_schema=False)
 async def serve_frontend_assets(full_path: str):
-    if full_path.startswith("api/"):
-        return HTMLResponse(status_code=404, content="Not Found")
+    if full_path.startswith(("api/", "v1/", "v2/")):
+        # JSON 404 instead of the landing page for mistyped API paths.
+        raise HTTPException(status_code=404, detail="Not Found")
 
     if full_path.startswith("admin/"):
-        return _frontend_index_response()
+        asset_path = _resolve_frontend_asset(full_path.removeprefix("admin/"))
+        return FileResponse(asset_path) if asset_path is not None else _frontend_index_response()
 
-    asset_path = FRONTEND_DIST_DIR / full_path
-    if asset_path.exists() and asset_path.is_file():
+    asset_path = _resolve_frontend_asset(full_path)
+    if asset_path is not None:
         return FileResponse(asset_path)
     return _landing_response()
 
 
 if __name__ == "__main__":
-    print("\n--- Server ist bereit ---", file=sys.stderr)
-    print("Oeffne die Startseite in deinem Browser: http://127.0.0.1:7861/", file=sys.stderr)
-    print("Das Admin-Dashboard ist erreichbar unter: http://127.0.0.1:7861/admin", file=sys.stderr)
-    print("Der API-Endpunkt ist erreichbar unter: POST http://127.0.0.1:7861/transcribe/", file=sys.stderr)
+    print("\n--- G3 Whisper is ready ---", file=sys.stderr)
+    print("Start page: http://127.0.0.1:7861/", file=sys.stderr)
+    print("Admin: http://127.0.0.1:7861/admin", file=sys.stderr)
+    print("API: POST http://127.0.0.1:7861/transcribe/", file=sys.stderr)
     uvicorn.run(app, host="0.0.0.0", port=7861)

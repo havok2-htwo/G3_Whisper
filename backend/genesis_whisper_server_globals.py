@@ -261,5 +261,6 @@ batch_runtime_state: Dict[str, Any] = {
     "last_batch_duration_ms": None,
     "last_error": None,
     "total_batches_processed": 0,
+    "total_batches_failed": 0,
     "total_segments_processed": 0,
 }

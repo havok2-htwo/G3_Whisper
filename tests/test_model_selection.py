@@ -1264,10 +1264,13 @@ class ClientDiscoveryTests(unittest.TestCase):
         paths = [getattr(route, "path", None) for route in server.app.routes]
         self.assertLess(paths.index("/v2/capabilities"), paths.index("/{full_path:path}"))
 
-    def test_v1_models_keeps_active_first_then_the_alias_without_auth(self) -> None:
+    def test_v1_models_keeps_active_first_then_the_alias(self) -> None:
         self.use_settings(local_model=WHISPER_TURBO)
-        with mock.patch.object(api, "authorize_api_key", side_effect=AssertionError("must stay open")):
+        # Gated like the transcription routes (open while no API key exists; the gate itself is tested in
+        # test_api_keys.py): the listing runs only after the gate let the request through.
+        with mock.patch.object(api, "authorize_api_key", return_value=None) as gate:
             response = self.client.get("/v1/models")
+        gate.assert_called_once()
         self.assertEqual(response.status_code, 200, response.text)
         body = response.json()
         self.assertEqual(set(body), {"object", "data"})

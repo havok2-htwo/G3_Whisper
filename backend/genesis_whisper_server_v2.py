@@ -22,7 +22,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.formparsers import MultiPartException, MultiPartParser
 
 from .genesis_whisper_server_audio import get_audio_duration_seconds, load_audio_file
-from .genesis_whisper_server_auth import authorize_api_key, get_auth_store, require_admin
+from .genesis_whisper_server_auth import authorize_api_key, get_auth_store
 from .genesis_whisper_server_batching import served_model_id
 from .genesis_whisper_server_chunking import combine_transcription_chunks, split_audio_for_whisper
 from .genesis_whisper_server_diarization_engine import (
@@ -418,38 +418,24 @@ def _success_response(request_id: str, payload: dict[str, Any]) -> JSONResponse:
 
 
 def _authorize_v2_request(request: Request) -> str | None:
-    """Accept the public API key or an authenticated admin UI session.
+    """Accept a client API key (Bearer or X-API-Key) or an authenticated admin UI session.
 
-    Client API keys remain the normal machine-to-machine credential.  The
-    same-origin admin dashboard already has a protected, HTTP-only session and
-    must not require operators to copy a client key back into their browser
-    merely to exercise the v2 test panel.
+    The shared gate does both: the same-origin admin dashboard has a protected, HTTP-only session and must not
+    need a client key for the Playground, while an explicitly supplied key stays authoritative (a wrong key is
+    401 even with a session), so the Playground can still validate client credentials.
     """
 
-    # An explicitly supplied key is always authoritative.  This keeps the
-    # admin tester useful for validating client credentials instead of
-    # silently accepting a bad key through the browser session fallback.
-    if request.headers.get("x-api-key") is not None:
-        return authorize_api_key(request)
-
-    try:
-        return authorize_api_key(request)
-    except HTTPException as api_key_error:
-        try:
-            require_admin(request)
-        except HTTPException:
-            raise api_key_error
-        return None
+    return authorize_api_key(request)
 
 
 def _ensure_asr_model(processing_key: tuple[str, str, str, str, str]) -> None:
     model_id, device, cache_path, _, precision = processing_key
     if load_local_asr_model(model_id, device, cache_path, precision):
         return
-    detail = "Lokales ASR-Modell konnte nicht geladen werden."
+    detail = "The local ASR model could not be loaded."
     load_error = get_last_local_asr_load_error()
     if load_error:
-        detail = f"{detail} Ursache: {load_error}"
+        detail = f"{detail} Cause: {load_error}"
     raise RuntimeError(detail)
 
 

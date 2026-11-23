@@ -423,40 +423,12 @@ class V2EndpointTests(unittest.TestCase):
         self.assertEqual(payload["models"]["embedding"]["dimension"], 192)
         self.assertNotIn("embedding_space_id", json.dumps(payload))
 
-    def test_authenticated_admin_session_can_use_v2_tester_without_client_key(self) -> None:
-        normalized = _vector(0).tolist()
-        with (
-            mock.patch.object(
-                v2,
-                "authorize_api_key",
-                side_effect=HTTPException(status_code=401, detail="API key required"),
-            ),
-            mock.patch.object(v2, "require_admin", return_value={"username": "admin"}) as require_admin,
-            mock.patch.object(v2, "load_audio_file", return_value=self.audio),
-            mock.patch.object(v2, "_record_log"),
-            mock.patch.object(
-                v2,
-                "_generate_embedding",
-                new=mock.AsyncMock(return_value=(normalized, 3)),
-            ),
-        ):
-            response = self._call({"schema_version": "2.0", "mode": "embedding"})
-
-        self.assertEqual(response.status_code, 200, _payload(response))
-        require_admin.assert_called_once()
-
-    def test_v2_preserves_api_key_error_without_admin_session(self) -> None:
-        with (
-            mock.patch.object(
-                v2,
-                "authorize_api_key",
-                side_effect=HTTPException(status_code=401, detail="API key required"),
-            ),
-            mock.patch.object(
-                v2,
-                "require_admin",
-                side_effect=HTTPException(status_code=401, detail="Authentication required"),
-            ),
+    def test_v2_reports_a_refused_gate_as_invalid_api_key(self) -> None:
+        # The gate itself (keys, Bearer, admin session, explicit key wins) is tested in test_api_keys.py.
+        with mock.patch.object(
+            v2,
+            "authorize_api_key",
+            side_effect=HTTPException(status_code=401, detail="API key required"),
         ):
             response = self._call({"schema_version": "2.0", "mode": "embedding"})
 
@@ -478,21 +450,6 @@ class V2EndpointTests(unittest.TestCase):
         self.assertEqual(payload["result"], {"transcript": {"text": "Ein Transkript", "language": "de"}})
         # The language the ASR ran with; no detection block when no detection ran.
         self.assertEqual(payload["models"], {"asr": {"id": "asr-model", "language": "de"}})
-
-    def test_explicit_invalid_api_key_is_not_hidden_by_admin_session(self) -> None:
-        with (
-            mock.patch.object(v2, "authorize_api_key", side_effect=HTTPException(status_code=401, detail="bad key")),
-            mock.patch.object(v2, "require_admin", return_value={"username": "admin"}) as require_admin,
-        ):
-            response = self._call(
-                {"schema_version": "2.0", "mode": "embedding"},
-                headers={"X-API-Key": "invalid"},
-            )
-
-        payload = _payload(response)
-        self.assertEqual(response.status_code, 401)
-        self.assertEqual(payload["error"]["code"], "INVALID_API_KEY")
-        require_admin.assert_not_called()
 
     def test_transcript_embedding_returns_both_and_only_192_dimensions(self) -> None:
         normalized = _vector(3).tolist()

@@ -59,9 +59,9 @@ def process_local_asr_batch(audio_batch: List[np.ndarray], processing_key: Tuple
     with shared_gpu_lease():
         if not load_local_asr_model(model_id, device, cache_path, precision):
             load_error = get_last_local_asr_load_error()
-            detail = "Lokales ASR-Modell konnte nicht geladen werden."
+            detail = "The local ASR model could not be loaded."
             if load_error:
-                detail = f"{detail} Ursache: {load_error}"
+                detail = f"{detail} Cause: {load_error}"
             raise RuntimeError(detail)
         with settings_lock:
             batch_size = max(1, int(current_settings.get("batch_max_segments", len(audio_batch) or 1)))
@@ -80,9 +80,9 @@ def create_api(app: FastAPI) -> FastAPI:
     @app.post("/transcribe/")
     async def transcribe_endpoint(
         request: Request,
-        file: UploadFile = File(..., description="Die zu transkribierende Audiodatei (z.B. WAV, MP3, FLAC)."),
-        engine: str = Form("local", description="Es wird nur noch die lokale ASR-Engine unterstuetzt."),
-        voice_ident: bool = Form(False, description="Wenn True, wird zusaetzlich ein Stimm-Vektor (Embedding) generiert."),
+        file: UploadFile = File(..., description="The audio file to transcribe (for example WAV, MP3, FLAC)."),
+        engine: str = Form("local", description="Only the local ASR engine is supported."),
+        voice_ident: bool = Form(False, description="When true, a voice vector (embedding) is generated as well."),
     ):
         api_key_id = authorize_api_key(request)
         request_start_time = time.monotonic()
@@ -239,7 +239,9 @@ def create_api(app: FastAPI) -> FastAPI:
         return response_data
 
     @app.get("/v1/models")
-    async def list_models_openai():
+    async def list_models_openai(request: Request):
+        # Same gate as the transcription routes: open while no API key exists.
+        authorize_api_key(request)
         with settings_lock:
             local_model = current_settings.get("local_model", "whisper-1")
         return {

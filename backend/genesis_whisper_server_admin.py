@@ -16,11 +16,16 @@ from .genesis_whisper_server_audio import get_audio_duration_seconds, load_audio
 from .genesis_whisper_server_auth import (
     SESSION_COOKIE_NAME,
     clear_session_cookie,
+    client_key,
     get_auth_store,
+    login_rate_limiter,
     require_admin,
+    require_same_origin,
     require_session,
+    run_password_work,
     set_session_cookie,
 )
+from .genesis_whisper_server_perf import perf_snapshot
 from .genesis_whisper_server_batching import ModelFailoverError
 from .genesis_whisper_server_chunking import (
     TARGET_SAMPLE_RATE,
@@ -91,6 +96,13 @@ from .genesis_whisper_server_wxc import apply_mms_device_setting
 ACTIVE_MODEL_CHANGED = "active_model_changed"
 
 
+def _failed_batch_count() -> int:
+    from .genesis_whisper_server_globals import batch_runtime_state, batch_state_lock
+
+    with batch_state_lock:
+        return int(batch_runtime_state.get("total_batches_failed", 0) or 0)
+
+
 class AdminSettingsPayload(BaseModel):
     # Not a setting: the model the sent form was loaded for. Callers that omit it are not checked.
     expected_local_model: str | None = None
@@ -111,7 +123,9 @@ class AdminSettingsPayload(BaseModel):
     language_detection_model: str | None = None
     redimnet_max_batch_size: int | None = None
     debug_retain_history_audio: StrictBool | None = None
+    # Empty or the masked value from GET keeps the saved token; huggingface_token_clear=true removes it.
     huggingface_token: str | None = None
+    huggingface_token_clear: StrictBool | None = None
     # No extra="forbid": keys of older clients (e.g. the removed diarization_engine / dia_server_base_url /
     # dia_api_key) are accepted and ignored.
     segmentation_model_path: str | None = None
@@ -161,6 +175,20 @@ class CreateApiKeyPayload(BaseModel):
     alias: str = ""
 
 
+TOKEN_MASK_CHAR = "\u2026"
+
+
+def mask_secret(value: Any) -> str:
+    """'hf_…abcd' for a saved token, '' for none. The clear text never leaves the server."""
+
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    prefix = text[:3] if text.startswith("hf_") else ""
+    tail = text[-4:] if len(text) >= 12 else ""
+    return f"{prefix}{TOKEN_MASK_CHAR}{tail}"
+
+
 def _settings_snapshot() -> Dict[str, Any]:
     with settings_lock:
         settings_copy = current_settings.copy()
@@ -168,9 +196,26 @@ def _settings_snapshot() -> Dict[str, Any]:
 
 
 def _serialize_settings() -> Dict[str, Any]:
-    """The admin representation of the saved settings (normalised)."""
+    """The admin representation of the saved settings (normalised), secrets masked."""
 
-    return _settings_snapshot()
+    snapshot = _settings_snapshot()
+    token = snapshot.get("huggingface_token") or ""
+    snapshot["huggingface_token"] = mask_secret(token)
+    snapshot["huggingface_token_set"] = bool(token)
+    return snapshot
+
+
+def _apply_token_update(payload_data: Dict[str, Any]) -> None:
+    """Keep the saved token unless a new one was typed or an explicit clear was sent (in place)."""
+
+    clear = payload_data.pop("huggingface_token_clear", None) is True
+    token = str(payload_data.get("huggingface_token") or "").strip()
+    if clear:
+        payload_data["huggingface_token"] = ""
+    elif not token or TOKEN_MASK_CHAR in token:
+        payload_data.pop("huggingface_token", None)
+    else:
+        payload_data["huggingface_token"] = token
 
 
 def _settings_options() -> Dict[str, List[Dict[str, Any]]]:
@@ -355,7 +400,7 @@ def _get_local_processing_key() -> tuple[str, str, str, str, str]:
 def _effective_model_storage_path(storage_path: str | None = None) -> str:
     if storage_path is not None:
         return str(storage_path)
-    return str(_serialize_settings().get("local_model_cache_path", ""))
+    return str(_settings_snapshot().get("local_model_cache_path", ""))
 
 
 def _get_loaded_model_cuda_index() -> int | None:
@@ -413,12 +458,12 @@ async def _run_admin_benchmark(request: Request, audio_data, repeat_count: int) 
     effective_language = get_effective_transcription_language(model_id, configured_language)
 
     async with request.app.state.local_gpu_lock:
-        model_loaded = await run_blocking_gpu_phase(_load_model_for_settings, _serialize_settings())
+        model_loaded = await run_blocking_gpu_phase(_load_model_for_settings, _settings_snapshot())
     if not model_loaded:
         load_error = get_last_local_asr_load_error()
-        detail = "Lokales ASR-Modell konnte fuer den Benchmark nicht geladen werden."
+        detail = "The local ASR model could not be loaded for the benchmark."
         if load_error:
-            detail = f"{detail} Ursache: {load_error}"
+            detail = f"{detail} Cause: {load_error}"
         raise HTTPException(status_code=500, detail=detail)
 
     cuda_index = _get_loaded_model_cuda_index()
@@ -525,12 +570,30 @@ def create_admin_api(app: FastAPI) -> FastAPI:
     model_select_lock = asyncio.Lock()
 
     # --- Auth: username/password login backed by an httpOnly session cookie ---
+    @app.get("/api/admin/auth/setup")
+    async def admin_auth_setup():
+        """Public: whether the first-login flow (default credentials) is still pending. Login page hint only."""
+        store = get_auth_store()
+        return {"setup_required": store.load_error is None and store.setup_required()}
+
     @app.post("/api/admin/auth/login")
     async def admin_login(payload: LoginPayload, request: Request, response: Response):
+        require_same_origin(request)
+        client = client_key(request)
+        retry_after = login_rate_limiter.begin(client)
+        if retry_after:
+            raise HTTPException(
+                status_code=429,
+                detail=f"Too many failed logins. Try again in {retry_after} s.",
+                headers={"Retry-After": str(retry_after)},
+            )
         store = get_auth_store()
-        user = store.verify_user(payload.username, payload.password)
+        if store.load_error:
+            raise HTTPException(status_code=503, detail="The account store could not be read. Check the server log.")
+        user = await run_password_work(store.verify_user, payload.username, payload.password)
         if not user:
             raise HTTPException(status_code=401, detail="Invalid username or password.")
+        login_rate_limiter.succeeded(client)
         token = store.create_session(user["username"])
         store.touch_login(user["username"])
         set_session_cookie(response, request, token)
@@ -544,7 +607,11 @@ def create_admin_api(app: FastAPI) -> FastAPI:
 
     @app.get("/api/admin/auth/whoami")
     async def admin_whoami(ctx: dict = Depends(require_session)):
-        return {"username": ctx["username"], "must_change_password": ctx["must_change_password"]}
+        return {
+            "username": ctx["username"],
+            "must_change_password": ctx["must_change_password"],
+            "expires_at": ctx.get("expires_at"),
+        }
 
     @app.post("/api/admin/auth/change-password")
     async def admin_change_password(
@@ -554,15 +621,15 @@ def create_admin_api(app: FastAPI) -> FastAPI:
         ctx: dict = Depends(require_session),
     ):
         store = get_auth_store()
-        if not store.verify_user(ctx["username"], payload.current_password):
+        if not await run_password_work(store.verify_user, ctx["username"], payload.current_password):
             raise HTTPException(status_code=400, detail="Current password is incorrect.")
-        store.set_password(ctx["username"], payload.new_password)
+        await run_password_work(store.set_password, ctx["username"], payload.new_password)
         # set_password invalidated the caller's old session; issue a fresh one so they stay in.
         token = store.create_session(ctx["username"])
         set_session_cookie(response, request, token)
         return {"ok": True, "must_change_password": False}
 
-    # --- Client API keys (admin-managed; used to authorize the public /transcribe/ API) ---
+    # --- Client API keys (admin-managed; gate /transcribe/, /v1/audio/transcriptions, /v1/models, /v2/audio/process) ---
     @app.get("/api/admin/api-keys")
     async def admin_list_api_keys(_: dict = Depends(require_admin)):
         return {"keys": get_auth_store().list_api_keys()}
@@ -575,7 +642,13 @@ def create_admin_api(app: FastAPI) -> FastAPI:
     async def admin_delete_api_key(key_id: str, _: dict = Depends(require_admin)):
         if not get_auth_store().delete_api_key(key_id):
             raise HTTPException(status_code=404, detail="API key not found.")
-        return {"ok": True}
+        return Response(status_code=204)
+
+    # --- Performance graph (shared G3 contract, schema 1) ---
+    @app.get("/api/admin/perf")
+    async def admin_perf(request: Request, _: dict = Depends(require_admin)):
+        batch_manager = getattr(request.app.state, "whisper_batch_manager", None)
+        return await asyncio.to_thread(perf_snapshot, batch_manager)
 
     @app.get("/api/admin/settings")
     async def admin_get_settings(_: dict[str, str] = Depends(require_admin)):
@@ -596,6 +669,7 @@ def create_admin_api(app: FastAPI) -> FastAPI:
             payload_data = payload.dict(exclude_unset=True, exclude_none=True)
 
         expected_local_model = payload_data.pop("expected_local_model", None)
+        _apply_token_update(payload_data)
 
         with settings_lock:
             previous_settings = current_settings.copy()
@@ -795,6 +869,7 @@ def create_admin_api(app: FastAPI) -> FastAPI:
         return {
             "summary": {
                 "total_requests": total_requests,
+                "failed_batches": int(_failed_batch_count()),
                 "avg_total_duration_ms": round(mean(total_duration_values), 2) if total_duration_values else None,
                 "avg_transcription_duration_ms": round(mean(transcription_values), 2) if transcription_values else None,
             },
@@ -919,12 +994,12 @@ def create_admin_api(app: FastAPI) -> FastAPI:
     @app.post("/api/admin/benchmark")
     async def admin_benchmark(
         request: Request,
-        file: UploadFile = File(..., description="Audio- oder Video-Datei fuer den Benchmark."),
+        file: UploadFile = File(..., description="Audio or video file for the benchmark."),
         repeat_count: int = Form(1),
         _: dict[str, str] = Depends(require_admin),
     ):
         if repeat_count < 1 or repeat_count > 64:
-            raise HTTPException(status_code=400, detail="Wiederholungen muessen zwischen 1 und 64 liegen.")
+            raise HTTPException(status_code=400, detail="Repeats must be between 1 and 64.")
 
         filename = file.filename or "benchmark-audio"
         try:
@@ -932,7 +1007,7 @@ def create_admin_api(app: FastAPI) -> FastAPI:
         except HTTPException:
             raise
         except Exception as exc:
-            raise HTTPException(status_code=400, detail=f"Konnte Audiodatei nicht verarbeiten: {exc}") from exc
+            raise HTTPException(status_code=400, detail=f"Could not process the audio file: {exc}") from exc
 
         benchmark_result = await _run_admin_benchmark(request, audio_data, repeat_count)
         benchmark_result["file_name"] = filename
