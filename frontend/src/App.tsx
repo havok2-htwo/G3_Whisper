@@ -2116,6 +2116,7 @@ export default function App() {
                             <th>Time</th>
                             <th>Speaker</th>
                             <th>Kind</th>
+                            <th>Language</th>
                             <th>Overlap</th>
                             <th>Text</th>
                           </tr>
@@ -2138,6 +2139,12 @@ export default function App() {
                                 )}
                               </td>
                               <td>{segment.speaker_kind}</td>
+                              <td className="nowrap">
+                                {segment.language ? <span className="mono">{segment.language}</span> : "—"}
+                                {segment.language_source && (
+                                  <span className="cell-sub">from {segment.language_source}</span>
+                                )}
+                              </td>
                               <td>{segment.overlap ? "Yes" : "No"}</td>
                               <td className="text-cell">{segment.text}</td>
                             </tr>

@@ -12,6 +12,7 @@ Dieses Dokument wird bewusst knapp gehalten und bei kuenftigen Arbeiten fortgesc
 
 ## Unreleased
 
+- **Admin-UI, Playground:** Die Tabelle "Speaker turns" zeigt jetzt je Segment die erkannte Sprache (`language`) und ihre Herkunft (`language_source`: Sprecher, Turn, Anfrage oder Einstellung). Die API liefert beide Felder schon; nur die Anzeige ist neu.
 - **Admin-UI vereinheitlicht (G3-Standard, wie Rerank/Embed/OmniVoice) und Sicherheitsfixes:**
   - **Sicherheit:** Die Catch-all-Route fuer statische Dateien lieferte per `GET /..%2f..%2f<datei>` jede Datei des Checkouts aus (`.env`, Einstellungs- und Secrets-Datei) ohne Login. Jetzt nur noch Dateien innerhalb von `frontend/dist` (lexikalische Pruefung wie G3_RERANK), unbekannte `api/`-, `v1/`-, `v2/`-Pfade antworten JSON-404; Regressionstest. `GET /api/admin/settings` liefert den HF-Token nur noch maskiert (`hf_…abcd`) plus `huggingface_token_set`; leerer oder maskierter PUT behaelt ihn, `huggingface_token_clear: true` loescht ihn.
   - **API-Keys:** `Authorization: Bearer` zusaetzlich zu `X-API-Key`; die Admin-Session gilt ohne gesendeten Key (Playground), ein explizit gesendeter falscher Key bleibt 401. `/v1/models` ist jetzt wie die Transkriptionsrouten geschuetzt (nur sobald ein Key existiert). Key-Speicher im Speicher mit Index, atomar und 0600 geschrieben, Nutzung entprellt (5 s) gespeichert, nicht lesbare Secrets-Datei sperrt (503) statt zu oeffnen. Neue Keys speichern einen Hinweis (`whisper_AbCd…wXyZ`), Loeschen antwortet 204.

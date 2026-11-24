@@ -229,6 +229,10 @@ export type AudioProcessTranscriptSegment = {
   speaker_kind: "known" | "unknown" | "unresolved";
   text: string;
   overlap?: boolean;
+  /** Language the segment was decoded in (ISO code, e.g. "de"). */
+  language?: string;
+  /** Where that language came from: speaker, turn, request or setting. */
+  language_source?: string;
   [key: string]: unknown;
 };
 
