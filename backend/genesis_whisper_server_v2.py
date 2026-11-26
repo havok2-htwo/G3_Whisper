@@ -70,6 +70,7 @@ from .genesis_whisper_server_lid import (
     turn_language,
     unavailable_warning,
 )
+from . import genesis_whisper_server_progress as progress
 from .genesis_whisper_server_gpu import run_blocking_gpu_phase, run_sliced_gpu_phase
 from .genesis_whisper_server_local_asr_engine import get_last_local_asr_load_error, load_local_asr_model
 from .genesis_whisper_server_repetition import (
@@ -880,7 +881,10 @@ async def _transcribe_turns(
     started = time.monotonic()
     batch_manager = request.app.state.whisper_batch_manager
     # One job per language (the speaker's, or the turn's own where it overrode it); results come back in turn order.
-    batch_results = await submit_by_language(batch_manager, prepared_chunks, processing_key, chunk_languages)
+    progress_name = _enter_asr_phase(request, len(prepared_chunks))
+    batch_results = await submit_by_language(
+        batch_manager, prepared_chunks, processing_key, chunk_languages, progress_name
+    )
     result_index = 0
     transcript_segments: list[dict[str, Any]] = []
     for turn_index, (turn, chunk_count) in enumerate(zip(turns, turn_chunk_counts)):
@@ -982,7 +986,8 @@ async def _wxc_transcribe_segments(
 
     asr_started = time.monotonic()
     batch_manager = request.app.state.whisper_batch_manager
-    results = await submit_by_language(batch_manager, chunk_audio, processing_key, chunk_languages)
+    progress_name = _enter_asr_phase(request, len(chunk_audio))
+    results = await submit_by_language(batch_manager, chunk_audio, processing_key, chunk_languages, progress_name)
     texts = [result.text for result in results]
     # Collapse ASR repetition loops on the full chunk text, BEFORE alignment
     # splits it into words. Word-level alignment plus sentence splitting at "."
@@ -993,6 +998,7 @@ async def _wxc_transcribe_segments(
     timings["transcription"] = round((time.monotonic() - asr_started) * 1000)
 
     align_started = time.monotonic()
+    progress.enter_phase("alignment")
     words = await _align_words_sliced(request, audio, chunks, texts)
     timings["alignment"] = round((time.monotonic() - align_started) * 1000)
 
@@ -1001,6 +1007,7 @@ async def _wxc_transcribe_segments(
     bounds = alignment_bounds(chunks)
 
     verify_started = time.monotonic()
+    progress.enter_phase("verification")
     verify_windows, verify_kept = await asyncio.to_thread(plan_verification_windows, audio, sentences)
     verify_embedded = await _embed_windows_sliced(request, verify_windows) if verify_windows else []
     verification = await asyncio.to_thread(finish_verification, verify_windows, verify_kept, verify_embedded)
@@ -1052,6 +1059,36 @@ def _chunk_language_at(moment: float, bounds: Sequence[float], chunk_languages: 
         if bounds[index] < moment <= bounds[index + 1]:
             return language
     return chunk_languages[-1]
+
+
+def _enter_asr_phase(request: Request, total_chunks: int) -> str | None:
+    """Enter the tracked request's "transcription" phase (docs/254) and return the name its ASR jobs get.
+
+    The progress comes from the batch jobs themselves: a probe counts their outstanding chunks when someone asks
+    (a finished job is gone, so once seen, no job means done; before the first job registered, nothing ran yet).
+    The phase waits in the ASR queue until the batch worker starts the first of its jobs (the job reports that,
+    see TranscriptionJob), so queue time never counts as transcription time.
+    None outside a tracked request, and the jobs keep their fresh tokens as before."""
+
+    entry = progress.current_entry()
+    if entry is None:
+        return None
+    batch_manager = request.app.state.whisper_batch_manager
+    progress_id = entry.progress_id
+    seen = False
+
+    def probe() -> tuple[int, int]:
+        nonlocal seen
+        outstanding, jobs, _started = batch_manager.job_progress(progress_id)
+        if jobs:
+            seen = True
+        elif not seen:
+            return 0, total_chunks
+        return max(0, total_chunks - outstanding), total_chunks
+
+    progress.enter_phase("transcription", probe=probe)
+    progress.registry.begin_queue(entry)
+    return progress_id
 
 
 class WxcNoSpeechError(RuntimeError):
@@ -1185,6 +1222,7 @@ async def _process_diarization(
     # (503 MODEL_UNAVAILABLE, not retryable).
     try:
         if LOCAL_WINDOW_FILTER == "silero":
+            progress.enter_phase("vad")
             speech_probs = await asyncio.to_thread(silero_frame_probs, audio)
         diarization_payload = await run_local_diarization(
             http_request.app.state.local_gpu_lock,
@@ -1218,6 +1256,7 @@ async def _process_diarization(
     # Standard diarization preserves all speaker activity and therefore
     # defines the safe, overlap-free enrollment regions. Exclusive turns
     # remain reserved for ASR so overlapping speech is transcribed once.
+    progress.enter_phase("embedding")
     speaker_clouds = await _extract_speaker_clouds(http_request, audio, standard, overlaps)
     embedding_ms = round((time.monotonic() - embedding_started) * 1000)
 
@@ -1250,6 +1289,7 @@ async def _process_diarization(
     speaker_languages: SpeakerLanguages | None = None
     lid_ms: int | None = None
     if language_detection_applies(*_language_settings(language_override)):
+        progress.enter_phase("language_detection")
         speaker_languages, language_decision = await _detect_speaker_languages(
             http_request, audio, speaker_clouds, effective_exclusive, turns
         )
@@ -1294,6 +1334,7 @@ async def _process_diarization(
             speaker_languages,
         )
 
+    progress.enter_phase("finishing")
     try:
         assignments, unresolved_profile_ids, unresolved_clusters = match_known_speakers(
             known_speakers,
@@ -1578,6 +1619,8 @@ def create_v2_capabilities_api(app: FastAPI) -> FastAPI:
             "diarization": diarization_capability(),
             # Genesis3 docs/243 8.8: offered only while the switch is on and the seg-3.0 checkpoint is usable.
             "speaker_turns": speaker_turns_capability(speaker_turns_available()),
+            # Genesis3 docs/254: X-Progress-ID on the POST, then GET /v2/progress/{id} while it runs.
+            "progress": progress.capability(),
         }
 
     return app
@@ -1613,14 +1656,26 @@ def create_v2_api(app: FastAPI) -> FastAPI:
         request_started = time.monotonic()
         form_data: FormData | None = None
         mode: str | None = None
+        progress_entry: progress.ProgressEntry | None = None
+        progress_token = None
+        progress_status = "failed"
         try:
             try:
                 api_key_id = _authorize_v2_request(http_request)
             except HTTPException as exc:
                 raise V2ApiError(exc.status_code, "INVALID_API_KEY", str(exc.detail), False) from exc
+            # docs/254: a client-chosen X-Progress-ID makes this request pollable under GET /v2/progress/{id}
+            # (same key only). A missing, malformed or busy id just means no progress, never an error.
+            progress_entry = progress.registry.start(
+                http_request.headers.get(progress.PROGRESS_HEADER, "").strip(), api_key_id
+            )
+            progress_token = progress.bind(progress_entry)
             form_data, file, request_json = await _parse_multipart_parts(http_request)
             parsed = _parse_request_json(request_json)
             mode = parsed["mode"]
+            if progress_entry is not None:
+                progress.registry.set_mode(progress_entry, mode)
+                progress.enter_phase("decode")
             if parsed.get("speaker_turns") is not None and not speaker_turns_available():
                 raise V2ApiError(
                     422,
@@ -1638,6 +1693,9 @@ def create_v2_api(app: FastAPI) -> FastAPI:
                 raise V2ApiError(400, "AUDIO_DECODE_FAILED", f"Audiodatei konnte nicht dekodiert werden: {exc}") from exc
             decode_ms = round((time.monotonic() - decode_started) * 1000)
             audio_duration_ms = round(get_audio_duration_seconds(audio) * 1000)
+            if progress_entry is not None:
+                progress.registry.set_audio_seconds(progress_entry, audio_duration_ms / 1000.0)
+                progress.enter_phase("processing")
             filter_enabled = repetition_filter_enabled(http_request.headers.get(REPETITION_FILTER_HEADER))
             gate_enabled = http_request.headers.get("x-g3-turn-gate", "").strip().lower() not in ("off", "0", "false", "no")
             pipeline_mode = (
@@ -1777,6 +1835,7 @@ def create_v2_api(app: FastAPI) -> FastAPI:
                     # Retention is diagnostic-only and must never invalidate a
                     # successful production request.
                     print(f"[V2-WARNUNG] Debug-Audio konnte nicht gespeichert werden: {exc}", file=sys.stderr)
+            progress_status = "completed"
             return _success_response(
                 request_id,
                 {
@@ -1820,8 +1879,44 @@ def create_v2_api(app: FastAPI) -> FastAPI:
                 request_started=request_started,
             )
         finally:
+            if progress_entry is not None:
+                progress.registry.finish(progress_entry, progress_status)
+            if progress_token is not None:
+                progress.unbind(progress_token)
             if form_data is not None:
                 await form_data.close()
+
+    @app.get("/v2/progress/{progress_id}")
+    async def progress_v2(progress_id: str, http_request: Request):
+        """Progress of one running (or just finished) POST /v2/audio/process of the same API key (docs/254).
+
+        Phase, units, fraction, elapsed time and ETA only; never request contents. Unknown, expired and other
+        keys' ids are the same 404."""
+
+        try:
+            api_key_id = _authorize_v2_request(http_request)
+        except HTTPException as exc:
+            return JSONResponse(
+                status_code=exc.status_code,
+                content={
+                    "schema_version": V2_SCHEMA_VERSION,
+                    "error": {"code": "INVALID_API_KEY", "message": str(exc.detail)},
+                },
+            )
+        entry = progress.registry.get(progress_id, api_key_id)
+        if entry is None:
+            return JSONResponse(
+                status_code=404,
+                content={
+                    "schema_version": V2_SCHEMA_VERSION,
+                    "error": {"code": "PROGRESS_NOT_FOUND", "message": "Kein laufender Auftrag mit dieser ID."},
+                },
+            )
+        return JSONResponse(
+            status_code=200,
+            headers={"Cache-Control": "no-store"},
+            content={"schema_version": V2_SCHEMA_VERSION, **progress.registry.snapshot(entry)},
+        )
 
     return app
 

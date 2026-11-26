@@ -1198,7 +1198,8 @@ class ClientDiscoveryTests(unittest.TestCase):
         body = self.capabilities()
         self.assertEqual(
             set(body),
-            {"schema_version", "service", "model", "language", "modes", "embedding", "diarization", "speaker_turns"},
+            {"schema_version", "service", "model", "language", "modes", "embedding", "diarization", "speaker_turns",
+             "progress"},
         )
         self.assertEqual((body["schema_version"], body["service"]), ("2.0", "asr"))
         self.assertEqual(

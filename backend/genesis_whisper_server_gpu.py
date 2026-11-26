@@ -11,6 +11,8 @@ from pathlib import Path
 from typing import Iterator
 from typing import Any, Callable, List, Sequence, TypeVar
 
+from . import genesis_whisper_server_progress as progress
+
 
 T = TypeVar("T")
 
@@ -129,9 +131,21 @@ async def run_sliced_gpu_phase(
 
     slice_size = max(1, int(slice_size))
     results: List[T] = []
+    # Progress of the request this phase belongs to (docs/254): one unit per item, and the wait for a lock someone
+    # else holds is reported as waiting. Both are no-ops outside a tracked request.
+    progress.add_units(total=len(items))
     for start in range(0, len(items), slice_size):
-        async with lock:
-            results.append(await run_blocking_gpu_phase(function, items[start : start + slice_size], *args))
+        part = items[start : start + slice_size]
+        locked = getattr(lock, "locked", None)
+        wait = progress.begin_gpu_wait() if callable(locked) and locked() else None
+        try:
+            async with lock:
+                progress.end_gpu_wait(wait)
+                wait = None
+                results.append(await run_blocking_gpu_phase(function, part, *args))
+        finally:
+            progress.end_gpu_wait(wait)
+        progress.add_units(done=len(part))
         # Yield once so a waiter woken by the release really acquires the lock
         # before this phase queues up again behind it.
         await asyncio.sleep(0)

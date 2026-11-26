@@ -19,6 +19,7 @@ from .genesis_whisper_server_globals import (
     job_history,
     settings_lock,
 )
+from . import genesis_whisper_server_progress as progress
 from .genesis_whisper_server_perf import asr_audio_rate
 from .genesis_whisper_server_gpu import (
     add_gpu_activity_listener,
@@ -87,6 +88,8 @@ class TranscriptionJob:
         self.batch_count = 0
         self.created_at = time.monotonic()
         self.started_at: Optional[float] = None
+        # The tracked request that submitted this job (docs/254), told when the job first reaches the GPU.
+        self.progress_entry = progress.current_entry()
         self.cancel_requested = False
         self.finished = False
         self.done: asyncio.Future = loop.create_future()
@@ -290,6 +293,20 @@ class WhisperBatchManager:
             self._describe_job(key, "waiting") for key in self._waiting
         ]
         return state
+
+    def job_progress(self, request_id: str) -> tuple[int, int, bool]:
+        """(outstanding chunks, live jobs, any of them started) of the jobs named ``request_id`` or
+        ``request_id#<n>`` (one request's language jobs, see submit_by_language). A finished job is gone."""
+
+        outstanding = 0
+        jobs = 0
+        started = False
+        for job in self._jobs.values():
+            if job.request_id == request_id or job.request_id.startswith(f"{request_id}#"):
+                jobs += 1
+                outstanding += len(job.pending) + len(job.inflight)
+                started = started or job.started_at is not None
+        return outstanding, jobs, started
 
     def _describe_job(self, key: str, state: str) -> Dict[str, Any]:
         job = self._jobs[key]
@@ -548,6 +565,7 @@ class WhisperBatchManager:
             job.batch_count += 1
             if job.started_at is None:
                 job.started_at = now
+                progress.queue_started(job.progress_entry)
             # Served jobs rotate to the back so the next anchor is the job that
             # waited longest, including jobs with a different processing key.
             self._active.remove(job.key)

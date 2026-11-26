@@ -89,6 +89,13 @@ class _CapturingApp:
 
         return decorator
 
+    def get(self, path: str, **_kwargs):
+        def decorator(endpoint):
+            self.routes[("GET", path)] = endpoint
+            return endpoint
+
+        return decorator
+
 
 class _AsyncLock:
     async def __aenter__(self):

@@ -30,6 +30,7 @@ import numpy as np
 
 from . import genesis_whisper_server_wxc as _wxc
 from .genesis_whisper_server_globals import current_settings, settings_lock
+from . import genesis_whisper_server_progress as progress
 from .genesis_whisper_server_gpu import run_sliced_gpu_phase
 from .genesis_whisper_server_local_diarization import (
     BATCH_WINDOW_SCALES,
@@ -227,6 +228,7 @@ async def run_local_diarization(
     started = time.monotonic()
     samples = np.ascontiguousarray(np.asarray(audio, np.float32).reshape(-1))
     duration_s = len(samples) / SAMPLE_RATE
+    progress.enter_phase("segmentation")
     if LOCAL_WINDOW_FILTER == "silero":
         if speech_probs is None:
             from .genesis_whisper_server_wxc import silero_frame_probs
@@ -243,6 +245,7 @@ async def run_local_diarization(
     starts = await asyncio.to_thread(plan_scale_starts, len(samples), speech, frame_samples, BATCH_WINDOW_SCALES)
     embed = embed_diarization_scales if half_embed else embed_scales
     lazy = "s0.75"  # embedded on demand in the final pass
+    progress.enter_phase("speaker_windows", total=sum(len(starts[k]) for k in BATCH_WINDOW_SCALES if k != lazy))
     vectors = await embed(lock, samples, starts, {k: v for k, v in BATCH_WINDOW_SCALES.items() if k != lazy})
     vectors[lazy] = np.zeros((len(starts[lazy]), 192), np.float32)
     loop = asyncio.get_running_loop()
@@ -266,6 +269,7 @@ async def run_local_diarization(
                                               min_speakers=min_speakers, max_speakers=max_speakers,
                                               started=started)
 
+    progress.enter_phase("clustering")
     payload = await asyncio.to_thread(_cpu)
     payload["model"] = {
         "id": LOCAL_DIARIZATION_MODEL_ID,

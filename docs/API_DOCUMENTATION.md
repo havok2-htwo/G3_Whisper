@@ -819,7 +819,8 @@ Response shape:
   "modes": ["embedding", "transcript", "transcript_embedding", "diarization"],
   "embedding": { "id": "ReDimNet2-B6" },
   "diarization": { "configured": true, "engine": "local", "model": "g3-whisper/seg3-redimnet2-v4" },
-  "speaker_turns": { "supported": true, "embedding_model": "ReDimNet2-B6", "dimension": 192, "max_known_speakers": 16 }
+  "speaker_turns": { "supported": true, "embedding_model": "ReDimNet2-B6", "dimension": 192, "max_known_speakers": 16 },
+  "progress": { "supported": true, "header": "X-Progress-ID", "path": "/v2/progress/{progress_id}", "ttl_seconds": 600 }
 }
 ```
 
@@ -833,7 +834,53 @@ Notes:
 - `diarization.configured`: ein seg-3.0-Checkpoint ist vorhanden und sein letzter Ladeversuch ist nicht gescheitert (sonst antwortet der Modus `diarization` mit `503 MODEL_UNAVAILABLE`).
 - `diarization.engine` ist immer `local` (seg-3.0 + ReDimNet2 im Prozess); das Feld bleibt fuer Clients, die es lesen. Der fruehere Wert `dia` (externer G3_DIA-Server) kommt nicht mehr vor. `model` ist `g3-whisper/seg3-redimnet2-v4`.
 - `speaker_turns` (siehe [`transcript` mit `speaker_turns`](#transcript-mit-speaker_turns-live-sprecher)): `supported: true` nur bei `speaker_turns_enabled`, nutzbarem seg-3.0-Checkpoint und lokal vorhandenem MMS_FA-Checkpoint (`<torch-hub>/checkpoints/model.pt`, fuer die Wortzeiten), sonst `{ "supported": false }`. Die Abfrage prueft nur Dateien, laedt kein Modell und wartet nie auf ein laufendes Laden.
+- `progress` (siehe [`GET /v2/progress/{progress_id}`](#get-v2progressprogress_id)): fehlt bei aelteren Servern; dann gibt es keine Fortschrittsabfrage und ein Client fragt nicht nach.
 - Older servers answer this path with the HTML landing page and status 200, not with 404. A client must treat a non-JSON answer as "not available".
+
+### `GET /v2/progress/{progress_id}`
+
+Purpose (Genesis3 docs/254): wie weit ein laufender `POST /v2/audio/process` ist und wie lange er noch ungefaehr dauert, waehrend der synchrone POST noch offen ist. Gedacht fuer lange `diarization`-Auftraege (ein Abruf alle paar Sekunden).
+
+Ablauf:
+
+1. Der Client waehlt eine eigene ID (16-64 Zeichen `A-Z a-z 0-9 _ -`, z. B. eine UUID ohne Bindestriche) und sendet sie beim POST als Header `X-Progress-ID`. Die `request_id` der Antwort bleibt davon unberuehrt (weiter vom Server vergeben).
+2. Waehrend der POST laeuft, fragt er `GET /v2/progress/{progress_id}` mit demselben API-Key ab (Bearer oder `X-API-Key`; ohne konfigurierte Keys offen, die Admin-Session wie bei den anderen v2-Routen).
+3. Nach dem Ende bleibt der Eintrag noch `ttl_seconds` (600 s) mit `state` `completed` oder `failed` abrufbar, danach 404.
+
+Eine fehlende, fehlerhafte oder gerade von einem anderen laufenden Auftrag belegte ID ist kein Fehler: der POST laeuft normal, nur ohne Fortschritt (die Abfrage antwortet dann 404). Die Tabelle liegt im Speicher (hoechstens 256 Eintraege, ein Neustart leert sie) und haelt keine Inhalte, nur Zahlen.
+
+Response `200` (`Cache-Control: no-store`):
+
+```json
+{
+  "schema_version": "2.0",
+  "progress_id": "6f1c0f6a2b9e4c47a8d2b1e0c3f4a5b6",
+  "state": "running",
+  "mode": "diarization",
+  "phase": "transcription",
+  "phase_index": 8,
+  "phase_count": 12,
+  "phase_done": 31,
+  "phase_total": 74,
+  "progress": 0.6421,
+  "elapsed_ms": 48210,
+  "eta_ms": 27400,
+  "audio_duration_ms": 3612000
+}
+```
+
+Felder:
+
+- `state`: `running`, `waiting` (wartet auf die GPU-Sperre oder in der ASR-Warteschlange, die jemand anderes gerade belegt), `completed`, `failed`.
+- `mode`: der Modus des Auftrags, `null` solange der Upload noch laeuft.
+- `phase`: Phasen von `diarization` in dieser Reihenfolge: `upload`, `decode`, `vad`, `segmentation`, `speaker_windows`, `clustering`, `embedding`, `language_detection`, `transcription`, `alignment`, `verification`, `finishing`. Uebersprungene Phasen (z. B. ohne Spracherkennung, oder im Turn-Fallback ohne `alignment`/`verification`) zaehlen als erledigt. Die anderen Modi kennen nur `upload`, `decode`, `processing`. `phase_index`/`phase_count` zaehlen in dieser Liste.
+- `phase_done`/`phase_total`: erledigte/gesamte Einheiten der Phase (Fenster, Chunks, ASR-Chunks), `null` wenn die Phase keine zaehlbaren Einheiten hat (`upload`, `decode`, `vad`, `clustering`, `finishing`).
+- `progress`: 0-1 ueber alle Phasen, jede Phase gewichtet mit ihrer erwarteten Dauer; faellt nie zurueck. `1.0` nur bei `completed`.
+- `elapsed_ms`: seit Beginn des POST (bis zum Ende, wenn fertig).
+- `eta_ms`: geschaetzte Restzeit. Rest der aktuellen Phase aus ihrer bisherigen Rate (ohne Wartezeit auf die GPU) plus die erwartete Dauer der restlichen Phasen (Millisekunden je Audiosekunde: gemessene Startwerte, laufend ersetzt durch den Mittelwert fertiger Auftraege dieses Prozesses ab 30 s Audio), skaliert damit, wie schnell dieser Auftrag bisher lief. `null`, solange das nicht ehrlich schaetzbar ist: Audio noch nicht dekodiert, `state` `waiting`, oder eine Phase ohne Einheiten laeuft schon laenger als erwartet. `0` nach dem Ende.
+- `audio_duration_ms`: Laenge des dekodierten Audios, vorher `null`.
+
+Fehler: `401` mit `error.code` `INVALID_API_KEY` wie die anderen v2-Routen; `404` mit `error.code` `PROGRESS_NOT_FOUND` fuer unbekannte, abgelaufene und fremde IDs (ein anderer Key sieht nie, ob eine ID existiert).
 
 ## Public Transcription API
 
