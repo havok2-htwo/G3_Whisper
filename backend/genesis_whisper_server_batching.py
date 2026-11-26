@@ -291,6 +291,20 @@ class WhisperBatchManager:
         ]
         return state
 
+    def job_progress(self, request_id: str) -> tuple[int, int, bool]:
+        """(outstanding chunks, live jobs, any of them started) of the jobs named ``request_id`` or
+        ``request_id#<n>`` (one request's language jobs, see submit_by_language). A finished job is gone."""
+
+        outstanding = 0
+        jobs = 0
+        started = False
+        for job in self._jobs.values():
+            if job.request_id == request_id or job.request_id.startswith(f"{request_id}#"):
+                jobs += 1
+                outstanding += len(job.pending) + len(job.inflight)
+                started = started or job.started_at is not None
+        return outstanding, jobs, started
+
     def _describe_job(self, key: str, state: str) -> Dict[str, Any]:
         job = self._jobs[key]
         waited_ms = job.queue_wait_ms

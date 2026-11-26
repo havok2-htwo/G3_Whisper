@@ -1046,11 +1046,14 @@ async def submit_by_language(
     A job carries one processing key and the scheduler batches only equal keys, so every language becomes its
     own job and its own batches. The jobs run concurrently. Without ``languages``, or with a single one, this is
     exactly the one submit_job call of before (the very same segment list). ``request_id`` names the job (the
-    first one when there are several); without it every job gets a fresh token.
+    first one when there are several, the others ``<request_id>#<n>``, so a progress probe finds all of them);
+    without it every job gets a fresh token.
     """
 
     def token(index: int = 0) -> str:
-        return request_id if request_id and index == 0 else uuid.uuid4().hex
+        if not request_id:
+            return uuid.uuid4().hex
+        return request_id if index == 0 else f"{request_id}#{index}"
 
     if not languages:
         return await batch_manager.submit_job(segments, token(), processing_key)
