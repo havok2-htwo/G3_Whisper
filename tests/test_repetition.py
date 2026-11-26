@@ -86,6 +86,20 @@ class HyphenChainLoopTests(unittest.TestCase):
                          "Also ja, genau.")
         self.assertEqual(filter_repeated_patterns("ja-ja-ja-ja-ja-Sache"), "ja-Sache")
 
+    def test_chain_end_hyphens(self) -> None:
+        cases = {
+            "M-U-T-S-S-S-S-S-S-S-": "M-U-T-S",
+            "M-U-T-S-S-S-S-S-S-S- und dann": "M-U-T-S und dann",
+            "M-U-T-S-S-S-S-S-S-S-, ja": "M-U-T-S, ja",
+            "S-S-S-S-S-S-S-?": "S?",
+            "ja-ja-ja-ja-ja-.": "ja.",
+            "ja-ja-ja-ja-ja! Gut": "ja! Gut",
+            "ja-ja-ja-ja-ja--Sache": "ja--Sache",
+            "ja-ja-ja-ja-ja--5": "ja--5",
+        }
+        for text, expected in cases.items():
+            self.assertEqual(filter_repeated_patterns(text), expected, text)
+
     def test_chain_uses_the_same_thresholds(self) -> None:
         self.assertEqual(filter_repeated_patterns("ja-ja-ja-ja"), "ja-ja-ja-ja")
         self.assertEqual(filter_repeated_patterns("Ost-West-Ost-West"), "Ost-West-Ost-West")

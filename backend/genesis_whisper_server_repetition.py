@@ -26,6 +26,7 @@ MIN_MULTI_TOKEN_REPETITIONS = 3
 
 _WORD_RE = re.compile(r"\w+(?:[-'\u2019]\w+)*", re.UNICODE)
 _CHAIN_PART_RE = re.compile(r"\w+(?:['\u2019]\w+)*", re.UNICODE)
+_WORD_CHAR_RE = re.compile(r"\w", re.UNICODE)
 
 
 @dataclass(frozen=True)
@@ -76,7 +77,8 @@ def _filter_hyphen_chains(text: str) -> str:
 
     A kept part ends before its joining hyphen.  A run that reaches the end of
     its chain (a decoder loop cut off by the token limit) also takes the
-    chain's dangling trailing hyphens with it.
+    chain's dangling trailing hyphens with it, unless they run straight into
+    another word.
     """
 
     removals: list[tuple[int, int]] = []
@@ -96,7 +98,10 @@ def _filter_hyphen_chains(text: str) -> str:
             start, end = chain_removals[-1]
             while end < len(text) and text[end] == "-":
                 end += 1
-            chain_removals[-1] = (start, end)
+            # Hyphens that lead straight into the next word ("ja-…-ja--Sache")
+            # still separate it; dropping them would glue two words together.
+            if end == len(text) or not _WORD_CHAR_RE.match(text[end]):
+                chain_removals[-1] = (start, end)
         removals.extend(chain_removals)
     return _apply_removals(text, removals)
 

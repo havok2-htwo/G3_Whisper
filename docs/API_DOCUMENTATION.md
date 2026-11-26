@@ -781,7 +781,8 @@ metadata or markers. Diarization applies it only inside each speaker turn. Insid
 hyphen-joined word (`M-U-T-S-S-S-…`, `ja-ja-ja-ja-ja`) the parts are compared with the
 same thresholds, so a loop glued together with hyphens collapses as well; apostrophe
 words such as `geht's` stay one part, and dangling hyphens after a cut-off loop are
-dropped (`M-U-T-S-S-S-S-S-S-` → `M-U-T-S`).
+dropped (`M-U-T-S-S-S-S-S-S-` → `M-U-T-S`) unless they lead straight into the next
+word (`ja-ja-ja-ja-ja--Sache` → `ja--Sache`).
 
 Opt out for one request with:
 
