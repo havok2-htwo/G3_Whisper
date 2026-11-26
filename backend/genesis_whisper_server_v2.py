@@ -71,7 +71,14 @@ from .genesis_whisper_server_lid import (
     unavailable_warning,
 )
 from . import genesis_whisper_server_progress as progress
-from .genesis_whisper_server_gpu import run_blocking_gpu_phase, run_sliced_gpu_phase
+from .genesis_whisper_server_gpu import (
+    BACKGROUND,
+    INTERACTIVE,
+    reset_gpu_class,
+    run_blocking_gpu_phase,
+    run_sliced_gpu_phase,
+    set_gpu_class,
+)
 from .genesis_whisper_server_local_asr_engine import get_last_local_asr_load_error, load_local_asr_model
 from .genesis_whisper_server_repetition import (
     REPETITION_FILTER_HEADER,
@@ -97,6 +104,7 @@ from .genesis_whisper_server_speaker_turns import (
 from .genesis_whisper_server_storage import log_transcription, normalize_settings
 from .genesis_whisper_server_turn_gate import finalize_segment_text, prefilter_turns
 from .genesis_whisper_server_wxc import (
+    WHOLE_AUDIO_MAX_S,
     align_chunk_slice,
     alignment_bounds,
     assign_words_to_turns,
@@ -509,6 +517,23 @@ async def _align_words_sliced(
         bounds,
     )
     return [word for part in parts for word in part]
+
+
+def request_gpu_class(mode: str, audio_seconds: float) -> str:
+    """GPU class of a /v2/audio/process request (PriorityGpuLock): interactive requests go ahead of background ones.
+
+    Background: every diarization, and a transcript longer than WHOLE_AUDIO_MAX_S. That is the length at which
+    transcript mode already stops treating the audio as one live item (one language decision, one ASR item) and
+    takes the long-file path (per-piece detection, superchunks), the same limit as speaker_turns. Everything else
+    answers a live request directly and is interactive: embeddings, short transcripts with their language detection
+    and speaker turns.
+    """
+
+    if mode == "diarization":
+        return BACKGROUND
+    if mode in ("transcript", "transcript_embedding") and audio_seconds > WHOLE_AUDIO_MAX_S:
+        return BACKGROUND
+    return INTERACTIVE
 
 
 def _language_settings(language_override: str | None) -> tuple[str, str]:
@@ -1658,6 +1683,7 @@ def create_v2_api(app: FastAPI) -> FastAPI:
         mode: str | None = None
         progress_entry: progress.ProgressEntry | None = None
         progress_token = None
+        gpu_class_token = None
         progress_status = "failed"
         try:
             try:
@@ -1696,6 +1722,8 @@ def create_v2_api(app: FastAPI) -> FastAPI:
             if progress_entry is not None:
                 progress.registry.set_audio_seconds(progress_entry, audio_duration_ms / 1000.0)
                 progress.enter_phase("processing")
+            # Every GPU phase and ASR job of this request (also in its tasks and threads) waits in this class.
+            gpu_class_token = set_gpu_class(request_gpu_class(mode, audio_duration_ms / 1000.0))
             filter_enabled = repetition_filter_enabled(http_request.headers.get(REPETITION_FILTER_HEADER))
             gate_enabled = http_request.headers.get("x-g3-turn-gate", "").strip().lower() not in ("off", "0", "false", "no")
             pipeline_mode = (
@@ -1881,6 +1909,8 @@ def create_v2_api(app: FastAPI) -> FastAPI:
         finally:
             if progress_entry is not None:
                 progress.registry.finish(progress_entry, progress_status)
+            if gpu_class_token is not None:
+                reset_gpu_class(gpu_class_token)
             if progress_token is not None:
                 progress.unbind(progress_token)
             if form_data is not None:

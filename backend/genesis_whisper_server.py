@@ -16,7 +16,7 @@ from .genesis_whisper_server_api import create_api, process_local_asr_batch
 from .genesis_whisper_server_batching import WhisperBatchManager
 from .genesis_whisper_server_globals import current_settings
 from .genesis_whisper_server_history import reset_history_audio_store, shutdown_history_audio_store
-from .genesis_whisper_server_gpu import run_blocking_gpu_phase
+from .genesis_whisper_server_gpu import PriorityGpuLock, run_blocking_gpu_phase
 from .genesis_whisper_server_presets import FIRST_START_PRESET, load_settings_or_first_start_preset
 from .genesis_whisper_server_v2 import create_v2_api, create_v2_capabilities_api
 
@@ -212,7 +212,9 @@ async def startup_server(app: FastAPI):
         file=sys.stderr,
     )
 
-    local_gpu_lock = asyncio.Lock()
+    # Interactive work (live requests) before background work (diarizations, long transcripts), see
+    # PriorityGpuLock; the v2 handler sets the class of each request.
+    local_gpu_lock = PriorityGpuLock()
     whisper_batch_manager = WhisperBatchManager(process_local_asr_batch, local_gpu_lock)
     app.state.local_gpu_lock = local_gpu_lock
     app.state.whisper_batch_manager = whisper_batch_manager
