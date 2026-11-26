@@ -1066,6 +1066,8 @@ def _enter_asr_phase(request: Request, total_chunks: int) -> str | None:
 
     The progress comes from the batch jobs themselves: a probe counts their outstanding chunks when someone asks
     (a finished job is gone, so once seen, no job means done; before the first job registered, nothing ran yet).
+    The phase waits in the ASR queue until the batch worker starts the first of its jobs (the job reports that,
+    see TranscriptionJob), so queue time never counts as transcription time.
     None outside a tracked request, and the jobs keep their fresh tokens as before."""
 
     entry = progress.current_entry()
@@ -1075,16 +1077,17 @@ def _enter_asr_phase(request: Request, total_chunks: int) -> str | None:
     progress_id = entry.progress_id
     seen = False
 
-    def probe() -> tuple[int, int, bool]:
+    def probe() -> tuple[int, int]:
         nonlocal seen
-        outstanding, jobs, started = batch_manager.job_progress(progress_id)
+        outstanding, jobs, _started = batch_manager.job_progress(progress_id)
         if jobs:
             seen = True
         elif not seen:
-            return 0, total_chunks, True
-        return max(0, total_chunks - outstanding), total_chunks, bool(jobs) and not started
+            return 0, total_chunks
+        return max(0, total_chunks - outstanding), total_chunks
 
     progress.enter_phase("transcription", probe=probe)
+    progress.registry.begin_queue(entry)
     return progress_id
 
 

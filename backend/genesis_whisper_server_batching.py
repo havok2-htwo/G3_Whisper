@@ -19,6 +19,7 @@ from .genesis_whisper_server_globals import (
     job_history,
     settings_lock,
 )
+from . import genesis_whisper_server_progress as progress
 from .genesis_whisper_server_perf import asr_audio_rate
 from .genesis_whisper_server_gpu import (
     add_gpu_activity_listener,
@@ -87,6 +88,8 @@ class TranscriptionJob:
         self.batch_count = 0
         self.created_at = time.monotonic()
         self.started_at: Optional[float] = None
+        # The tracked request that submitted this job (docs/254), told when the job first reaches the GPU.
+        self.progress_entry = progress.current_entry()
         self.cancel_requested = False
         self.finished = False
         self.done: asyncio.Future = loop.create_future()
@@ -562,6 +565,7 @@ class WhisperBatchManager:
             job.batch_count += 1
             if job.started_at is None:
                 job.started_at = now
+                progress.queue_started(job.progress_entry)
             # Served jobs rotate to the back so the next anchor is the job that
             # waited longest, including jobs with a different processing key.
             self._active.remove(job.key)

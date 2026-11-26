@@ -18,7 +18,8 @@ from backend import genesis_whisper_server_auth as auth
 from backend import genesis_whisper_server_gpu as gpu
 from backend import genesis_whisper_server_progress as progress
 from backend import genesis_whisper_server_v2 as v2
-from tests.test_v2_api import _CapturingApp, _payload, _request, _upload
+from tests import test_v2_api as _v2_tests
+from tests.test_v2_api import _CapturingApp, _lid_result, _patch_lid_download, _payload, _request, _upload
 
 PID = "0123456789abcdef0123456789abcdef"
 
@@ -159,16 +160,58 @@ class SnapshotTests(unittest.TestCase):
 
     def test_probe_units_and_queue_wait(self) -> None:
         registry, clock, entry = self._diarization()
-        state = {"value": (0, 40, True)}
+        state = {"value": (0, 40)}
         registry.enter_phase(entry, "transcription", probe=lambda: state["value"])
+        registry.begin_queue(entry)
         self.assertEqual(registry.snapshot(entry)["state"], "waiting")
-        state["value"] = (10, 40, False)
+        registry.end_queue(entry)
+        state["value"] = (10, 40)
         clock.now += 5.0
         snapshot = registry.snapshot(entry)
         self.assertEqual((snapshot["state"], snapshot["phase_done"], snapshot["phase_total"]), ("running", 10, 40))
         self.assertIsNotNone(snapshot["eta_ms"])
         registry.add_units(entry, done=5)  # sliced calls never override a probe
         self.assertEqual(registry.snapshot(entry)["phase_done"], 10)
+
+    def test_the_asr_queue_wait_is_not_transcription_time(self) -> None:
+        # 600 s audio: 60 s in the ASR queue, then 10 s of work for half the chunks.
+        registry, clock, entry = self._diarization(audio_s=600.0)
+        state = {"value": (0, 100)}
+        registry.enter_phase(entry, "transcription", probe=lambda: state["value"])
+        registry.begin_queue(entry)
+        clock.now += 60.0
+        waiting = registry.snapshot(entry)
+        self.assertEqual((waiting["state"], waiting["eta_ms"]), ("waiting", None))
+        registry.end_queue(entry)
+        clock.now += 10.0
+        state["value"] = (50, 100)
+        snapshot = registry.snapshot(entry)
+        self.assertEqual(snapshot["state"], "running")
+        later = sum(registry.rates[name] for name in entry.phases[entry.phases.index("transcription") + 1:])
+        # 10 s for 50 % -> 10 s left, plus the later phases; the 60 s queue wait is not in the rate.
+        self.assertAlmostEqual(snapshot["eta_ms"] / 1000.0, 10.0 + later * 0.6, delta=3.0)
+        registry.enter_phase(entry, "alignment")
+        self.assertAlmostEqual(entry.active_s["transcription"], 10.0, places=3)
+
+    def test_a_queue_that_never_started_ends_with_its_phase(self) -> None:
+        registry, clock, entry = self._diarization()
+        registry.enter_phase(entry, "transcription", probe=lambda: (0, 10))
+        registry.begin_queue(entry)
+        clock.now += 20.0
+        registry.enter_phase(entry, "alignment")
+        self.assertEqual(registry.snapshot(entry)["state"], "running")
+        self.assertAlmostEqual(entry.active_s["transcription"], 0.0, places=3)
+        registry.end_queue(entry)  # a late start report changes nothing
+        self.assertEqual(registry.snapshot(entry)["state"], "running")
+
+    def test_language_detection_runs_on_time_not_on_its_growing_slice_count(self) -> None:
+        registry, _, entry = self._diarization()
+        registry.enter_phase(entry, "language_detection")
+        registry.add_units(entry, total=16)  # first of several slices
+        registry.add_units(entry, done=16)
+        snapshot = registry.snapshot(entry)
+        self.assertEqual((snapshot["phase_done"], snapshot["phase_total"]), (None, None))
+        self.assertIsNotNone(snapshot["eta_ms"])
 
     def test_a_failing_probe_only_loses_the_units(self) -> None:
         registry, _, entry = self._diarization()
@@ -188,8 +231,11 @@ class SnapshotTests(unittest.TestCase):
         registry.finish(entry, "completed")
         snapshot = registry.snapshot(entry)
         self.assertEqual((snapshot["state"], snapshot["progress"], snapshot["eta_ms"]), ("completed", 1.0, 0))
-        self.assertAlmostEqual(registry.rates["transcription"], 10.0, places=3)
-        self.assertNotIn("upload", registry.learned)
+        # Weighted from the first request on: 0.7 * 4.5 (default) + 0.3 * 10 (measured).
+        default = progress.DEFAULT_RATES_MS_PER_AUDIO_S["transcription"]
+        self.assertAlmostEqual(registry.rates["transcription"], (1 - progress.LEARN_WEIGHT) * default
+                               + progress.LEARN_WEIGHT * 10.0, places=3)
+        self.assertEqual(registry.rates["upload"], progress.DEFAULT_RATES_MS_PER_AUDIO_S["upload"])
 
     def test_failed_requests_keep_their_progress_and_teach_nothing(self) -> None:
         registry, clock, entry = self._diarization()
@@ -306,13 +352,81 @@ class AsrProbeTests(unittest.TestCase):
             self.assertEqual(v2._enter_asr_phase(request, 20), PID)
         before = registry.snapshot(entry)
         self.assertEqual((before["phase_done"], before["state"]), (0, "waiting"))
+        stats["value"] = (15, 1, False)
+        self.assertEqual(registry.snapshot(entry)["state"], "waiting")  # registered, not started yet
+        with mock.patch.object(progress, "registry", registry):
+            progress.queue_started(entry)
         stats["value"] = (15, 1, True)
-        self.assertEqual(registry.snapshot(entry)["phase_done"], 5)
+        running = registry.snapshot(entry)
+        self.assertEqual((running["phase_done"], running["state"]), (5, "running"))
         stats["value"] = (0, 0, False)
         self.assertEqual(registry.snapshot(entry)["phase_done"], 20)
 
     def test_no_tracked_request_keeps_the_fresh_job_tokens(self) -> None:
         self.assertIsNone(v2._enter_asr_phase(types.SimpleNamespace(), 5))
+
+    def test_a_job_remembers_the_tracked_request_that_submitted_it(self) -> None:
+        from backend.genesis_whisper_server_batching import TranscriptionJob
+
+        registry, _ = _registry()
+        entry = registry.start(PID, None)
+
+        async def make(bound):
+            with progress.tracking(bound):
+                return TranscriptionJob(request_id=PID, processing_key=None, segments=[], is_long=False,
+                                        loop=asyncio.get_running_loop())
+
+        self.assertIs(asyncio.run(make(entry)).progress_entry, entry)
+        self.assertIsNone(asyncio.run(make(None)).progress_entry)
+
+
+class PipelineWiringTests(unittest.TestCase):
+    """The real diarization path enters its phases in the order of MODE_PHASES (models and ASR faked)."""
+
+    TURNS = _v2_tests.DiarizationLanguageDetectionTests.TURNS
+
+    def setUp(self) -> None:
+        _patch_lid_download(self)
+
+    def _tracked(self, run) -> tuple[list[str], progress.ProgressEntry]:
+        registry, _ = _registry()
+        entry = registry.start(PID, None)
+        registry.set_mode(entry, "diarization")
+        registry.set_audio_seconds(entry, 18.0)
+        entered: list[str] = []
+        original = registry.enter_phase
+
+        def record(target, phase, **kwargs):
+            entered.append(phase)
+            original(target, phase, **kwargs)
+
+        with mock.patch.object(progress, "registry", registry), mock.patch.object(registry, "enter_phase", new=record), \
+                progress.tracking(entry):
+            run()
+        return entered, entry
+
+    def _assert_in_order(self, entered: list[str], expected: list[str]) -> None:
+        order = progress.MODE_PHASES["diarization"]
+        indexes = [order.index(phase) for phase in entered]
+        self.assertEqual(indexes, sorted(indexes), entered)
+        for phase in expected:
+            self.assertIn(phase, entered)
+
+    def test_process_diarization(self) -> None:
+        entered, entry = self._tracked(
+            lambda: _v2_tests.DiarizationLanguageDetectionTests.run_diarization(self, [_lid_result("en"), _lid_result("de")]))
+        self._assert_in_order(entered, ["embedding", "language_detection", "transcription", "finishing"])
+        self.assertEqual(entry.phase, "finishing")
+
+    def test_wxc_transcription_alignment_verification(self) -> None:
+        regions = [(0.2, 5.8), (6.1, 11.7), (12.2, 17.5)]
+        entered, entry = self._tracked(lambda: _v2_tests.DiarizationLanguageDetectionTests._run_wxc(self, regions, None))
+        self.assertEqual(entered, ["transcription", "alignment", "verification"])
+        self.assertEqual(entry.phase, "verification")
+
+    def test_the_order_check_catches_a_swapped_phase(self) -> None:
+        with self.assertRaises(AssertionError):
+            self._assert_in_order(["alignment", "transcription"], [])
 
 
 class EndpointTests(unittest.TestCase):

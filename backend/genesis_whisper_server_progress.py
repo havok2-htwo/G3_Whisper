@@ -9,12 +9,14 @@ How the numbers come about:
 - every mode has a fixed phase order; ``enter_phase`` moves on (skipped phases count as done);
 - a phase knows ``done``/``total`` units when the code declares them, from ``run_sliced_gpu_phase`` (one unit per
   item, counted automatically in phases that opt in), or from a probe (the ASR batch jobs of the request);
+- waiting is not work: the wait for a GPU lock someone else holds and the wait of the ASR phase until the batch
+  worker starts its first job are kept apart from a phase's active time (rate, ETA and the learned rates);
 - the overall fraction weighs every phase with its expected duration (milliseconds per audio second: measured
-  defaults, replaced by a running mean of this process's finished requests);
+  defaults, moved towards this process's finished requests by a weighted running mean);
 - the ETA is the rest of the current phase at its own measured rate plus the expected rest of the later phases,
   scaled by how fast this request ran so far. It is ``None`` while it cannot be estimated honestly: audio not yet
   decoded, the current phase without measurable progress and already past its expectation, or the request is
-  waiting for the GPU lock (``state`` "waiting").
+  waiting for the GPU lock or in the ASR queue (``state`` "waiting").
 """
 
 from __future__ import annotations
@@ -74,10 +76,12 @@ MODE_PHASES: Dict[str, Tuple[str, ...]] = {
     ),
 }
 DEFAULT_PHASES: Tuple[str, ...] = ("upload", "decode", "processing")
-# Phases whose run_sliced_gpu_phase calls count as units without an explicit total.
-AUTO_COUNTED_PHASES = frozenset({"segmentation", "embedding", "language_detection", "alignment", "verification"})
+# Phases whose run_sliced_gpu_phase calls count as units without an explicit total: each runs its items in one
+# run_sliced_gpu_phase call, so the first call already knows the whole phase. Language detection calls it once per
+# slice (and several detections in a row), its total would only grow with the work, so it runs on time instead.
+AUTO_COUNTED_PHASES = frozenset({"segmentation", "embedding", "alignment", "verification"})
 
-Probe = Callable[[], Optional[Tuple[int, int, bool]]]
+Probe = Callable[[], Optional[Tuple[int, int]]]
 
 
 class ProgressEntry:
@@ -101,6 +105,7 @@ class ProgressEntry:
         self.probe_seen = False
         self.waiting_since: Optional[float] = None
         self.waiting_depth = 0
+        self.queue_open = False
         self.active_s: Dict[str, float] = {}
         self.max_progress = 0.0
         self.status = "running"
@@ -120,7 +125,6 @@ class ProgressRegistry:
         self._ttl_s = ttl_s
         self.clock = clock
         self.rates: Dict[str, float] = dict(DEFAULT_RATES_MS_PER_AUDIO_S)
-        self.learned: set[str] = set()
 
     # -- table -----------------------------------------------------------------------------------------------
 
@@ -184,6 +188,7 @@ class ProgressRegistry:
             if target < entry.phase_index:
                 return  # never back: a later fallback path re-running ASR keeps the phase it reached
             if target > entry.phase_index:
+                self.end_queue(entry)  # a queue wait belongs to the phase that queued (a job that never started)
                 now = self.clock()
                 self._close_phase(entry, now)
                 entry.phase_index = target
@@ -217,6 +222,20 @@ class ProgressRegistry:
                 entry.phase_waited += self.clock() - entry.waiting_since
                 entry.waiting_since = None
 
+    def begin_queue(self, entry: ProgressEntry) -> None:
+        """The current phase waits in the ASR queue until its first batch job starts (``end_queue``)."""
+
+        with self._lock:
+            if not entry.queue_open:
+                entry.queue_open = True
+                self.begin_wait(entry)
+
+    def end_queue(self, entry: ProgressEntry) -> None:
+        with self._lock:
+            if entry.queue_open:
+                entry.queue_open = False
+                self.end_wait(entry)
+
     def finish(self, entry: ProgressEntry, status: str) -> None:
         with self._lock:
             if entry.finished_at is not None:
@@ -225,6 +244,7 @@ class ProgressRegistry:
             self._close_phase(entry, now)
             entry.waiting_since = None
             entry.waiting_depth = 0
+            entry.queue_open = False
             entry.status = status
             entry.finished_at = now
             if status == "completed":
@@ -238,17 +258,15 @@ class ProgressRegistry:
         for phase, seconds in entry.active_s.items():
             if phase == "upload" or seconds <= 0:
                 continue  # upload speed is the client's network, not this server
+            # Weighted from the first request on: one unusual request (a busy GPU, a near-silent meeting) only
+            # moves the rate, it never replaces the measured default.
             measured = seconds * 1000.0 / audio
-            if phase in self.learned:
-                self.rates[phase] = (1 - LEARN_WEIGHT) * self.rates[phase] + LEARN_WEIGHT * measured
-            else:
-                self.rates[phase] = measured
-                self.learned.add(phase)
+            self.rates[phase] = (1 - LEARN_WEIGHT) * self.rates[phase] + LEARN_WEIGHT * measured
 
     # -- read ------------------------------------------------------------------------------------------------
 
-    def _phase_units(self, entry: ProgressEntry) -> Tuple[Optional[int], Optional[int], bool]:
-        """(done, total, waiting_in_queue) of the current phase; done/total None when unknown."""
+    def _phase_units(self, entry: ProgressEntry) -> Tuple[Optional[int], Optional[int]]:
+        """(done, total) of the current phase; both None when unknown."""
 
         if entry.probe is not None:
             try:
@@ -256,21 +274,21 @@ class ProgressRegistry:
             except Exception:
                 probed = None
             if probed is not None:
-                done, total, queued = probed
+                done, total = probed
                 if total > 0:
                     entry.probe_seen = True
-                    return max(0, min(done, total)), total, queued
-            return None, None, False
+                    return max(0, min(done, total)), total
+            return None, None
         if entry.units_total > 0:
-            return entry.units_done, entry.units_total, False
-        return None, None, False
+            return entry.units_done, entry.units_total
+        return None, None
 
     def snapshot(self, entry: ProgressEntry) -> Dict[str, Any]:
         with self._lock:
             now = self.clock()
             end = entry.finished_at if entry.finished_at is not None else now
-            done, total, queued = (None, None, False) if entry.finished_at is not None else self._phase_units(entry)
-            waiting = entry.finished_at is None and (entry.waiting_since is not None or queued)
+            done, total = (None, None) if entry.finished_at is not None else self._phase_units(entry)
+            waiting = entry.finished_at is None and entry.waiting_since is not None
             phase = entry.phase
             phase_waited = entry.phase_waited + (now - entry.waiting_since if entry.waiting_since is not None else 0.0)
             phase_active = max(0.0, end - entry.phase_started - phase_waited) if entry.finished_at is None else 0.0
@@ -386,6 +404,13 @@ def end_gpu_wait(entry: Optional[ProgressEntry]) -> None:
         registry.end_wait(entry)
 
 
+def queue_started(entry: Optional[ProgressEntry]) -> None:
+    """A batch job of ``entry`` reached the GPU: its phase no longer waits in the ASR queue."""
+
+    if entry is not None:
+        registry.end_queue(entry)
+
+
 def capability() -> Dict[str, Any]:
     return {"supported": True, "header": "X-Progress-ID", "path": "/v2/progress/{progress_id}",
             "ttl_seconds": int(FINISHED_TTL_S)}
@@ -402,6 +427,7 @@ __all__ = [
     "registry",
     "begin_gpu_wait",
     "end_gpu_wait",
+    "queue_started",
     "tracking",
     "unbind",
 ]
