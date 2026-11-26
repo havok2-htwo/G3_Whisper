@@ -4,6 +4,12 @@ The filter deliberately works on normalized Unicode word tokens while applying
 all removals to the original text.  This lets it compare case, compatibility
 forms, whitespace, and terminal punctuation independently without rewriting the
 first occurrence that is kept.
+
+A hyphen chain such as ``M-U-T-S-S-S`` or ``ja-ja-ja-ja-ja`` is one token for
+the word pass, so a decoder loop glued together with hyphens would survive it.
+A second pass therefore compares the parts inside each chain with the same
+thresholds.  Repeated whole words keep exactly the word-pass behaviour, and
+apostrophe words (``geht's``, ``don't``) stay one part.
 """
 
 from __future__ import annotations
@@ -19,6 +25,8 @@ MIN_SINGLE_TOKEN_REPETITIONS = 5
 MIN_MULTI_TOKEN_REPETITIONS = 3
 
 _WORD_RE = re.compile(r"\w+(?:[-'\u2019]\w+)*", re.UNICODE)
+_CHAIN_PART_RE = re.compile(r"\w+(?:['\u2019]\w+)*", re.UNICODE)
+_WORD_CHAR_RE = re.compile(r"\w", re.UNICODE)
 
 
 @dataclass(frozen=True)
@@ -54,16 +62,55 @@ def filter_repeated_patterns(text: str) -> str:
 
     current = text
     while True:
-        filtered = _filter_once(current)
+        filtered = _filter_hyphen_chains(_filter_once(current))
         if filtered == current:
             return filtered
         current = filtered
 
 
 def _filter_once(text: str) -> str:
-    tokens = _tokenize(text)
+    return _apply_removals(text, _run_removals(_tokenize(text)))
+
+
+def _filter_hyphen_chains(text: str) -> str:
+    """Collapse loops among the hyphen-joined parts of each word token.
+
+    A kept part ends before its joining hyphen.  A run that reaches the end of
+    its chain (a decoder loop cut off by the token limit) also takes the
+    chain's dangling trailing hyphens with it, unless they run straight into
+    another word.
+    """
+
+    removals: list[tuple[int, int]] = []
+    for word in _WORD_RE.finditer(text):
+        if "-" not in word.group(0):
+            continue
+        parts = [
+            _Token(
+                normalized=unicodedata.normalize("NFKC", part.group(0)).casefold(),
+                start=word.start() + part.start(),
+                end=word.start() + part.end(),
+            )
+            for part in _CHAIN_PART_RE.finditer(word.group(0))
+        ]
+        chain_removals = _run_removals(parts)
+        if chain_removals and chain_removals[-1][1] == word.end():
+            start, end = chain_removals[-1]
+            while end < len(text) and text[end] == "-":
+                end += 1
+            # Hyphens that lead straight into the next word ("ja-…-ja--Sache")
+            # still separate it; dropping them would glue two words together.
+            if end == len(text) or not _WORD_CHAR_RE.match(text[end]):
+                chain_removals[-1] = (start, end)
+        removals.extend(chain_removals)
+    return _apply_removals(text, removals)
+
+
+def _run_removals(tokens: list[_Token]) -> list[tuple[int, int]]:
+    """Text spans that hold the second through last copy of each repeated run."""
+
     if len(tokens) < MIN_SINGLE_TOKEN_REPETITIONS:
-        return text
+        return []
 
     normalized = [token.normalized for token in tokens]
     removals: list[tuple[int, int]] = []
@@ -80,7 +127,10 @@ def _filter_once(text: str) -> str:
         run_end_index = index + pattern_length * repetition_count - 1
         removals.append((first_end, tokens[run_end_index].end))
         index = run_end_index + 1
+    return removals
 
+
+def _apply_removals(text: str, removals: list[tuple[int, int]]) -> str:
     if not removals:
         return text
 
