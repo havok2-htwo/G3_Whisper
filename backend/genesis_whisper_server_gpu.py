@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import os
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from contextvars import ContextVar
 from functools import partial
 from pathlib import Path
 from typing import Iterator
-from typing import Any, Callable, List, Sequence, TypeVar
+from typing import Any, Callable, Deque, Dict, List, Sequence, TypeVar
 
 from . import genesis_whisper_server_progress as progress
 
@@ -57,6 +59,101 @@ def note_gpu_activity() -> None:
         except Exception:
             # A listener is housekeeping; it must never fail a GPU phase.
             pass
+
+
+# Two classes of GPU work. Interactive: everything that answers a request directly (the default:
+# short transcripts and their language detection, embeddings, speaker turns of a live section, v1, the admin
+# playground). Background: every phase of a diarization or a long transcript, including its ASR batches. The v2
+# handler sets the class per request; it travels with the request's context into its tasks and worker threads.
+INTERACTIVE = "interactive"
+BACKGROUND = "background"
+_gpu_class: ContextVar[str] = ContextVar("g3_gpu_class", default=INTERACTIVE)
+
+
+def current_gpu_class() -> str:
+    return _gpu_class.get()
+
+
+def set_gpu_class(gpu_class: str) -> Any:
+    """Make ``gpu_class`` the class of the current request's GPU work; returns the token for ``reset_gpu_class``."""
+
+    if gpu_class not in (INTERACTIVE, BACKGROUND):
+        raise ValueError(f"Unbekannte GPU-Klasse '{gpu_class}'.")
+    return _gpu_class.set(gpu_class)
+
+
+def reset_gpu_class(token: Any) -> None:
+    _gpu_class.reset(token)
+
+
+@contextmanager
+def gpu_class_scope(gpu_class: str) -> Iterator[None]:
+    token = set_gpu_class(gpu_class)
+    try:
+        yield
+    finally:
+        reset_gpu_class(token)
+
+
+class PriorityGpuLock:
+    """The process-wide local GPU lock: interactive waiters before background waiters, FIFO inside each class.
+
+    A waiter's class is the caller's ``current_gpu_class()`` at ``acquire``. A release hands the lock straight to
+    the first interactive waiter, else to the first background one, so a background waiter only gets the GPU
+    while no interactive one waits. A running hold is never interrupted: bulk work stays preemptible only between
+    its slices (run_sliced_gpu_phase). There is deliberately no ageing: background work waits as long as
+    interactive work keeps arriving (owner decision). Drop-in for ``asyncio.Lock`` (``async with``,
+    ``acquire``/``release``/``locked``).
+    """
+
+    def __init__(self) -> None:
+        self._locked = False
+        self._waiters: Dict[str, Deque[asyncio.Future]] = {INTERACTIVE: deque(), BACKGROUND: deque()}
+
+    def locked(self) -> bool:
+        return self._locked
+
+    def waiting(self, gpu_class: str) -> int:
+        return sum(1 for waiter in self._waiters[gpu_class] if not waiter.done())
+
+    async def acquire(self) -> bool:
+        if not self._locked:
+            self._locked = True
+            return True
+        queue = self._waiters[current_gpu_class()]
+        waiter = asyncio.get_running_loop().create_future()
+        queue.append(waiter)
+        try:
+            await waiter
+        except asyncio.CancelledError:
+            if waiter.done() and not waiter.cancelled():
+                # Handed over just before the cancellation landed: pass the lock on.
+                self.release()
+            else:
+                try:
+                    queue.remove(waiter)
+                except ValueError:
+                    pass
+            raise
+        return True
+
+    def release(self) -> None:
+        if not self._locked:
+            raise RuntimeError("GPU-Sperre ist nicht gehalten.")
+        for gpu_class in (INTERACTIVE, BACKGROUND):
+            queue = self._waiters[gpu_class]
+            while queue:
+                waiter = queue.popleft()
+                if not waiter.done():
+                    waiter.set_result(True)  # hand-off: the lock stays held, nobody can barge in between
+                    return
+        self._locked = False
+
+    async def __aenter__(self) -> None:
+        await self.acquire()
+
+    async def __aexit__(self, *_exc: Any) -> None:
+        self.release()
 
 
 @contextmanager
@@ -153,12 +250,19 @@ async def run_sliced_gpu_phase(
 
 
 __all__ = [
+    "BACKGROUND",
+    "INTERACTIVE",
+    "PriorityGpuLock",
     "add_gpu_activity_listener",
+    "current_gpu_class",
+    "gpu_class_scope",
     "gpu_activity_count",
     "note_gpu_activity",
     "remove_gpu_activity_listener",
+    "reset_gpu_class",
     "run_blocking_gpu_phase",
     "run_gpu_housekeeping",
     "run_sliced_gpu_phase",
+    "set_gpu_class",
     "shared_gpu_lease",
 ]

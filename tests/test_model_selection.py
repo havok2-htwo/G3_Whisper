@@ -690,10 +690,10 @@ class FailedSelectionQueueTests(_AdminCase):
         async def scenario(manager, audio, key):
             self.assertEqual(key[0], WHISPER_TURBO)
             job = asyncio.create_task(manager.submit_job(audio, "queued", key))
-            # The worker reserves the batch and waits behind the load for the GPU lock.
+            # The worker waits behind the load for the GPU lock; it plans (reserves) the batch only once it owns it.
             await asyncio.sleep(0.05)
             self.assertEqual(len(manager._jobs), 1)
-            self.assertEqual(next(iter(manager._jobs.values())).batch_count, 1)
+            self.assertEqual(next(iter(manager._jobs.values())).batch_count, 0)
 
             async def after_failure() -> None:
                 results = await job

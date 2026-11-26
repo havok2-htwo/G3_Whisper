@@ -572,6 +572,51 @@ class V2EndpointTests(unittest.TestCase):
         configuration = process_diarization_mock.await_args.args[3]
         self.assertEqual(configuration["expected_speakers"], 5)
 
+    def test_each_mode_runs_its_gpu_work_in_its_gpu_class(self) -> None:
+        from backend import genesis_whisper_server_gpu as gpu
+
+        seen: list[tuple[str, str]] = []
+
+        def recorder(name, value):
+            async def run(*_args, **_kwargs):
+                seen.append((name, gpu.current_gpu_class()))
+                return value
+            return run
+
+        diarization_value = (
+            {"transcript": {"text": "", "segments": []}, "speaker_counts": {"expected": None, "detected": 0},
+             "speaker_assignments": [], "unknown_speakers": [], "unresolved_known_speakers": []},
+            {}, {"asr": {"id": "asr"}}, [], "",
+        )
+        patches = self._base_patches()
+        with (
+            patches[0],
+            patches[1],
+            patches[2],
+            mock.patch.object(v2, "_process_diarization", new=recorder("diarization", diarization_value)),
+            mock.patch.object(v2, "_transcribe_audio", new=recorder("transcript", ("Text", 7, 1, "asr", _GERMAN))),
+            mock.patch.object(v2, "_generate_embedding", new=recorder("embedding", (_vector(0).tolist(), 4))),
+        ):
+            for mode in ("embedding", "transcript", "diarization"):
+                body = {"schema_version": "2.0", "mode": mode}
+                if mode == "diarization":
+                    body["diarization"] = {}
+                self.assertEqual(self._call(body).status_code, 200)
+            # The same transcript as a long file (above WHOLE_AUDIO_MAX_S) is background work.
+            with mock.patch.object(v2, "get_audio_duration_seconds", return_value=v2.WHOLE_AUDIO_MAX_S + 1):
+                self.assertEqual(self._call({"schema_version": "2.0", "mode": "transcript"}).status_code, 200)
+
+        self.assertEqual(
+            seen,
+            [
+                ("embedding", gpu.INTERACTIVE),
+                ("transcript", gpu.INTERACTIVE),
+                ("diarization", gpu.BACKGROUND),
+                ("transcript", gpu.BACKGROUND),
+            ],
+        )
+        self.assertEqual(gpu.current_gpu_class(), gpu.INTERACTIVE)
+
     def test_default_diarization_passes_refinement_off_without_changing_result_shape(self) -> None:
         legacy_result = {
             "transcript": {"text": "Diarisiert", "segments": []},

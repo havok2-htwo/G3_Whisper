@@ -22,8 +22,12 @@ from .genesis_whisper_server_globals import (
 from . import genesis_whisper_server_progress as progress
 from .genesis_whisper_server_perf import asr_audio_rate
 from .genesis_whisper_server_gpu import (
+    BACKGROUND,
+    INTERACTIVE,
     add_gpu_activity_listener,
+    current_gpu_class,
     gpu_activity_count,
+    gpu_class_scope,
     remove_gpu_activity_listener,
     run_blocking_gpu_phase,
     run_gpu_housekeeping,
@@ -90,6 +94,8 @@ class TranscriptionJob:
         self.started_at: Optional[float] = None
         # The tracked request that submitted this job (docs/254), told when the job first reaches the GPU.
         self.progress_entry = progress.current_entry()
+        # GPU class of the submitting request (current_gpu_class): interactive jobs get the GPU first.
+        self.interactive = current_gpu_class() == INTERACTIVE
         self.cancel_requested = False
         self.finished = False
         self.done: asyncio.Future = loop.create_future()
@@ -164,6 +170,14 @@ class WhisperBatchManager:
       the long job cannot starve under a steady stream of live requests
     * jobs served by a batch rotate to the end of the active list, so the
       next anchor is always the job that waited longest (also across keys)
+    * interactive jobs (submitted under GPU class interactive) go first:
+      while one has pending chunks, batches are planned from the interactive
+      jobs only (all rules above apply among them) and take the GPU lock as
+      interactive; a batch of background jobs takes it as background. No
+      ageing for background jobs (owner decision)
+    * a batch is planned only once the worker owns the GPU lock, so a job
+      that arrives while the worker waits for the lock still rides in it; a
+      background wait turns interactive when an interactive job arrives
     """
 
     def __init__(self, process_batch_fn: Callable[[List[np.ndarray], Any], List[str]], gpu_lock: asyncio.Lock):
@@ -173,6 +187,8 @@ class WhisperBatchManager:
         self._waiting: Deque[str] = deque()
         self._active: List[str] = []
         self._wake = asyncio.Event()
+        # Set when an interactive job is submitted; ends a background wait for the GPU lock (_acquire_gpu).
+        self._interactive_arrived = asyncio.Event()
         self._worker_task: Optional[asyncio.Task] = None
         self._stop_event = asyncio.Event()
         self._last_batch_was_fast_path = False
@@ -256,12 +272,14 @@ class WhisperBatchManager:
             loop=asyncio.get_running_loop(),
         )
         self._jobs[job.key] = job
-        if job.is_long and not self._long_slot_available(limits):
+        if job.is_long and not self._long_slot_available(limits, job.interactive):
             self._waiting.append(job.key)
         else:
             self._active.append(job.key)
         self._update_queue_state()
         self._wake.set()
+        if job.interactive:
+            self._interactive_arrived.set()
         try:
             return await job.done
         finally:
@@ -364,8 +382,8 @@ class WhisperBatchManager:
         a job that cannot move, which then ends with that error.
 
         Call it on the event loop before the next await after the failed load:
-        the worker may already wait for the GPU lock with a reserved batch of
-        these jobs, and it reads the key only once it owns the lock. The
+        the worker may already wait for the GPU lock for a batch of these jobs,
+        and it plans that batch and reads the key only once it owns the lock. The
         retarget stays registered because a request that read the key during the
         selection may still be preparing its chunks; submit_job applies it too.
         clear_failover ends that, jobs of any other model are never touched.
@@ -451,23 +469,36 @@ class WhisperBatchManager:
     def _eligible_jobs(self) -> List[TranscriptionJob]:
         return [job for job in self._active_jobs() if job.has_pending()]
 
-    def _long_slot_available(self, limits: Dict[str, Any]) -> bool:
+    def _long_slot_available(self, limits: Dict[str, Any], interactive: bool = False) -> bool:
+        """A free slot for one more active long job. An interactive long job counts only the interactive long
+        jobs: background long jobs cannot run while it waits, so it never waits for them."""
+
         max_parallel = int(limits["max_parallel_long_jobs"])
         if max_parallel <= 0:
             return True
-        active_long = sum(1 for job in self._active_jobs() if job.is_long)
+        active_long = sum(
+            1 for job in self._active_jobs() if job.is_long and (job.interactive or not interactive)
+        )
         return active_long < max_parallel
 
     def _has_schedulable_work(self) -> bool:
         if any(job.has_pending() for job in self._active_jobs()):
             return True
-        return bool(self._waiting) and self._long_slot_available(self._get_limits())
+        limits = self._get_limits()
+        return any(
+            key in self._jobs and self._long_slot_available(limits, self._jobs[key].interactive)
+            for key in self._waiting
+        )
 
     def _promote_waiting(self, limits: Dict[str, Any]) -> None:
         promoted = False
-        while self._waiting and self._long_slot_available(limits):
-            key = self._waiting.popleft()
-            if key in self._jobs:
+        # Interactive long jobs first, FIFO inside each class.
+        for key in sorted(self._waiting, key=lambda key: not (key in self._jobs and self._jobs[key].interactive)):
+            job = self._jobs.get(key)
+            if job is None:
+                self._waiting.remove(key)
+            elif self._long_slot_available(limits, job.interactive):
+                self._waiting.remove(key)
                 self._active.append(key)
                 promoted = True
         if promoted:
@@ -496,6 +527,11 @@ class WhisperBatchManager:
         eligible = self._eligible_jobs()
         if not eligible:
             return BatchPlan(items=[], fast_path=False)
+        # Interactive jobs before background jobs. While one has chunks, background chunks do not even fill up
+        # the batch: a 4 s live chunk next to fifteen 25 s background chunks takes ~2 s on the GPU, alone ~0.06 s.
+        interactive = [job for job in eligible if job.interactive]
+        if interactive:
+            eligible = interactive
         max_segments = max(1, int(limits["max_segments"]))
         max_audio_seconds = max(1.0, float(limits["max_audio_seconds"]))
 
@@ -640,6 +676,52 @@ class WhisperBatchManager:
         finally:
             self._idle_waiting = False
 
+    @staticmethod
+    def _plan_is_interactive(plan: BatchPlan) -> bool:
+        return any(item.job.interactive for item in plan.items)
+
+    @staticmethod
+    async def _withdraw_acquire(acquire: asyncio.Future) -> bool:
+        """Withdraw a pending lock acquisition; True when it had already got the lock (the caller owns it)."""
+
+        if not acquire.done():
+            acquire.cancel()
+            await asyncio.wait((acquire,))
+        return not acquire.cancelled() and acquire.exception() is None
+
+    async def _acquire_gpu(self, interactive: bool) -> None:
+        """Take the GPU lock for the next batch, in the class of its jobs.
+
+        A background wait is withdrawn and repeated as interactive as soon as an interactive job is submitted,
+        so a live request never queues behind the background slices that were ahead of the worker. With a
+        plain ``asyncio.Lock`` (tests) the class makes no difference.
+        """
+
+        while True:
+            if interactive:
+                with gpu_class_scope(INTERACTIVE):
+                    await self._gpu_lock.acquire()
+                return
+            self._interactive_arrived.clear()
+            if any(job.interactive for job in self._eligible_jobs()):
+                interactive = True
+                continue
+            with gpu_class_scope(BACKGROUND):
+                # The task copies the context, so the lock sees the background class.
+                acquire = asyncio.ensure_future(self._gpu_lock.acquire())
+            arrived = asyncio.ensure_future(self._interactive_arrived.wait())
+            try:
+                await asyncio.wait((acquire, arrived), return_when=asyncio.FIRST_COMPLETED)
+            except BaseException:
+                arrived.cancel()
+                if await self._withdraw_acquire(acquire):
+                    self._gpu_lock.release()
+                raise
+            arrived.cancel()
+            if await self._withdraw_acquire(acquire):
+                return
+            interactive = True
+
     async def _worker_loop(self):
         try:
             while not self._stop_event.is_set():
@@ -673,8 +755,18 @@ class WhisperBatchManager:
                     await asyncio.sleep(0)
                     continue
 
-                batch_items = self._reserve_batch(plan)
-                await self._process_batch(batch_items, fast_path=plan.fast_path)
+                await self._acquire_gpu(self._plan_is_interactive(plan))
+                try:
+                    # Planned (again) only now that the GPU is ours: a job that arrived while the worker waited
+                    # for the lock rides in this batch instead of waiting for the next round.
+                    limits = self._get_limits()
+                    self._promote_waiting(limits)
+                    plan = self._build_batch_plan(limits)
+                    if plan.items:
+                        batch_items = self._reserve_batch(plan)
+                        await self._process_batch(batch_items, fast_path=plan.fast_path)
+                finally:
+                    self._gpu_lock.release()
                 self._settled_gpu_activity = None
         except asyncio.CancelledError:
             raise
@@ -712,6 +804,8 @@ class WhisperBatchManager:
             self._finish_job(job, error=RuntimeError(str(exc)), status="error")
 
     async def _process_batch(self, batch_items: List[BatchItem], *, fast_path: bool = False):
+        """Run one reserved batch; the caller holds the GPU lock."""
+
         batch_items = [item for item in batch_items if not item.job.cancel_requested]
         if not batch_items:
             self._update_queue_state()
@@ -731,25 +825,12 @@ class WhisperBatchManager:
             batch_runtime_state["last_error"] = None
 
         try:
-            async with self._gpu_lock:
-                # A request may be cancelled while this batch waits behind a
-                # different GPU phase. Re-evaluate only after ownership is
-                # acquired so cancelled work never reaches the model.
-                batch_items = [item for item in batch_items if not item.job.cancel_requested]
-                if not batch_items:
-                    return
-
-                audio_batch = [item.audio_data for item in batch_items]
-                total_audio_seconds = sum(item.duration_seconds for item in batch_items)
-                with batch_state_lock:
-                    batch_runtime_state["active_batch_size"] = len(batch_items)
-                    batch_runtime_state["active_batch_audio_seconds"] = round(total_audio_seconds, 3)
-
-                results = await run_blocking_gpu_phase(
-                    self._process_batch_fn,
-                    audio_batch,
-                    batch_items[0].job.processing_key,
-                )
+            audio_batch = [item.audio_data for item in batch_items]
+            results = await run_blocking_gpu_phase(
+                self._process_batch_fn,
+                audio_batch,
+                batch_items[0].job.processing_key,
+            )
 
             if len(results) != len(batch_items):
                 raise RuntimeError(f"Batch-Transkription lieferte {len(results)} Ergebnisse für {len(batch_items)} Segmente.")
