@@ -777,7 +777,11 @@ mode produces text. It is also enabled on legacy `/transcribe/`, OpenAI-compatib
 from five repetitions; 2-32-token patterns collapse from three repetitions. Matching is
 Unicode token based, case-insensitive, whitespace/terminal-punctuation insensitive, and
 never fuzzy. Each run is reduced to its first original occurrence without response
-metadata or markers. Diarization applies it only inside each speaker turn.
+metadata or markers. Diarization applies it only inside each speaker turn. Inside a
+hyphen-joined word (`M-U-T-S-S-S-…`, `ja-ja-ja-ja-ja`) the parts are compared with the
+same thresholds, so a loop glued together with hyphens collapses as well; apostrophe
+words such as `geht's` stay one part, and dangling hyphens after a cut-off loop are
+dropped (`M-U-T-S-S-S-S-S-S-` → `M-U-T-S`).
 
 Opt out for one request with:
 

@@ -62,6 +62,65 @@ class RepetitionFilterTests(unittest.TestCase):
         self.assertEqual(filter_repeated_patterns(text), text)
 
 
+# Real live transcript, meeting ccbd9d51 seq 196: Cohere looped "S-" until the
+# 256-token limit.  The whole loop is a single hyphen-joined word token.
+SEQ_196_TEXT = (
+    "Mutzchen. M-U-T-"
+    "S-S-S-S-S-S-S-S-S-S-S-S-S-S-S-S-S-S-S-S-S-S-S-S-S-S-S-S-S-S-"
+    "S-S-S-S-S-S-S-S-S-S-S-S-S-S-S-S-S-S-S-S-S-S-S-S-S-S-S-S-S-S-"
+    "S-S-S-S-S-S-S-S-S-S-S-S-S-S-S-S-S-S-S-S-S-S-S-S-S-S-S-S-S-S-"
+    "S-S-S-S-S-S-S-S-S-S-S-S-S-S-S-S-S-S-S-S-S-S-S-S-S-S-S-S-S-S-"
+    "S-S-S-"
+)
+
+
+class HyphenChainLoopTests(unittest.TestCase):
+    def test_real_seq_196_hyphen_loop_collapses_to_first_letter(self) -> None:
+        self.assertEqual(SEQ_196_TEXT.count("S-"), 123)
+        self.assertEqual(len(SEQ_196_TEXT), 262)
+        self.assertEqual(filter_repeated_patterns(SEQ_196_TEXT), "Mutzchen. M-U-T-S")
+
+    def test_ja_chain_collapses(self) -> None:
+        self.assertEqual(filter_repeated_patterns("ja-ja-ja-ja-ja"), "ja")
+        self.assertEqual(filter_repeated_patterns("Also ja-ja-ja-ja-ja-ja, genau."),
+                         "Also ja, genau.")
+        self.assertEqual(filter_repeated_patterns("ja-ja-ja-ja-ja-Sache"), "ja-Sache")
+
+    def test_chain_uses_the_same_thresholds(self) -> None:
+        self.assertEqual(filter_repeated_patterns("ja-ja-ja-ja"), "ja-ja-ja-ja")
+        self.assertEqual(filter_repeated_patterns("Ost-West-Ost-West"), "Ost-West-Ost-West")
+        self.assertEqual(filter_repeated_patterns("Ost-West-Ost-West-Ost-West Ende"),
+                         "Ost-West Ende")
+
+    def test_apostrophe_words_stay_one_part(self) -> None:
+        self.assertEqual(filter_repeated_patterns("geht's-geht's-geht's-geht's-geht's"),
+                         "geht's")
+        for text in ("geht's geht's", "don't don't don't", "Das geht's, don't worry."):
+            self.assertEqual(filter_repeated_patterns(text), text)
+
+    def test_real_repetitions_and_spelling_are_kept(self) -> None:
+        for text in (
+            "Moment, Moment, Moment",
+            "Weiter, weiter, weiter, weiter",
+            "no no no",
+            "wenn, wenn, wenn",
+            "E-Mail, E-Mail, E-Mail",
+            "M-U-T-Z",
+            "B-A-S-S",
+            "hahahaha",
+            "mmmmmm",
+            "ääääh",
+            "AAA",
+            "Ja, André.",
+            "279cc4c3-ad37-4e5c-a4b7-7f846312022e",
+        ):
+            self.assertEqual(filter_repeated_patterns(text), text)
+
+    def test_hyphen_chain_filter_is_idempotent(self) -> None:
+        once = filter_repeated_patterns(SEQ_196_TEXT)
+        self.assertEqual(filter_repeated_patterns(once), once)
+
+
 class RepetitionHeaderTests(unittest.TestCase):
     def test_only_explicit_off_disables_filter(self) -> None:
         self.assertFalse(repetition_filter_enabled("off"))
